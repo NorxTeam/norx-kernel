@@ -753,11 +753,13 @@ fn ps(session: &mut Session) {
 fn print_process_records(session: &mut Session) {
     crate::process::list_records(|record| {
         session.write_fmt(format_args!(
-            "{}\t{}\t{}\texit={} code={} caps=0x{:x}\n",
+            "{}\t{}\t{}\t{}\texit={} runtime={} code={} caps=0x{:x}\n",
             record.pid,
             record.state.name(),
+            record.owner.name(),
             record.path(),
             record.exit,
+            record.runtime(),
             record.code_len,
             record.capabilities.bits(),
         ));

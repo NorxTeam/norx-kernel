@@ -39,6 +39,16 @@ pub enum IoTarget {
     Serial = 2,
 }
 
+impl IoTarget {
+    pub const fn name(self) -> &'static str {
+        match self {
+            IoTarget::Kernel => "kernel",
+            IoTarget::User => "user",
+            IoTarget::Serial => "serial",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ProcessIo {
     pub stdin: IoTarget,

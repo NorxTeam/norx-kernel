@@ -31,8 +31,11 @@ pub struct Record {
     pub path_len: usize,
     pub state: State,
     pub exit: u64,
+    pub owner: crate::abi::syscall::IoTarget,
     pub capabilities: crate::capability::Set,
     pub code_len: u16,
+    pub started: u64,
+    pub ended: u64,
 }
 
 impl Record {
@@ -43,13 +46,20 @@ impl Record {
             path_len: 0,
             state: State::Exited,
             exit: 0,
+            owner: crate::abi::syscall::IoTarget::Kernel,
             capabilities: crate::capability::Set::NONE,
             code_len: 0,
+            started: 0,
+            ended: 0,
         }
     }
 
     pub fn path(&self) -> &str {
         core::str::from_utf8(&self.path[..self.path_len]).unwrap_or("")
+    }
+
+    pub fn runtime(&self) -> u64 {
+        self.ended.saturating_sub(self.started)
     }
 }
 
@@ -151,7 +161,7 @@ pub fn run_user_code(
     if !crate::arch::user::load_argv(args) {
         return Err(SpawnError::NoLoader);
     }
-    let pid = begin(path, object.capabilities, object.code_len);
+    let pid = begin(path, object.capabilities, object.code_len, io.stdout);
     let _io = crate::abi::syscall::enter_io(io);
     let Some(value) = crate::arch::user::probe() else {
         finish(pid, State::Failed, 38);
@@ -184,7 +194,12 @@ pub fn list_records(mut f: impl FnMut(Record)) {
     });
 }
 
-fn begin(path: &str, capabilities: crate::capability::Set, code_len: u16) -> u64 {
+fn begin(
+    path: &str,
+    capabilities: crate::capability::Set,
+    code_len: u16,
+    owner: crate::abi::syscall::IoTarget,
+) -> u64 {
     crate::arch::without_interrupts(|| unsafe {
         let pid = NEXT_PID;
         NEXT_PID = NEXT_PID.saturating_add(1);
@@ -193,8 +208,10 @@ fn begin(path: &str, capabilities: crate::capability::Set, code_len: u16) -> u64
         let mut record = Record::empty();
         record.pid = pid;
         record.state = State::Running;
+        record.owner = owner;
         record.capabilities = capabilities;
         record.code_len = code_len;
+        record.started = crate::time::ticks();
         record.path_len = path.len().min(PATH_MAX);
         record.path[..record.path_len].copy_from_slice(&path.as_bytes()[..record.path_len]);
         TABLE[slot] = record;
@@ -210,6 +227,7 @@ fn finish(pid: u64, state: State, exit: u64) {
             if (*record).pid == pid {
                 (*record).state = state;
                 (*record).exit = exit;
+                (*record).ended = crate::time::ticks();
                 return;
             }
         }
