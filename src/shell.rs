@@ -66,7 +66,7 @@ impl Session {
         self.println("Boa Shell");
         self.println("sessions: user framebuffer + serial console");
         self.println(
-            "builtins: help clear echo time ticks sched irq input hw sec userctx userprobe mem paging dmaptest vm block vfs ls cat write procs ps wait uname drivers syscalls syscalltrap sclatest stdio [tail|read] lazytest run rundebug runuser crash halt",
+            "builtins: help clear echo time ticks sched irq input hw sec userctx userprobe mem paging dmaptest vm block vfs ls cat write procs ps wait kill uname drivers syscalls syscalltrap sclatest stdio [tail|read] lazytest run rundebug runuser crash halt",
         );
         self.prompt();
     }
@@ -282,7 +282,7 @@ fn exec(session: &mut Session, line: &str) {
 
     match args[0] {
         "help" => session.println(
-            "builtins: help clear echo time ticks sched irq input hw sec userctx userprobe mem paging dmaptest vm block vfs ls cat write procs ps wait uname drivers syscalls syscalltrap sclatest stdio [tail|read] lazytest run rundebug runuser crash halt",
+            "builtins: help clear echo time ticks sched irq input hw sec userctx userprobe mem paging dmaptest vm block vfs ls cat write procs ps wait kill uname drivers syscalls syscalltrap sclatest stdio [tail|read] lazytest run rundebug runuser crash halt",
         ),
         "clear" => {
             if matches!(session.target, Target::User) {
@@ -319,6 +319,7 @@ fn exec(session: &mut Session, line: &str) {
         "procs" => procs(session),
         "ps" => ps(session),
         "wait" => wait_process(session, &args[1..argc]),
+        "kill" => kill_process(session, &args[1..argc]),
         "uname" => session.write_fmt(format_args!("Boa {} uefi\n", crate::arch::NAME)),
         "drivers" => drivers(session),
         "syscalls" => syscalls(session),
@@ -771,6 +772,27 @@ fn wait_process(session: &mut Session, args: &[&str]) {
         record.exit,
         record.runtime(),
     ));
+}
+
+fn kill_process(session: &mut Session, args: &[&str]) {
+    let Some(pid) = args.first().and_then(|arg| parse_u64(arg)) else {
+        session.println("kill: missing pid");
+        return;
+    };
+    match crate::process::kill(pid) {
+        Ok(record) => session.write_fmt(format_args!(
+            "{} killed exit={} runtime={}\n",
+            record.pid,
+            record.exit,
+            record.runtime(),
+        )),
+        Err(crate::process::KillError::NotFound) => {
+            session.write_fmt(format_args!("kill: {}: no such process\n", pid))
+        }
+        Err(crate::process::KillError::NotRunning(state)) => {
+            session.write_fmt(format_args!("kill: {}: already {}\n", pid, state.name()))
+        }
+    }
 }
 
 fn parse_u64(s: &str) -> Option<u64> {

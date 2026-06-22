@@ -73,7 +73,7 @@ Do not build speculative versions of these ideas before the required lower layer
 
 - `run` resolves executable paths through VFS, reads the object bytes, validates the header, loads the code section into the user code page, and executes it through the architecture user-mode path.
 - `rundebug` keeps the temporary in-kernel entry-id path for smoke tests.
-- User program launches now allocate a PID and record owner, state, exit code, runtime ticks, capabilities, path, and code size in a small fixed process table exposed by `ps`, `procs`, and `wait <pid>`.
+- User program launches now allocate a PID and record owner, state, exit code, runtime ticks, capabilities, path, and code size in a small fixed process table exposed by `ps`, `procs`, `wait <pid>`, and `kill <pid>`.
 - Loaded user code now performs buffered `Write(ptr,len)` before `Exit`, so userspace string output reaches the kernel log path on x86_64 and aarch64.
 - Loaded user code receives a compact `argc/argv` table in the user stack and can print `argv[0]` through the same `Write(ptr,len)` path.
 - Process I/O is now bound to the shell session that launched it: VM-owned commands write to the framebuffer session, serial-owned commands write/read through serial. The current synchronous runner keeps `stdin/stdout/stderr` in a process-scoped I/O guard, with small per-session stdout/stderr rings readable through `stdio tail` and consumable through `stdio read`.

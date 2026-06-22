@@ -12,6 +12,7 @@ pub enum State {
     Running,
     Exited,
     Failed,
+    Killed,
 }
 
 impl State {
@@ -20,6 +21,7 @@ impl State {
             State::Running => "running",
             State::Exited => "exited",
             State::Failed => "failed",
+            State::Killed => "killed",
         }
     }
 }
@@ -203,6 +205,32 @@ pub fn find(pid: u64) -> Option<Record> {
         }
         None
     })
+}
+
+pub fn kill(pid: u64) -> Result<Record, KillError> {
+    crate::arch::without_interrupts(|| unsafe {
+        let table = core::ptr::addr_of_mut!(TABLE) as *mut Record;
+        for i in 0..MAX_PROCESSES {
+            let record = table.add(i);
+            if (*record).pid != pid {
+                continue;
+            }
+            if (*record).state != State::Running {
+                return Err(KillError::NotRunning((*record).state));
+            }
+            (*record).state = State::Killed;
+            (*record).exit = 130;
+            (*record).ended = crate::time::ticks();
+            return Ok(*record);
+        }
+        Err(KillError::NotFound)
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum KillError {
+    NotFound,
+    NotRunning(State),
 }
 
 fn begin(
