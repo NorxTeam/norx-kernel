@@ -194,6 +194,17 @@ pub fn list_records(mut f: impl FnMut(Record)) {
     });
 }
 
+pub fn find(pid: u64) -> Option<Record> {
+    crate::arch::without_interrupts(|| unsafe {
+        for record in TABLE {
+            if record.pid == pid {
+                return Some(record);
+            }
+        }
+        None
+    })
+}
+
 fn begin(
     path: &str,
     capabilities: crate::capability::Set,

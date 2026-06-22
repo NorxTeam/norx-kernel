@@ -66,7 +66,7 @@ impl Session {
         self.println("Boa Shell");
         self.println("sessions: user framebuffer + serial console");
         self.println(
-            "builtins: help clear echo time ticks sched irq input hw sec userctx userprobe mem paging dmaptest vm block vfs ls cat write procs ps uname drivers syscalls syscalltrap sclatest stdio [tail|read] lazytest run rundebug runuser crash halt",
+            "builtins: help clear echo time ticks sched irq input hw sec userctx userprobe mem paging dmaptest vm block vfs ls cat write procs ps wait uname drivers syscalls syscalltrap sclatest stdio [tail|read] lazytest run rundebug runuser crash halt",
         );
         self.prompt();
     }
@@ -282,7 +282,7 @@ fn exec(session: &mut Session, line: &str) {
 
     match args[0] {
         "help" => session.println(
-            "builtins: help clear echo time ticks sched irq input hw sec userctx userprobe mem paging dmaptest vm block vfs ls cat write procs ps uname drivers syscalls syscalltrap sclatest stdio [tail|read] lazytest run rundebug runuser crash halt",
+            "builtins: help clear echo time ticks sched irq input hw sec userctx userprobe mem paging dmaptest vm block vfs ls cat write procs ps wait uname drivers syscalls syscalltrap sclatest stdio [tail|read] lazytest run rundebug runuser crash halt",
         ),
         "clear" => {
             if matches!(session.target, Target::User) {
@@ -318,6 +318,7 @@ fn exec(session: &mut Session, line: &str) {
         "write" => write_file(session, &args[1..argc]),
         "procs" => procs(session),
         "ps" => ps(session),
+        "wait" => wait_process(session, &args[1..argc]),
         "uname" => session.write_fmt(format_args!("Boa {} uefi\n", crate::arch::NAME)),
         "drivers" => drivers(session),
         "syscalls" => syscalls(session),
@@ -748,6 +749,42 @@ fn procs(session: &mut Session) {
 
 fn ps(session: &mut Session) {
     print_process_records(session);
+}
+
+fn wait_process(session: &mut Session, args: &[&str]) {
+    let Some(pid) = args.first().and_then(|arg| parse_u64(arg)) else {
+        session.println("wait: missing pid");
+        return;
+    };
+    let Some(record) = crate::process::find(pid) else {
+        session.write_fmt(format_args!("wait: {}: no such process\n", pid));
+        return;
+    };
+    if record.state == crate::process::State::Running {
+        session.write_fmt(format_args!("wait: {} still running\n", pid));
+        return;
+    }
+    session.write_fmt(format_args!(
+        "{} {} exit={} runtime={}\n",
+        record.pid,
+        record.state.name(),
+        record.exit,
+        record.runtime(),
+    ));
+}
+
+fn parse_u64(s: &str) -> Option<u64> {
+    let mut out = 0u64;
+    if s.is_empty() {
+        return None;
+    }
+    for byte in s.bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        out = out.checked_mul(10)?.checked_add((byte - b'0') as u64)?;
+    }
+    Some(out)
 }
 
 fn print_process_records(session: &mut Session) {
