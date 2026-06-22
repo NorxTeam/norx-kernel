@@ -42,3 +42,8 @@ system partition without starting QEMU.
 
 Boa is not production-ready. The public tree is intended for kernel development,
 architecture experiments, and reproducible boot tests.
+
+## License
+
+Boa Kernel is licensed under the GNU General Public License v3.0 only. See
+`LICENSE`.
