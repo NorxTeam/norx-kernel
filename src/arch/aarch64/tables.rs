@@ -1,0 +1,221 @@
+use core::arch::{asm, global_asm};
+
+global_asm!(
+    r#"
+    .align 11
+    .global boa_exception_vectors
+boa_exception_vectors:
+    b boa_aarch64_sync_exception
+    .space 124
+    b boa_aarch64_exception
+    .space 124
+    b boa_aarch64_exception
+    .space 124
+    b boa_aarch64_exception
+    .space 124
+    b boa_aarch64_sync_exception
+    .space 124
+    b boa_aarch64_exception
+    .space 124
+    b boa_aarch64_exception
+    .space 124
+    b boa_aarch64_exception
+    .space 124
+    b boa_aarch64_sync_exception
+    .space 124
+    b boa_aarch64_exception
+    .space 124
+    b boa_aarch64_exception
+    .space 124
+    b boa_aarch64_exception
+    .space 124
+    b boa_aarch64_exception
+    .space 124
+    b boa_aarch64_exception
+    .space 124
+    b boa_aarch64_exception
+    .space 124
+    b boa_aarch64_exception
+    .space 124
+
+    .global boa_aarch64_sync_exception
+boa_aarch64_sync_exception:
+    sub sp, sp, #160
+    stp x1, x2, [sp, #0]
+    stp x3, x4, [sp, #16]
+    stp x5, x6, [sp, #32]
+    stp x7, x8, [sp, #48]
+    stp x9, x10, [sp, #64]
+    stp x11, x12, [sp, #80]
+    stp x13, x14, [sp, #96]
+    stp x29, x30, [sp, #112]
+    mrs x9, CurrentEL
+    ubfx x9, x9, #2, #2
+    cmp x9, #1
+    b.eq 1f
+    cmp x9, #2
+    b.eq 2f
+    cmp x9, #3
+    b.eq 3f
+    b 9f
+1:
+    mrs x10, esr_el1
+    mrs x11, elr_el1
+    b 4f
+2:
+    mrs x10, esr_el2
+    mrs x11, elr_el2
+    b 4f
+3:
+    mrs x10, esr_el3
+    mrs x11, elr_el3
+4:
+    ubfx x12, x10, #26, #6
+    cmp x12, #0x15
+    b.ne 9f
+    mov x9, x0
+    mov x10, x1
+    mov x11, x2
+    mov x12, x3
+    mov x13, x4
+    mov x14, x5
+    mov x0, x8
+    mov x1, x9
+    mov x2, x10
+    mov x3, x11
+    mov x4, x12
+    mov x5, x13
+    mov x6, x14
+    bl boa_aarch64_syscall_rust
+    adrp x9, BOA_AARCH64_USER_PROBE_RETURN_PC
+    add x9, x9, :lo12:BOA_AARCH64_USER_PROBE_RETURN_PC
+    ldr x10, [x9]
+    cbz x10, 11f
+    ldr x11, [sp, #56]
+    cmp x11, #1
+    b.ne 11f
+    cbnz x10, 10f
+11:
+    ldp x1, x2, [sp, #0]
+    ldp x3, x4, [sp, #16]
+    ldp x5, x6, [sp, #32]
+    ldp x7, x8, [sp, #48]
+    ldp x9, x10, [sp, #64]
+    ldp x11, x12, [sp, #80]
+    ldp x13, x14, [sp, #96]
+    ldp x29, x30, [sp, #112]
+    add sp, sp, #160
+    mrs x9, CurrentEL
+    ubfx x9, x9, #2, #2
+    cmp x9, #1
+    b.eq 5f
+    cmp x9, #2
+    b.eq 6f
+    cmp x9, #3
+    b.eq 7f
+    eret
+5:
+    eret
+6:
+    eret
+7:
+    eret
+9:
+    add sp, sp, #160
+    b boa_aarch64_exception
+10:
+    adrp x9, BOA_AARCH64_USER_PROBE_RETURN_SP
+    add x9, x9, :lo12:BOA_AARCH64_USER_PROBE_RETURN_SP
+    ldr x10, [x9]
+    mov sp, x10
+    adrp x9, BOA_AARCH64_USER_PROBE_RETURN_PC
+    add x9, x9, :lo12:BOA_AARCH64_USER_PROBE_RETURN_PC
+    ldr x11, [x9]
+    adrp x9, BOA_AARCH64_USER_PROBE_DONE
+    add x9, x9, :lo12:BOA_AARCH64_USER_PROBE_DONE
+    str xzr, [x9]
+    adrp x9, BOA_AARCH64_USER_PROBE_ACTIVE
+    add x9, x9, :lo12:BOA_AARCH64_USER_PROBE_ACTIVE
+    str xzr, [x9]
+    br x11
+"#
+);
+
+extern "C" {
+    static boa_exception_vectors: u8;
+}
+
+pub fn init() {
+    let current_el: u64;
+    let vectors = unsafe { &boa_exception_vectors as *const u8 as u64 };
+
+    unsafe {
+        asm!(
+            "msr daifset, #0xf",
+            options(nomem, nostack, preserves_flags)
+        );
+        asm!("mrs {}, CurrentEL", out(reg) current_el, options(nomem, nostack, preserves_flags));
+        match (current_el >> 2) & 3 {
+            1 => {
+                asm!("msr vbar_el1, {}", in(reg) vectors, options(nomem, nostack, preserves_flags))
+            }
+            2 => {
+                asm!("msr vbar_el2, {}", in(reg) vectors, options(nomem, nostack, preserves_flags))
+            }
+            3 => {
+                asm!("msr vbar_el3, {}", in(reg) vectors, options(nomem, nostack, preserves_flags))
+            }
+            _ => {}
+        }
+        asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+}
+
+#[no_mangle]
+extern "C" fn boa_aarch64_exception() -> ! {
+    let current_el: u64;
+    let esr: u64;
+    let far: u64;
+    let elr: u64;
+    let spsr: u64;
+
+    unsafe {
+        asm!("mrs {}, CurrentEL", out(reg) current_el, options(nomem, nostack, preserves_flags));
+        match (current_el >> 2) & 3 {
+            1 => {
+                asm!("mrs {}, esr_el1", out(reg) esr, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, spsr_el1", out(reg) spsr, options(nomem, nostack, preserves_flags));
+            }
+            2 => {
+                asm!("mrs {}, esr_el2", out(reg) esr, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, far_el2", out(reg) far, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, elr_el2", out(reg) elr, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, spsr_el2", out(reg) spsr, options(nomem, nostack, preserves_flags));
+            }
+            3 => {
+                asm!("mrs {}, esr_el3", out(reg) esr, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, far_el3", out(reg) far, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, elr_el3", out(reg) elr, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, spsr_el3", out(reg) spsr, options(nomem, nostack, preserves_flags));
+            }
+            _ => {
+                esr = 0;
+                far = 0;
+                elr = 0;
+                spsr = 0;
+            }
+        }
+    }
+
+    crate::irq::exception();
+    crate::kprintln!("  frame: elr=0x{:016x} spsr=0x{:016x}", elr, spsr);
+    crate::crash::fatal(crate::error::KernelError::arch_cpu_exception(
+        "aarch64 exception",
+        0x20ff,
+        "arg0 contains current_el in high nibble and esr in low bits; arg1 is far",
+        (((current_el >> 2) & 3) << 60) | esr,
+        far,
+    ))
+}

@@ -1,0 +1,15 @@
+# Rust build output
+/target/
+
+# Local QEMU images, firmware var stores, and smoke-test logs
+/build/
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Local environment files
+.env
+.env.*

@@ -1,0 +1,19 @@
+[package]
+name = "boa_kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features = [
+    "regular",
+    "size_20",
+    "unicode-basic-latin",
+] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
