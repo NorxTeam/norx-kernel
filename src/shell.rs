@@ -320,7 +320,7 @@ fn exec(session: &mut Session, line: &str) {
         "ps" => ps(session),
         "wait" => wait_process(session, &args[1..argc]),
         "kill" => kill_process(session, &args[1..argc]),
-        "uname" => session.write_fmt(format_args!("Norx {} uefi\n", crate::arch::NAME)),
+        "uname" => session.write_fmt(format_args!("Norx {} grub\n", crate::arch::NAME)),
         "drivers" => drivers(session),
         "syscalls" => syscalls(session),
         "syscalltrap" => syscalltrap(session),
@@ -356,10 +356,11 @@ fn split<'a>(line: &'a str, out: &mut [&'a str; ARG_MAX]) -> usize {
 }
 
 fn show_time(session: &mut Session) {
-    if let Some(time) = crate::time::boot_time() {
+    if let Some(ticks) = crate::time::boot_time() {
         session.write_fmt(format_args!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}\n",
-            time.year, time.month, time.day, time.hour, time.minute, time.second
+            "boot ticks={} now={}\n",
+            ticks,
+            crate::time::ticks()
         ));
     } else {
         session.println("time unavailable");

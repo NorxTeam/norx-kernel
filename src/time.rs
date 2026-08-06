@@ -1,20 +1,18 @@
-use crate::uefi::{Status, SystemTable, Time};
-
-static mut BOOT_TIME: Option<Time> = None;
+static mut BOOT_TICKS: u64 = 0;
 static mut LAST_SCHEDULER_TICK: u64 = 0;
 
 const SCHEDULER_HZ: u64 = 100;
 const FALLBACK_TICKS_PER_SCHEDULER_TICK: u64 = 50_000_000;
 
-pub fn init(system_table: *mut SystemTable) {
+pub fn init() {
     unsafe {
-        BOOT_TIME = crate::uefi::get_time(system_table);
-        LAST_SCHEDULER_TICK = crate::arch::ticks();
+        BOOT_TICKS = crate::arch::ticks();
+        LAST_SCHEDULER_TICK = BOOT_TICKS;
     }
 }
 
-pub fn boot_time() -> Option<Time> {
-    unsafe { BOOT_TIME }
+pub fn boot_time() -> Option<u64> {
+    unsafe { Some(BOOT_TICKS) }
 }
 
 pub fn ticks() -> u64 {
@@ -41,8 +39,4 @@ pub fn poll_scheduler_tick() -> bool {
         LAST_SCHEDULER_TICK = now;
     }
     true
-}
-
-pub fn ok(status: Status) -> bool {
-    status == 0
 }

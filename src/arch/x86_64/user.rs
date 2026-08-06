@@ -181,8 +181,8 @@ fn mark_transition_pages() -> bool {
         && crate::arch::paging::mark_user_accessible(pages.idt + 4095)
         && crate::arch::paging::mark_user_accessible(pages.tss)
         && crate::arch::paging::mark_user_accessible(pages.int80)
-        // TODO(paging): early UEFI page tables keep the live kernel stack in a supervisor
-        // large page; replace this with Norx-owned CR3 before real userspace.
+        // TODO(paging): GRUB's initial page tables keep the live kernel stack in a
+        // supervisor large page; replace this with a Norx-owned CR3 before real userspace.
         && crate::arch::paging::mark_user_accessible(current_stack())
         // TODO(paging): inherited firmware tables also fault on a low transition read.
         && crate::arch::paging::mark_user_accessible(0x1000)

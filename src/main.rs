@@ -4,6 +4,7 @@
 
 mod abi;
 mod arch;
+mod boot;
 mod bootlog;
 mod capability;
 mod crash;
@@ -21,83 +22,65 @@ mod sched;
 mod shell;
 mod time;
 mod timer;
-mod uefi;
 mod vfs;
 mod vm;
 
 use core::panic::PanicInfo;
 
-#[no_mangle]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "efiapi" fn efi_main(
-    image: uefi::Handle,
-    system_table: *mut uefi::SystemTable,
-) -> uefi::Status {
-    arch::init();
+pub fn kernel_start() -> ! {
     log::init();
-    bootlog::ok("arch serial initialized");
-    time::init(system_table);
-    if let Some(time) = time::boot_time() {
-        bootlog::ok_fmt(format_args!(
-            "uefi time {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            time.year, time.month, time.day, time.hour, time.minute, time.second
-        ));
-    } else {
-        bootlog::fail("uefi time unavailable");
+    let boot = boot::info();
+    bootlog::ok_fmt(format_args!(
+        "GRUB hand-off accepted arch={} memory={} modules={}",
+        boot.architecture.name(),
+        boot.memory_len,
+        boot.modules_len
+    ));
+    if !boot.cmdline().is_empty() {
+        bootlog::info(boot.cmdline());
     }
+    time::init();
+    bootlog::ok("kernel clock initialized");
     bootlog::spin(0, "probing built-in drivers");
     drivers::init();
     bootlog::ok("driver framework initialized");
     vfs::init();
     bootlog::ok("vfs initialized");
     bootlog::spin(1, "probing input devices");
-    input::init(system_table);
+    input::init();
     bootlog::ok("input subsystem initialized");
     bootlog::warn("usb hid input deferred; using early console input");
 
-    match unsafe { uefi::gop_framebuffer(system_table) } {
-        Some(raw) => {
-            crash::init(raw);
-            let fb = framebuffer::init(raw);
-            log::init_framebuffer(raw);
-            bootlog::ok_fmt(format_args!(
-                "framebuffer {}x{} pitch {}",
-                fb.width(),
-                fb.height(),
-                fb.pitch()
-            ));
-        }
-        None => {
-            bootlog::fail("framebuffer unavailable");
-        }
+    if let Some(raw) = boot.framebuffer {
+        crash::init(raw);
+        let fb = framebuffer::init(raw);
+        log::init_framebuffer(raw);
+        bootlog::ok_fmt(format_args!(
+            "framebuffer {}x{} pitch {}",
+            fb.width(),
+            fb.height(),
+            fb.pitch()
+        ));
+    } else {
+        bootlog::warn("framebuffer unavailable; serial remains active");
     }
 
-    match memory::exit_boot_services(image, system_table) {
-        Some(summary) => {
-            bootlog::ok_fmt(format_args!(
-                "memory map {} entries desc {} v{}",
-                summary.descriptors, summary.descriptor_size, summary.descriptor_version
-            ));
-            bootlog::ok_fmt(format_args!(
-                "physical allocator {} KiB usable",
-                summary.usable_pages * 4
-            ));
-            if summary.skipped_ranges != 0 {
-                bootlog::warn_fmt(format_args!(
-                    "physical allocator skipped {} memory ranges",
-                    summary.skipped_ranges
-                ));
-            }
-            if let Some(frame) = memory::alloc_frame() {
-                bootlog::ok_fmt(format_args!("first free frame 0x{:x}", frame));
-            } else {
-                bootlog::fail("physical allocator has no free frames");
-            }
-        }
-        None => {
-            bootlog::fail("ExitBootServices failed");
-            crash::fatal(error::KernelError::uefi("ExitBootServices failed"));
-        }
+    let summary = memory::init(boot);
+    bootlog::ok_fmt(format_args!("memory map {} regions", summary.descriptors));
+    bootlog::ok_fmt(format_args!(
+        "physical allocator {} KiB usable",
+        summary.usable_pages * 4
+    ));
+    if summary.skipped_ranges != 0 {
+        bootlog::warn_fmt(format_args!(
+            "physical allocator skipped {} memory ranges",
+            summary.skipped_ranges
+        ));
+    }
+    if let Some(frame) = memory::alloc_frame() {
+        bootlog::ok_fmt(format_args!("first free frame 0x{:x}", frame));
+    } else {
+        bootlog::fail("physical allocator has no free frames");
     }
 
     arch::tables::init();

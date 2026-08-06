@@ -1,4 +1,4 @@
-use crate::{error::KernelError, uefi::RawFramebuffer};
+use crate::{boot::RawFramebuffer, error::KernelError};
 
 static mut FRAMEBUFFER: Option<RawFramebuffer> = None;
 

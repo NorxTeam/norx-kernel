@@ -20,6 +20,8 @@ Run before opening a pull request:
 
 ```sh
 cargo fmt --check
-cargo build --target x86_64-unknown-uefi
-cargo build --target aarch64-unknown-uefi
+cargo build --target x86_64-unknown-none
+cargo build --target aarch64-unknown-none-softfloat
+cargo clippy --target x86_64-unknown-none -- -D warnings
+cargo clippy --target aarch64-unknown-none-softfloat -- -D warnings
 ```

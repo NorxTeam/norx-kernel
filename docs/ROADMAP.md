@@ -2,8 +2,8 @@
 
 ## Current Track
 
-1. UEFI boot without external bootloader.
-2. ExitBootServices, memory map, physical frame allocator.
+1. GRUB hand-off with architecture-specific entry contracts.
+2. GRUB memory map, reserved regions, framebuffer, modules, and command line.
 3. Kernel paging, physical-frame allocation, and lazy page-fault allocation.
 4. Interrupt timers and preemptive scheduling.
 5. Norx syscall ABI with SCLA activation.
@@ -120,19 +120,18 @@ paths below as permanent architecture decisions.
 
 #### Audit outcome (2026-08-06)
 
-- [x] Removed `src/heap.rs`: `main::efi_main` initialized a static 64 KiB
+- [x] Removed `src/heap.rs`: the former UEFI entry initialized a static 64 KiB
   buffer while consuming 16 physical frames and never connecting those frames
   to the buffer. The replacement is to defer a real heap until an allocator
   has an actual kernel caller.
-- [x] Hardened the UEFI → framebuffer boundary in
-  `uefi::gop_framebuffer`. Unsupported pixel formats, null bases, invalid
-  stride/geometry, overflowed sizes, and undersized buffers are rejected
-  before `framebuffer::Fb::put_pixel` creates a slice or writes pixels.
-- [x] Hardened the UEFI → physical allocator boundary in
-  `uefi::memory_map`/`memory::load_ranges`. Descriptor size, map bounds, page
-  count overflow, range overflow, and the fixed range-table limit are checked;
-  adjacent ranges are merged and skipped ranges are reported instead of being
-  counted as allocatable memory.
+- [x] Hardened the firmware → framebuffer boundary in the boot hand-off
+  parser. Unsupported pixel formats, null bases, invalid stride/geometry,
+  overflowed sizes, and undersized buffers are rejected before
+  `framebuffer::Fb::put_pixel` creates a slice or writes pixels.
+- [x] Hardened the boot memory-map → physical allocator boundary. Entry size,
+  map bounds, page count overflow, range overflow, and the fixed range-table
+  limit are checked; adjacent ranges are merged and skipped ranges are
+  reported instead of being counted as allocatable memory.
 - [x] Fixed a mutable-global alias in `log::handle_ansi`: `CSI J` now resets
   the borrowed `Console` directly, and the reset clears the pending ANSI
   parser state as well.
@@ -145,8 +144,8 @@ paths below as permanent architecture decisions.
 
 #### Deferred findings with owners
 
-- GRUB must replace the `efi_main`/`SystemTable`/GOP/ExitBootServices contract
-  before UEFI-specific workarounds can be removed; this is task 2.
+- The GRUB entry layer is now in place; the remaining page-table concerns are
+  tracked below and are no longer hidden behind a firmware-specific entry API.
 - x86 user-mode setup still marks firmware-owned transition pages as user
   accessible, and aarch64 page-table writes still rely on identity-mapped
   frames. These are protection-boundary issues requiring the new boot contract
@@ -162,17 +161,43 @@ paths below as permanent architecture decisions.
 
 ### 2. Replace the current boot path with GRUB
 
-- [ ] Replace the current direct UEFI-first entry path with a GRUB boot
+- [x] Replace the current direct UEFI-first entry path with a GRUB boot
   contract.
-- [ ] The repository currently has no Limine configuration; this task means
+- [x] The repository currently has no Limine configuration; this task means
   replacing the existing boot entry design with GRUB, not deleting a present
   Limine integration.
-- [ ] Define and validate the GRUB hand-off for memory map, framebuffer,
+- [x] Define and validate the GRUB hand-off for memory map, framebuffer,
   command line, boot modules, and architecture information.
-- [ ] Remove UEFI-only boot workarounds that are no longer needed and keep the
+- [x] Remove UEFI-only boot workarounds that are no longer needed and keep the
   kernel entry layer small and architecture-specific where required.
-- [ ] Update build scripts, documentation, CI, and local run targets for the
+- [x] Update build scripts, documentation, CI, and local run targets for the
   GRUB boot image and supported architectures.
+
+#### GRUB hand-off outcome (2026-08-06)
+
+- [x] Added `src/boot.rs` with an x86_64 Multiboot2 parser. It validates the
+  loader magic and bounded tag structure, copies the command line, collects
+  usable memory, records modules, validates a 32-bit RGB/BGR framebuffer, and
+  reserves the kernel image, Multiboot information block, and modules before
+  the physical allocator sees the map.
+- [x] Added the aarch64 GRUB Linux-image/FDT contract. The image header carries
+  the ARM64 Linux magic and text offset; the FDT parser reads memory `reg`,
+  `/chosen` bootargs/initrd, and an optional `simple-framebuffer`, while the
+  FDT, kernel, and initrd are reserved. This matches upstream GRUB's ARM64
+  Linux-only boot support instead of pretending that x86 Multiboot2 is portable
+  to ARM64.
+- [x] Replaced the UEFI PE targets and `efi_main` with freestanding ELF targets,
+  architecture-specific linker scripts, GRUB EFI entry stubs, and a small
+  `build.rs` linker-script dependency hook. x86_64 uses the EFI64 Multiboot2
+  entry tag; aarch64 is converted to the Linux `Image` binary layout.
+- [x] Replaced the UEFI run path with `scripts/run.sh`, standalone GRUB EFI
+  images, architecture-specific `grub.cfg`, QEMU firmware-variable handling,
+  CI image builds, and updated contribution/build documentation.
+- [x] Verified both freestanding builds and both Clippy runs with
+  `-D warnings`, checked the x86 Multiboot2 header checksum/EFI64 entry address,
+  checked the ARM64 image magic/text offset, and passed shell syntax validation.
+  Full GRUB image execution is wired into CI; the local Windows environment has
+  QEMU but no `grub-mkstandalone` installation.
 
 ### 3. Remove universal-syscall binary smoke paths
 

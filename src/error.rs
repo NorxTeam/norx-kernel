@@ -4,7 +4,6 @@ pub enum ErrorKind {
     CpuException,
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     PageFault,
-    Uefi,
 }
 
 #[derive(Clone, Copy)]
@@ -71,23 +70,11 @@ impl KernelError {
         }
     }
 
-    pub const fn uefi(message: &'static str) -> Self {
-        Self {
-            kind: ErrorKind::Uefi,
-            code: 0x3000,
-            message,
-            detail: "uefi service failed or returned no device",
-            arg0: 0,
-            arg1: 0,
-        }
-    }
-
     pub fn title(self) -> &'static str {
         match self.kind {
             ErrorKind::Panic => "KERNEL PANIC",
             ErrorKind::CpuException => "CPU EXCEPTION",
             ErrorKind::PageFault => "PAGE FAULT",
-            ErrorKind::Uefi => "UEFI ERROR",
         }
     }
 
@@ -96,7 +83,6 @@ impl KernelError {
             ErrorKind::Panic => "panic",
             ErrorKind::CpuException => "cpu-exception",
             ErrorKind::PageFault => "page-fault",
-            ErrorKind::Uefi => "uefi",
         }
     }
 }

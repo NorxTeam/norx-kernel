@@ -2,13 +2,14 @@
 
 [![CI](../../actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
 
-Norx is an experimental Rust kernel for a UEFI-first operating system. It boots
-without an external bootloader and currently targets `x86_64-unknown-uefi` and
-`aarch64-unknown-uefi`.
+Norx is an experimental Rust kernel booted by GRUB. It currently targets
+`x86_64-unknown-none` through GRUB's Multiboot2 EFI hand-off and
+`aarch64-unknown-none-softfloat` through GRUB's ARM64 Linux-image/FDT hand-off.
 
 ## Current Scope
 
-- Direct UEFI entry and framebuffer console.
+- GRUB hand-off with memory regions, reserved ranges, modules, command line,
+  architecture information, and optional framebuffer.
 - Serial logging and interactive shell sessions.
 - Basic memory, paging, timer, scheduler, and interrupt infrastructure.
 - Early user-mode execution path with a small Norx syscall ABI.
@@ -17,15 +18,17 @@ without an external bootloader and currently targets `x86_64-unknown-uefi` and
 
 ## Requirements
 
-- Rustup. The repository pins nightly Rust and UEFI targets in
+- Rustup. The repository pins nightly Rust and freestanding targets in
   `rust-toolchain.toml`.
+- GRUB's `grub-mkstandalone` and `grub-file` tools.
+- An `objcopy` compatible with LLVM binary output for the ARM64 image.
 - QEMU with EDK2 firmware files available in QEMU's share directory.
 
 ## Build
 
 ```sh
-cargo build --target x86_64-unknown-uefi
-cargo build --target aarch64-unknown-uefi
+cargo build --target x86_64-unknown-none
+cargo build --target aarch64-unknown-none-softfloat
 ```
 
 ## Run
@@ -35,8 +38,10 @@ cargo build --target aarch64-unknown-uefi
 ./scripts/run.sh aarch64
 ```
 
-Set `PROFILE=release` for a release build or `MODE=build` to create the EFI
-system partition without starting QEMU.
+The script builds a GRUB EFI system partition under `build/<arch>/esp` and
+starts QEMU with it. Set `PROFILE=release` for a release build or `MODE=build`
+to create the partition without starting QEMU. The ARM64 path converts the
+freestanding ELF into the Linux `Image` layout expected by GRUB.
 
 ## Status
 

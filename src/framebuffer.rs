@@ -1,7 +1,7 @@
 use crate::{
+    boot::{PixelFormat, RawFramebuffer},
     error::KernelError,
     font,
-    uefi::{PixelFormat, RawFramebuffer},
 };
 
 pub const TERM_W: usize = font::WIDTH;

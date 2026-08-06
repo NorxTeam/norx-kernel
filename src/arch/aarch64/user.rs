@@ -184,8 +184,8 @@ fn current_el() -> u8 {
 }
 
 fn write_payload(frame: u64) {
-    // TODO(paging): early aarch64 UEFI keeps allocated RAM identity-mapped; replace
-    // this with the real aarch64 direct-map/page-table writer when paging lands.
+    // TODO(paging): the GRUB/ARM64 initial map keeps allocated RAM identity-mapped;
+    // replace this with the real aarch64 page-table writer when paging lands.
     write_code(frame, PROBE_CODE);
 }
 

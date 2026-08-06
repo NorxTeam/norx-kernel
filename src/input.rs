@@ -16,7 +16,7 @@ pub enum Key {
 static mut SERIAL_ESC: [u8; 4] = [0; 4];
 static mut SERIAL_ESC_LEN: usize = 0;
 
-pub fn init(_system_table: *mut crate::uefi::SystemTable) {
+pub fn init() {
     crate::drivers::framework::register(crate::drivers::framework::Driver {
         name: "vm-keyboard",
         class: crate::drivers::framework::Class::Input,

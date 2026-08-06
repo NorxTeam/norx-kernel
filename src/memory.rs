@@ -1,17 +1,16 @@
-use crate::uefi::{MemoryDescriptor, MemoryMapInfo};
+use crate::boot::{BootInfo, MemoryRegion};
 
-const MAP_BYTES: usize = 64 * 1024;
 const MAX_RANGES: usize = 64;
 const PAGE_SIZE: u64 = 4096;
 const MIN_FRAME: u64 = 0x100000;
 
-static mut MAP_BUFFER: [u8; MAP_BYTES] = [0; MAP_BYTES];
 static mut RANGES: [Range; MAX_RANGES] = [Range::empty(); MAX_RANGES];
 static mut RANGE_COUNT: usize = 0;
 static mut NEXT_RANGE: usize = 0;
 static mut NEXT_FRAME: u64 = 0;
 static mut USABLE_PAGES: u64 = 0;
 static mut ALLOCATED_FRAMES: u64 = 0;
+static mut SKIPPED_RANGES: usize = 0;
 
 #[derive(Clone, Copy)]
 struct Range {
@@ -25,7 +24,8 @@ impl Range {
     }
 
     fn end(self) -> u64 {
-        self.start + self.pages * PAGE_SIZE
+        self.start
+            .saturating_add(self.pages.saturating_mul(PAGE_SIZE))
     }
 }
 
@@ -33,8 +33,6 @@ pub struct Summary {
     pub descriptors: usize,
     pub usable_pages: u64,
     pub skipped_ranges: usize,
-    pub descriptor_size: usize,
-    pub descriptor_version: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -45,29 +43,26 @@ pub struct Stats {
     pub next_frame: u64,
 }
 
-pub fn exit_boot_services(
-    image: crate::uefi::Handle,
-    system_table: *mut crate::uefi::SystemTable,
-) -> Option<Summary> {
-    let buffer = (&raw mut MAP_BUFFER).cast::<MemoryDescriptor>();
-    let info = unsafe { crate::uefi::memory_map(system_table, buffer, MAP_BYTES)? };
-
-    if unsafe {
-        crate::uefi::is_error(crate::uefi::exit_boot_services(
-            image,
-            system_table,
-            info.map_key,
-        ))
-    } {
-        let retry = unsafe { crate::uefi::memory_map(system_table, buffer, MAP_BYTES)? };
-        let status = unsafe { crate::uefi::exit_boot_services(image, system_table, retry.map_key) };
-        if crate::uefi::is_error(status) {
-            return None;
-        }
-        return Some(load_ranges(buffer, retry));
+pub fn init(info: BootInfo) -> Summary {
+    unsafe {
+        RANGE_COUNT = 0;
+        NEXT_RANGE = 0;
+        NEXT_FRAME = 0;
+        USABLE_PAGES = 0;
+        ALLOCATED_FRAMES = 0;
+        SKIPPED_RANGES = 0;
     }
 
-    Some(load_ranges(buffer, info))
+    for region in info.memory.iter().take(info.memory_len).copied() {
+        add_available(region, &info);
+    }
+
+    let stats = stats();
+    Summary {
+        descriptors: info.memory_len,
+        usable_pages: stats.usable_pages,
+        skipped_ranges: unsafe { SKIPPED_RANGES },
+    }
 }
 
 pub fn alloc_frame() -> Option<u64> {
@@ -100,71 +95,73 @@ pub fn stats() -> Stats {
     }
 }
 
-fn load_ranges(buffer: *const MemoryDescriptor, info: MemoryMapInfo) -> Summary {
-    unsafe {
-        RANGE_COUNT = 0;
-        NEXT_RANGE = 0;
-        NEXT_FRAME = 0;
-        USABLE_PAGES = 0;
-        ALLOCATED_FRAMES = 0;
+fn add_available(region: MemoryRegion, info: &BootInfo) {
+    let Some(end) = region.base.checked_add(region.length) else {
+        unsafe { SKIPPED_RANGES = SKIPPED_RANGES.saturating_add(1) };
+        return;
+    };
+    let start = region.base.max(MIN_FRAME);
+    if start >= end {
+        return;
     }
 
-    let count = info.map_size / info.descriptor_size;
-    let mut usable_pages = 0u64;
-    let mut skipped_ranges = 0;
+    let mut cursor = align_up(start);
+    let end = end & !(PAGE_SIZE - 1);
+    if cursor >= end {
+        return;
+    }
 
-    for i in 0..count {
-        let desc = unsafe {
-            ((buffer as *const u8).add(i * info.descriptor_size) as *const MemoryDescriptor)
-                .read_unaligned()
-        };
-        if desc.ty != crate::uefi::MEMORY_CONVENTIONAL || desc.number_of_pages == 0 {
-            continue;
-        }
-        let Some(bytes) = desc.number_of_pages.checked_mul(PAGE_SIZE) else {
-            skipped_ranges += 1;
-            continue;
-        };
-        if desc.physical_start.checked_add(bytes).is_none() {
-            skipped_ranges += 1;
-            continue;
-        }
-        let mut start = desc.physical_start;
-        let mut pages = desc.number_of_pages;
-        if start < MIN_FRAME {
-            let drop_bytes = MIN_FRAME - start;
-            let drop_pages = drop_bytes.div_ceil(PAGE_SIZE).min(pages);
-            start += drop_pages * PAGE_SIZE;
-            pages -= drop_pages;
-        }
-        if pages == 0 {
-            continue;
-        }
-
-        unsafe {
-            let merged = RANGE_COUNT != 0 && RANGES[RANGE_COUNT - 1].end() == start;
-            if merged {
-                RANGES[RANGE_COUNT - 1].pages = RANGES[RANGE_COUNT - 1].pages.saturating_add(pages);
-                usable_pages = usable_pages.saturating_add(pages);
-            } else if RANGE_COUNT < MAX_RANGES {
-                RANGES[RANGE_COUNT] = Range { start, pages };
-                RANGE_COUNT += 1;
-                usable_pages = usable_pages.saturating_add(pages);
+    while cursor < end {
+        let mut next = end;
+        let mut covered_end = cursor;
+        for reserved in info.reserved.iter().take(info.reserved_len).copied() {
+            let Some(reserved_end) = reserved.base.checked_add(reserved.length) else {
+                continue;
+            };
+            if reserved_end <= cursor || reserved.base >= end {
+                continue;
+            }
+            if reserved.base <= cursor {
+                covered_end = covered_end.max(reserved_end.min(end));
             } else {
-                skipped_ranges += 1;
+                next = next.min(reserved.base);
             }
         }
-    }
 
+        if covered_end > cursor {
+            cursor = align_up(covered_end);
+            continue;
+        }
+        let available_end = next.min(end) & !(PAGE_SIZE - 1);
+        if available_end > cursor {
+            push_range(cursor, (available_end - cursor) / PAGE_SIZE);
+        }
+        cursor = align_up(available_end.max(cursor.saturating_add(PAGE_SIZE)));
+    }
+}
+
+fn push_range(start: u64, pages: u64) {
+    if pages == 0 {
+        return;
+    }
     unsafe {
-        USABLE_PAGES = usable_pages;
+        let merged = RANGE_COUNT != 0 && RANGES[RANGE_COUNT - 1].end() == start;
+        if merged {
+            RANGES[RANGE_COUNT - 1].pages = RANGES[RANGE_COUNT - 1].pages.saturating_add(pages);
+            USABLE_PAGES = USABLE_PAGES.saturating_add(pages);
+        } else if RANGE_COUNT < MAX_RANGES {
+            RANGES[RANGE_COUNT] = Range { start, pages };
+            RANGE_COUNT += 1;
+            USABLE_PAGES = USABLE_PAGES.saturating_add(pages);
+        } else {
+            SKIPPED_RANGES = SKIPPED_RANGES.saturating_add(1);
+        }
     }
+}
 
-    Summary {
-        descriptors: count,
-        usable_pages,
-        skipped_ranges,
-        descriptor_size: info.descriptor_size,
-        descriptor_version: info.descriptor_version,
-    }
+fn align_up(value: u64) -> u64 {
+    value
+        .checked_add(PAGE_SIZE - 1)
+        .map(|value| value & !(PAGE_SIZE - 1))
+        .unwrap_or(!(PAGE_SIZE - 1))
 }

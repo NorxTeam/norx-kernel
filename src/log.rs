@@ -1,6 +1,6 @@
 use core::fmt::{self, Write};
 
-use crate::{framebuffer, uefi::RawFramebuffer};
+use crate::{boot::RawFramebuffer, framebuffer};
 
 struct Console {
     raw: RawFramebuffer,
