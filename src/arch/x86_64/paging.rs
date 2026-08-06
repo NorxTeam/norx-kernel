@@ -101,11 +101,19 @@ pub fn init_norx_cr3() -> bool {
         }
 
         let old_cr3 = current_cr3();
+        if TABLE_POOL_NEXT == TABLE_PAGES {
+            return false;
+        }
+        let new_p4_address = (&raw mut TABLE_POOL[TABLE_POOL_NEXT]) as usize;
+        let cr0 = disable_write_protect();
+        if !make_mapping_writable(new_p4_address) {
+            restore_cr0(cr0);
+            return false;
+        }
         let Some(new_p4) = table_frame() else {
+            restore_cr0(cr0);
             return false;
         };
-        let cr0 = disable_write_protect();
-        make_mapping_writable(new_p4 as usize);
         let old = (old_cr3 & 0x000f_ffff_ffff_f000) as *const u64;
         let new = new_p4 as *mut u64;
         for i in 0..512 {

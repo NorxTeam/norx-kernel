@@ -1,6 +1,6 @@
 #![no_std]
 #![no_main]
-#![feature(abi_x86_interrupt)]
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 
 mod abi;
 mod arch;
@@ -11,7 +11,6 @@ mod drivers;
 mod error;
 mod font;
 mod framebuffer;
-mod heap;
 mod input;
 mod irq;
 mod log;
@@ -29,6 +28,7 @@ mod vm;
 use core::panic::PanicInfo;
 
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "efiapi" fn efi_main(
     image: uefi::Handle,
     system_table: *mut uefi::SystemTable,
@@ -69,7 +69,6 @@ pub extern "efiapi" fn efi_main(
         }
         None => {
             bootlog::fail("framebuffer unavailable");
-            error::report(error::KernelError::uefi("framebuffer unavailable"));
         }
     }
 
@@ -83,19 +82,16 @@ pub extern "efiapi" fn efi_main(
                 "physical allocator {} KiB usable",
                 summary.usable_pages * 4
             ));
+            if summary.skipped_ranges != 0 {
+                bootlog::warn_fmt(format_args!(
+                    "physical allocator skipped {} memory ranges",
+                    summary.skipped_ranges
+                ));
+            }
             if let Some(frame) = memory::alloc_frame() {
                 bootlog::ok_fmt(format_args!("first free frame 0x{:x}", frame));
             } else {
                 bootlog::fail("physical allocator has no free frames");
-            }
-            match heap::init() {
-                Some(heap) => {
-                    if heap::alloc_bytes(64, 8).is_none() {
-                        bootlog::fail("bootstrap heap self-check failed");
-                    }
-                    bootlog::ok_fmt(format_args!("bootstrap heap {} KiB", heap.bytes / 1024))
-                }
-                None => bootlog::fail("bootstrap heap init failed"),
             }
         }
         None => {

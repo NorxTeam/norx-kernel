@@ -198,12 +198,10 @@ pub fn list_records(mut f: impl FnMut(Record)) {
 
 pub fn find(pid: u64) -> Option<Record> {
     crate::arch::without_interrupts(|| unsafe {
-        for record in TABLE {
-            if record.pid == pid {
-                return Some(record);
-            }
-        }
-        None
+        core::slice::from_raw_parts(core::ptr::addr_of!(TABLE).cast::<Record>(), MAX_PROCESSES)
+            .iter()
+            .copied()
+            .find(|record| record.pid == pid)
     })
 }
 

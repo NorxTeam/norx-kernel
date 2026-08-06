@@ -32,6 +32,7 @@ impl Range {
 pub struct Summary {
     pub descriptors: usize,
     pub usable_pages: u64,
+    pub skipped_ranges: usize,
     pub descriptor_size: usize,
     pub descriptor_version: u32,
 }
@@ -109,7 +110,8 @@ fn load_ranges(buffer: *const MemoryDescriptor, info: MemoryMapInfo) -> Summary 
     }
 
     let count = info.map_size / info.descriptor_size;
-    let mut usable_pages = 0;
+    let mut usable_pages = 0u64;
+    let mut skipped_ranges = 0;
 
     for i in 0..count {
         let desc = unsafe {
@@ -117,6 +119,14 @@ fn load_ranges(buffer: *const MemoryDescriptor, info: MemoryMapInfo) -> Summary 
                 .read_unaligned()
         };
         if desc.ty != crate::uefi::MEMORY_CONVENTIONAL || desc.number_of_pages == 0 {
+            continue;
+        }
+        let Some(bytes) = desc.number_of_pages.checked_mul(PAGE_SIZE) else {
+            skipped_ranges += 1;
+            continue;
+        };
+        if desc.physical_start.checked_add(bytes).is_none() {
+            skipped_ranges += 1;
             continue;
         }
         let mut start = desc.physical_start;
@@ -131,11 +141,17 @@ fn load_ranges(buffer: *const MemoryDescriptor, info: MemoryMapInfo) -> Summary 
             continue;
         }
 
-        usable_pages += pages;
         unsafe {
-            if RANGE_COUNT < MAX_RANGES {
+            let merged = RANGE_COUNT != 0 && RANGES[RANGE_COUNT - 1].end() == start;
+            if merged {
+                RANGES[RANGE_COUNT - 1].pages = RANGES[RANGE_COUNT - 1].pages.saturating_add(pages);
+                usable_pages = usable_pages.saturating_add(pages);
+            } else if RANGE_COUNT < MAX_RANGES {
                 RANGES[RANGE_COUNT] = Range { start, pages };
                 RANGE_COUNT += 1;
+                usable_pages = usable_pages.saturating_add(pages);
+            } else {
+                skipped_ranges += 1;
             }
         }
     }
@@ -147,6 +163,7 @@ fn load_ranges(buffer: *const MemoryDescriptor, info: MemoryMapInfo) -> Summary 
     Summary {
         descriptors: count,
         usable_pages,
+        skipped_ranges,
         descriptor_size: info.descriptor_size,
         descriptor_version: info.descriptor_version,
     }

@@ -4,7 +4,7 @@
 
 1. UEFI boot without external bootloader.
 2. ExitBootServices, memory map, physical frame allocator.
-3. Kernel paging, heap, and lazy page-fault allocation.
+3. Kernel paging, physical-frame allocation, and lazy page-fault allocation.
 4. Interrupt timers and preemptive scheduling.
 5. Norx syscall ABI with SCLA activation.
 6. Process loader, address spaces, VFS, drivers, userspace services.
@@ -99,3 +99,156 @@ Do not build speculative versions of these ideas before the required lower layer
 - x86_64 also has a DPL3 `int 0x80` gate stub for the same universal dispatcher and uses a high user VA region outside firmware identity maps.
 - Shell command `syscalltrap` exercises the x86_64 trap handler path from kernel smoke; `userprobe` proves a tiny CPL3 trap round-trip through the same universal dispatcher.
 - aarch64 has an arch-local dispatcher/status layer, same-EL SVC entry, EL0 code/stack page mappings, and a working EL0 SVC probe round-trip.
+
+## Norx Kernel Patch Backlog
+
+These are the next implementation tasks. Do not treat the current smoke-test
+paths below as permanent architecture decisions.
+
+### 1. Audit the kernel and remove accidental complexity
+
+- [x] Inspect the boot path, memory and paging code, IRQ/timer setup,
+  scheduler, VFS, process loader, syscall ABI, drivers, logging, and panic
+  handling end to end.
+- [x] Find workarounds, dead code, duplicated state, misleading abstractions,
+  architecture leaks, unsafe assumptions, and code that exists only for an
+  obsolete smoke test.
+- [x] Record each finding with its root cause, affected callers, risk, and the
+  smallest correct replacement before changing it.
+- [x] Remove speculative interfaces and test-only state once the dependent
+  paths are removed.
+
+#### Audit outcome (2026-08-06)
+
+- [x] Removed `src/heap.rs`: `main::efi_main` initialized a static 64 KiB
+  buffer while consuming 16 physical frames and never connecting those frames
+  to the buffer. The replacement is to defer a real heap until an allocator
+  has an actual kernel caller.
+- [x] Hardened the UEFI → framebuffer boundary in
+  `uefi::gop_framebuffer`. Unsupported pixel formats, null bases, invalid
+  stride/geometry, overflowed sizes, and undersized buffers are rejected
+  before `framebuffer::Fb::put_pixel` creates a slice or writes pixels.
+- [x] Hardened the UEFI → physical allocator boundary in
+  `uefi::memory_map`/`memory::load_ranges`. Descriptor size, map bounds, page
+  count overflow, range overflow, and the fixed range-table limit are checked;
+  adjacent ranges are merged and skipped ranges are reported instead of being
+  counted as allocatable memory.
+- [x] Fixed a mutable-global alias in `log::handle_ansi`: `CSI J` now resets
+  the borrowed `Console` directly, and the reset clears the pending ANSI
+  parser state as well.
+- [x] Made `paging::init_norx_cr3` stop when its writable mapping cannot be
+  established instead of continuing into an unsafe page-table write.
+- [x] Removed a misleading non-fatal `error::report` call for a missing
+  framebuffer, made the x86-only compiler feature conditional, and removed
+  dead pixel-format handling. Both targets now pass format, Clippy with
+  `-D warnings`, and debug builds.
+
+#### Deferred findings with owners
+
+- GRUB must replace the `efi_main`/`SystemTable`/GOP/ExitBootServices contract
+  before UEFI-specific workarounds can be removed; this is task 2.
+- x86 user-mode setup still marks firmware-owned transition pages as user
+  accessible, and aarch64 page-table writes still rely on identity-mapped
+  frames. These are protection-boundary issues requiring the new boot contract
+  and syscall/user-mode decision, so they belong to tasks 2–3 rather than a
+  partial local workaround.
+- The VFS object binaries, universal syscall probes, synchronous process path,
+  framebuffer shell, and their diagnostic state are intentional remaining
+  smoke infrastructure. They are tracked for deletion in tasks 3–5; removing
+  them during this audit would leave a cross-task half-migration.
+- UART writes still wait indefinitely when the configured device is absent;
+  the serial-debugger rewrite must define the early-console failure policy in
+  task 4.
+
+### 2. Replace the current boot path with GRUB
+
+- [ ] Replace the current direct UEFI-first entry path with a GRUB boot
+  contract.
+- [ ] The repository currently has no Limine configuration; this task means
+  replacing the existing boot entry design with GRUB, not deleting a present
+  Limine integration.
+- [ ] Define and validate the GRUB hand-off for memory map, framebuffer,
+  command line, boot modules, and architecture information.
+- [ ] Remove UEFI-only boot workarounds that are no longer needed and keep the
+  kernel entry layer small and architecture-specific where required.
+- [ ] Update build scripts, documentation, CI, and local run targets for the
+  GRUB boot image and supported architectures.
+
+### 3. Remove universal-syscall binary smoke paths
+
+- [ ] Remove the embedded `/bin/hello` and `/bin/args` machine-code payloads,
+  `object_code`, and their architecture-specific byte arrays.
+- [ ] Remove VFS sectors and object generation used only to store those test
+  binaries.
+- [ ] Remove the universal syscall/SCLA demonstration path if the audit shows
+  it is not part of the intended kernel ABI.
+- [ ] Remove the related loader, probe, capability, status, and diagnostic
+  code instead of leaving partial compatibility shims.
+- [ ] Keep only the real architecture-local syscall entry points and the
+  minimum ABI needed by the future userspace design.
+
+### 4. Replace the kernel shell with `serial-debugger`
+
+- [ ] Remove the framebuffer keyboard shell and its role as a system control
+  interface.
+- [ ] Keep a minimal serial-only input/output loop for kernel diagnostics.
+- [ ] Rename shell-facing types, functions, messages, and documentation to
+  `serial-debugger`.
+- [ ] Make command parsing line-oriented, deterministic, and safe during early
+  boot and failure handling.
+- [ ] Keep only commands that are explicitly useful for inspecting or
+  recovering the kernel.
+
+### 5. Delete obsolete test commands and debugger baggage
+
+- [ ] Review every current command and remove anything not needed by the
+  serial debugger.
+- [ ] Candidates for removal include `dmaptest`, `syscalltrap`, `sclatest`,
+  `stdio`, `lazytest`, `block`, `vfs`, `run`, `rundebug`, and `runuser`, plus
+  their backing code and state.
+- [ ] Remove test-only counters, probe payloads, fake process paths, embedded
+  binaries, smoke-only VFS data, and obsolete diagnostic formatting.
+- [ ] Keep a small intentional diagnostic set for boot state, memory, paging,
+  interrupts, processes, logs, and explicit panic testing.
+- [ ] Re-run the audit after deletion so no command references or dead
+  dependencies remain.
+
+### 6. Implement the Norx boot presentation
+
+- [ ] Add a compact ASCII-art `Norx` title as the first visible boot output.
+- [ ] Emit ordered kernel startup logs for each initialization stage.
+- [ ] Use consistent colored status markers in the style of `[    OK    ]`,
+  with matching failure and warning states.
+- [ ] Separate kernel initialization, hardware discovery, diagnostics, and
+  the future operating-system boot stage.
+- [ ] Leave an explicit extension point for the future OS bootloader without
+  claiming that an unimplemented stage has completed.
+- [ ] Keep the same essential startup information available through serial
+  output when framebuffer output is unavailable.
+
+### 7. Replace the console font with JetBrains Mono
+
+- [ ] Locate the already-downloaded JetBrains Mono font asset and verify its
+  format and license before bundling it.
+- [ ] Convert the required glyph range to the bitmap representation used by
+  the Norx console.
+- [ ] Replace the current `noto-sans-mono-bitmap` dependency and generated
+  font data with the JetBrains Mono asset.
+- [ ] Preserve the existing low-level renderer contract unless the font size
+  requires a measured layout change.
+- [ ] Verify ASCII-art alignment, boot logs, serial-debugger output, and panic
+  text at the target resolution.
+
+### 8. Redesign the kernel panic screen
+
+- [ ] Use a dark-gray background with a centered sad face `:(`.
+- [ ] Display a prominent centered `KERNEL PANIC` heading.
+- [ ] Render the detailed error description below it, including error kind,
+  architecture, address/register data, ticks/time, boot stage, and relevant
+  subsystem state.
+- [ ] Continue emitting the critical panic information to serial output for
+  headless debugging.
+- [ ] Keep the panic renderer allocation-free and safe when the heap,
+  interrupts, or normal logging path are unavailable.
+- [ ] Test the layout on both supported architectures and with deliberately
+  triggered panic paths.

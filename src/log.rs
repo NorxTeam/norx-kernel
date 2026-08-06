@@ -65,13 +65,7 @@ pub fn clear_screen() {
         let Some(console) = slot.as_mut() else {
             return;
         };
-        let mut fb = framebuffer::init(console.raw);
-        fb.clear(0x000000);
-        console.col = 2;
-        console.row = 2;
-        console.ansi = 0;
-        console.fg = 0xd8dee9;
-        console.bg = 0x000000;
+        reset_screen(console);
     }
 }
 
@@ -181,7 +175,7 @@ fn handle_ansi(console: &mut Console, byte: u8) {
             console.ansi = 0;
         }
         (2, b'J') => {
-            clear_screen();
+            reset_screen(console);
             console.ansi = 0;
         }
         (2, b'D') => {
@@ -205,6 +199,17 @@ fn handle_ansi(console: &mut Console, byte: u8) {
         }
         _ => console.ansi = 0,
     }
+}
+
+fn reset_screen(console: &mut Console) {
+    let mut fb = framebuffer::init(console.raw);
+    fb.clear(0x000000);
+    console.col = 2;
+    console.row = 2;
+    console.ansi = 0;
+    console.sgr_len = 0;
+    console.fg = 0xd8dee9;
+    console.bg = 0x000000;
 }
 
 fn apply_sgr(console: &mut Console) {

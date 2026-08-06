@@ -186,7 +186,6 @@ struct GraphicsOutputModeInfo {
 pub enum PixelFormat {
     Rgb,
     Bgr,
-    Other,
 }
 
 #[derive(Clone, Copy)]
@@ -213,15 +212,26 @@ pub unsafe fn gop_framebuffer(system_table: *mut SystemTable) -> Option<RawFrame
     let format = match info.pixel_format {
         0 => PixelFormat::Rgb,
         1 => PixelFormat::Bgr,
-        _ => PixelFormat::Other,
+        _ => return None,
     };
+    let width = info.horizontal_resolution as usize;
+    let height = info.vertical_resolution as usize;
+    let stride = info.pixels_per_scan_line as usize;
+    if width == 0 || height == 0 || stride < width || mode.framebuffer_base == 0 {
+        return None;
+    }
+    let row_bytes = stride.checked_mul(4)?;
+    let required_size = row_bytes.checked_mul(height)?;
+    if mode.framebuffer_size < required_size {
+        return None;
+    }
 
     Some(RawFramebuffer {
         base: mode.framebuffer_base as *mut u8,
         size: mode.framebuffer_size,
         width: info.horizontal_resolution,
         height: info.vertical_resolution,
-        stride: info.pixels_per_scan_line as usize,
+        stride,
         format,
     })
 }
@@ -269,7 +279,13 @@ pub unsafe fn memory_map(
         &mut descriptor_size,
         &mut descriptor_version,
     );
-    if is_error(status) || descriptor_size == 0 {
+    if is_error(status)
+        || buffer.is_null()
+        || map_size == 0
+        || map_size > buffer_bytes
+        || descriptor_size < core::mem::size_of::<MemoryDescriptor>()
+        || !map_size.is_multiple_of(descriptor_size)
+    {
         return None;
     }
     Some(MemoryMapInfo {

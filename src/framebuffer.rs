@@ -105,7 +105,7 @@ impl Fb {
     }
 
     fn text_centered(&mut self, y: u64, text: &str, scale: u64, rgb: u32) {
-        let width = text.bytes().count() as u64 * TERM_W as u64 * scale;
+        let width = text.len() as u64 * TERM_W as u64 * scale;
         let x = (self.raw.width as u64).saturating_sub(width) / 2;
         self.text(x, y, text, scale, rgb);
     }
@@ -172,11 +172,7 @@ impl Fb {
             return;
         }
 
-        if !matches!(self.raw.format, PixelFormat::Rgb | PixelFormat::Bgr) {
-            return;
-        }
-
-        let offset = ((y as usize * self.raw.stride + x as usize) * 4) as usize;
+        let offset = (y as usize * self.raw.stride + x as usize) * 4;
         if offset + 3 >= self.raw.size {
             return;
         }
@@ -193,7 +189,6 @@ impl Fb {
                 bytes[offset + 1] = (rgb >> 8) as u8;
                 bytes[offset + 2] = (rgb >> 16) as u8;
             }
-            PixelFormat::Other => {}
         }
     }
 }
