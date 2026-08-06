@@ -26,6 +26,12 @@ use core::panic::PanicInfo;
 pub fn kernel_start() -> ! {
     log::init();
     let boot = boot::info();
+    if let Some(raw) = boot.framebuffer {
+        crash::init(raw);
+        let _ = framebuffer::init(raw);
+        log::init_framebuffer(raw);
+    }
+    bootlog::title();
     bootlog::ok_fmt(format_args!(
         "GRUB hand-off accepted arch={} memory={} modules={}",
         boot.architecture.name(),
@@ -34,6 +40,15 @@ pub fn kernel_start() -> ! {
     ));
     if !boot.cmdline().is_empty() {
         bootlog::info(boot.cmdline());
+    }
+    if let Some(raw) = boot.framebuffer {
+        let fb = framebuffer::init(raw);
+        bootlog::ok_fmt(format_args!(
+            "framebuffer {}x{} pitch {}",
+            fb.width(),
+            fb.height(),
+            fb.pitch()
+        ));
     }
     time::init();
     bootlog::ok("kernel clock initialized");
@@ -44,17 +59,7 @@ pub fn kernel_start() -> ! {
     bootlog::ok("vfs initialized");
     bootlog::ok("serial-debugger input ready");
 
-    if let Some(raw) = boot.framebuffer {
-        crash::init(raw);
-        let fb = framebuffer::init(raw);
-        log::init_framebuffer(raw);
-        bootlog::ok_fmt(format_args!(
-            "framebuffer {}x{} pitch {}",
-            fb.width(),
-            fb.height(),
-            fb.pitch()
-        ));
-    } else {
+    if boot.framebuffer.is_none() {
         bootlog::warn("framebuffer unavailable; serial remains active");
     }
 
@@ -95,6 +100,7 @@ pub fn kernel_start() -> ! {
     bootlog::ok_fmt(format_args!("architecture {}", arch::NAME));
     bootlog::ok_fmt(format_args!("timer ticks {}", time::ticks()));
     bootlog::ok("kernel alive");
+    bootlog::info("future OS bootloader hand-off deferred");
     serial_debugger::run()
 }
 

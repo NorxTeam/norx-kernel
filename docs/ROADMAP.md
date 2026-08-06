@@ -139,15 +139,13 @@ paths below as permanent architecture decisions.
 
 - The GRUB entry layer is now in place; the remaining page-table concerns are
   tracked below and are no longer hidden behind a firmware-specific entry API.
-- x86 user-mode setup still marks firmware-owned transition pages as user
-  accessible, and aarch64 page-table writes still rely on identity-mapped
-  frames. These are protection-boundary issues requiring the new boot contract
-  and syscall/user-mode decision, so they belong to tasks 2–3 rather than a
-  partial local workaround.
+- The old x86 user-mode path and aarch64 identity-mapped page-table concerns
+  remain historical protection-boundary findings. User execution is now
+  intentionally unimplemented; revisit these when a real user ABI is added.
 - The VFS object binaries, universal syscall probes, synchronous process path,
-  framebuffer shell, and their diagnostic state are intentional remaining
-  smoke infrastructure. They are tracked for deletion in tasks 3–5; removing
-  them during this audit would leave a cross-task half-migration.
+  framebuffer shell, and their diagnostic state were removed in tasks 3–5.
+  The remaining VFS and syscall code is intentionally minimal until those
+  subsystems receive a real OS-level design.
 - UART writes still wait indefinitely when the configured device is absent;
   the serial-debugger rewrite must define the early-console failure policy in
   task 4.
@@ -281,40 +279,81 @@ paths below as permanent architecture decisions.
 
 ### 6. Implement the Norx boot presentation
 
-- [ ] Add a compact ASCII-art `Norx` title as the first visible boot output.
-- [ ] Emit ordered kernel startup logs for each initialization stage.
-- [ ] Use consistent colored status markers in the style of `[    OK    ]`,
+- [x] Add a compact ASCII-art `Norx` title as the first visible boot output.
+- [x] Emit ordered kernel startup logs for each initialization stage.
+- [x] Use consistent colored status markers in the style of `[    OK    ]`,
   with matching failure and warning states.
-- [ ] Separate kernel initialization, hardware discovery, diagnostics, and
+- [x] Separate kernel initialization, hardware discovery, diagnostics, and
   the future operating-system boot stage.
-- [ ] Leave an explicit extension point for the future OS bootloader without
+- [x] Leave an explicit extension point for the future OS bootloader without
   claiming that an unimplemented stage has completed.
-- [ ] Keep the same essential startup information available through serial
+- [x] Keep the same essential startup information available through serial
   output when framebuffer output is unavailable.
+
+#### Boot presentation outcome (2026-08-06)
+
+- [x] `bootlog::title()` prints the cyan Norx ASCII art before the first status
+  line. The framebuffer is prepared before that output, so the title reaches
+  both serial and the visible console when a framebuffer exists.
+- [x] Startup output now follows a linear order: GRUB hand-off, framebuffer,
+  clock, drivers, VFS, serial-debugger, memory, architecture tables, interrupts,
+  syscall entry, paging, VM, scheduler, timer, and kernel-alive state.
+- [x] Status labels use fixed-width colored markers with the requested `[    OK    ]`
+  style; the final line explicitly reports the future OS bootloader hand-off as
+  deferred.
+- [x] Verified both freestanding builds, both Clippy runs with `-D warnings`,
+  formatting, and diff whitespace.
 
 ### 7. Replace the console font with JetBrains Mono
 
-- [ ] Locate the already-downloaded JetBrains Mono font asset and verify its
+- [x] Locate the already-downloaded JetBrains Mono font asset and verify its
   format and license before bundling it.
-- [ ] Convert the required glyph range to the bitmap representation used by
+- [x] Convert the required glyph range to the bitmap representation used by
   the Norx console.
-- [ ] Replace the current `noto-sans-mono-bitmap` dependency and generated
+- [x] Replace the current `noto-sans-mono-bitmap` dependency and generated
   font data with the JetBrains Mono asset.
-- [ ] Preserve the existing low-level renderer contract unless the font size
+- [x] Preserve the existing low-level renderer contract unless the font size
   requires a measured layout change.
-- [ ] Verify ASCII-art alignment, boot logs, serial-debugger output, and panic
+- [x] Verify ASCII-art alignment, boot logs, serial-debugger output, and panic
   text at the target resolution.
+
+#### Font outcome (2026-08-06)
+
+- [x] Bundled `assets/fonts/JetBrainsMono-Regular.ttf` and its `OFL.txt` license.
+- [x] Generated Basic Latin glyph bitmaps at 20px with a 19px monospace cell;
+  the framebuffer renderer contract remains the same and line height stays
+  22px.
+- [x] Removed the Noto dependency and lockfile entries; the kernel now embeds
+  only the generated JetBrains Mono bitmap data and needs no runtime font
+  parser.
+- [x] Verified both freestanding builds, both Clippy runs with `-D warnings`,
+  formatting, and diff whitespace.
 
 ### 8. Redesign the kernel panic screen
 
-- [ ] Use a dark-gray background with a centered sad face `:(`.
-- [ ] Display a prominent centered `KERNEL PANIC` heading.
-- [ ] Render the detailed error description below it, including error kind,
+- [x] Use a dark-gray background with a centered sad face `:(`.
+- [x] Display a prominent centered `KERNEL PANIC` heading.
+- [x] Render the detailed error description below it, including error kind,
   architecture, address/register data, ticks/time, boot stage, and relevant
   subsystem state.
-- [ ] Continue emitting the critical panic information to serial output for
+- [x] Continue emitting the critical panic information to serial output for
   headless debugging.
-- [ ] Keep the panic renderer allocation-free and safe when the heap,
+- [x] Keep the panic renderer allocation-free and safe when the heap,
   interrupts, or normal logging path are unavailable.
-- [ ] Test the layout on both supported architectures and with deliberately
-  triggered panic paths.
+- [ ] Capture runtime framebuffer output on both supported architectures and
+  exercise deliberate panic paths.
+
+#### Panic-screen outcome (2026-08-06)
+
+- [x] Replaced the old exclamation-mark drawing with a centered JetBrains Mono
+  `:(` and prominent `KERNEL PANIC` heading on a `0x20242b` dark-gray canvas.
+- [x] Added centered kind, title, message, detail, architecture, ticks, code,
+  `arg0`, `arg1`, and halted-state information below the heading.
+- [x] Kept the renderer bounded by the framebuffer write guard and allocation-
+  free; serial `error::report` still prints the full panic record first.
+- [x] Verified both freestanding builds, both Clippy runs with `-D warnings`,
+  formatting, and diff whitespace. The direct aarch64 QEMU smoke attempt did
+  not produce serial output; full framebuffer capture remains gated by the
+  missing local GRUB image tools.
+- [ ] Re-run the runtime panic capture after installing `grub-mkstandalone`,
+  `grub-file`, and `xorriso` (or an equivalent image-building toolchain).

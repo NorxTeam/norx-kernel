@@ -5,11 +5,6 @@ edition = "2021"
 license = "GPL-3.0-only"
 
 [dependencies]
-noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features = [
-    "regular",
-    "size_20",
-    "unicode-basic-latin",
-] }
 
 [profile.dev]
 panic = "abort"

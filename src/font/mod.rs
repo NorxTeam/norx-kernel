@@ -1,12 +1,25 @@
-use noto_sans_mono_bitmap::{get_raster, get_raster_width, FontWeight, RasterHeight};
+mod data;
 
-const WEIGHT: FontWeight = FontWeight::Regular;
-const HEIGHT_KIND: RasterHeight = RasterHeight::Size20;
-
-pub const WIDTH: usize = get_raster_width(WEIGHT, HEIGHT_KIND);
+pub const WIDTH: usize = data::WIDTH;
 pub const LINE_HEIGHT: usize = 22;
 
-pub fn glyph(byte: u8) -> Option<noto_sans_mono_bitmap::RasterizedChar> {
-    let ch = if byte.is_ascii() { byte as char } else { '?' };
-    get_raster(ch, WEIGHT, HEIGHT_KIND).or_else(|| get_raster('?', WEIGHT, HEIGHT_KIND))
+pub struct RasterizedChar {
+    raster: &'static [[u8; WIDTH]; data::HEIGHT],
+}
+
+impl RasterizedChar {
+    pub const fn raster(&self) -> &'static [[u8; WIDTH]; data::HEIGHT] {
+        self.raster
+    }
+}
+
+pub fn glyph(byte: u8) -> Option<RasterizedChar> {
+    let index = if (0x20..=0x7e).contains(&byte) {
+        (byte - 0x20) as usize
+    } else {
+        (b'?' - 0x20) as usize
+    };
+    Some(RasterizedChar {
+        raster: &data::GLYPHS[index],
+    })
 }

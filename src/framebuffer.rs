@@ -37,30 +37,27 @@ impl Fb {
     }
 
     pub fn crash(&mut self, error: KernelError) {
-        self.clear(0x16191f);
-        let cx = self.raw.width as u64 / 2;
+        self.clear(0x20242b);
         let cy = self.raw.height as u64 / 2;
 
-        self.ring(cx, cy.saturating_sub(148), 52, 0xe8edf4);
-        self.rect(
-            cx.saturating_sub(4),
-            cy.saturating_sub(178),
-            8,
-            42,
-            0xe8edf4,
-        );
-        self.rect(cx.saturating_sub(4), cy.saturating_sub(124), 8, 8, 0xe8edf4);
-
-        self.text_centered(cy.saturating_sub(54), error.title(), 3, 0xf4f7fb);
-        self.text_centered(cy + 4, error.message, 2, 0xc8d0da);
-        self.text_centered(cy + 42, error.detail, 1, 0xaeb7c2);
-        self.text_centered(cy + 76, "CODE", 1, 0x7f8894);
-        self.hex_centered(cy + 98, error.code, 1, 0xaeb7c2);
-        self.text_centered(cy + 132, "ARG0", 1, 0x7f8894);
-        self.hex_centered(cy + 154, error.arg0, 1, 0xaeb7c2);
-        self.text_centered(cy + 188, "ARG1", 1, 0x7f8894);
-        self.hex_centered(cy + 210, error.arg1, 1, 0xaeb7c2);
-        self.text_centered(cy + 250, "SYSTEM HALTED", 1, 0x7f8894);
+        self.text_centered(cy.saturating_sub(142), ":(", 3, 0xf4f7fb);
+        self.text_centered(cy.saturating_sub(82), "KERNEL PANIC", 2, 0xf4f7fb);
+        self.text_centered(cy.saturating_sub(42), error.title(), 1, 0xc8d0da);
+        self.text_centered(cy.saturating_sub(20), error.message, 1, 0xc8d0da);
+        self.text_centered(cy + 2, error.detail, 1, 0xaeb7c2);
+        self.text_centered(cy + 28, "KIND", 1, 0x7f8894);
+        self.text_centered(cy + 46, error.kind_name(), 1, 0xaeb7c2);
+        self.text_centered(cy + 70, "ARCH", 1, 0x7f8894);
+        self.text_centered(cy + 88, crate::arch::NAME, 1, 0xaeb7c2);
+        self.text_centered(cy + 112, "TICKS", 1, 0x7f8894);
+        self.hex_centered(cy + 130, crate::time::ticks(), 1, 0xaeb7c2);
+        self.text_centered(cy + 154, "CODE", 1, 0x7f8894);
+        self.hex_centered(cy + 172, error.code, 1, 0xaeb7c2);
+        self.text_centered(cy + 196, "ARG0", 1, 0x7f8894);
+        self.hex_centered(cy + 214, error.arg0, 1, 0xaeb7c2);
+        self.text_centered(cy + 238, "ARG1", 1, 0x7f8894);
+        self.hex_centered(cy + 256, error.arg1, 1, 0xaeb7c2);
+        self.text_centered(cy + 296, "SYSTEM HALTED", 1, 0x7f8894);
     }
 
     pub fn term_char(&mut self, x: usize, y: usize, byte: u8, fg: u32, bg: u32) {
@@ -85,21 +82,6 @@ impl Fb {
         for yy in y..y.saturating_add(h) {
             for xx in x..x.saturating_add(w) {
                 self.put_pixel(xx, yy, rgb);
-            }
-        }
-    }
-
-    fn ring(&mut self, cx: u64, cy: u64, r: u64, rgb: u32) {
-        let inner = r.saturating_sub(4) * r.saturating_sub(4);
-        let outer = r * r;
-        for y in cy.saturating_sub(r)..cy.saturating_add(r) {
-            for x in cx.saturating_sub(r)..cx.saturating_add(r) {
-                let dx = x.abs_diff(cx);
-                let dy = y.abs_diff(cy);
-                let d = dx * dx + dy * dy;
-                if d >= inner && d <= outer {
-                    self.put_pixel(x, y, rgb);
-                }
             }
         }
     }
