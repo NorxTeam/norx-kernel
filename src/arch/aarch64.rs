@@ -5,7 +5,6 @@ pub const NAME: &str = "aarch64";
 pub mod paging;
 pub mod syscall;
 pub mod tables;
-pub mod user;
 
 pub fn init() {
     unsafe {
@@ -50,14 +49,7 @@ pub fn init_interrupt_controller() {
 
 pub fn init_syscalls() {
     syscall::init();
-    let status = syscall::status();
-    if status.dispatcher_ready {
-        crate::bootlog::ok("aarch64 universal syscall dispatcher initialized");
-    }
-    if status.svc_ready {
-        crate::bootlog::ok("aarch64 svc syscall entry initialized");
-    }
-    crate::bootlog::warn("aarch64 EL0 syscall return deferred");
+    crate::bootlog::ok("aarch64 SVC syscall entry initialized");
 }
 
 pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
@@ -83,16 +75,4 @@ pub fn map_lazy_page(_virtual_address: usize) -> bool {
 
 pub fn supports_lazy_pages() -> bool {
     false
-}
-
-pub fn user_mode_ready() -> bool {
-    user::context().ready
-}
-
-pub fn syscall_ready() -> bool {
-    syscall::status().svc_ready
-}
-
-pub fn prepare_user_mode() -> bool {
-    user::prepare()
 }

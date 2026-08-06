@@ -4,12 +4,9 @@ const LAZY_PAGES: usize = 16;
 const TABLE_PAGES: usize = 32;
 const DIRECT_MAP_BYTES: usize = 16 * 1024 * 1024;
 pub const DIRECT_MAP_BASE: usize = 0xffff_8000_0000_0000;
-pub const USER_CODE_BASE: usize = 0x0000_0800_0000_0000;
-pub const USER_STACK_TOP: usize = 0x0000_0800_0010_0000;
 
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
-const PTE_USER: u64 = 1 << 2;
 
 #[repr(align(4096))]
 #[allow(dead_code)]
@@ -32,8 +29,6 @@ pub struct Stats {
     pub direct_map_ready: bool,
     pub norx_cr3_ready: bool,
     pub norx_cr3: u64,
-    pub user_code_base: usize,
-    pub user_stack_top: usize,
 }
 
 #[link_section = ".data"]
@@ -88,8 +83,6 @@ pub fn stats() -> Stats {
             direct_map_ready: DIRECT_MAP_READY,
             norx_cr3_ready: NORX_CR3_READY,
             norx_cr3: NORX_CR3,
-            user_code_base: USER_CODE_BASE,
-            user_stack_top: USER_STACK_TOP,
         }
     }
 }
@@ -124,31 +117,6 @@ pub fn init_norx_cr3() -> bool {
         asm!("mov cr3, {}", in(reg) new_p4, options(nostack, preserves_flags));
         NORX_CR3_READY = true;
         true
-    }
-}
-
-pub fn map_user_page(virtual_address: usize, writable: bool) -> Option<u64> {
-    let frame = crate::memory::alloc_frame()?;
-    unsafe {
-        zero_physical_page(frame)?;
-        let cr0 = disable_write_protect();
-        let flags = PTE_PRESENT | PTE_USER | if writable { PTE_WRITABLE } else { 0 };
-        let mapped = map_to_flags(virtual_address, frame, flags);
-        restore_cr0(cr0);
-        if mapped {
-            Some(frame)
-        } else {
-            None
-        }
-    }
-}
-
-pub fn mark_user_accessible(virtual_address: usize) -> bool {
-    unsafe {
-        let cr0 = disable_write_protect();
-        let marked = mark_user_accessible_inner(virtual_address);
-        restore_cr0(cr0);
-        marked
     }
 }
 
@@ -216,13 +184,13 @@ unsafe fn map_to_flags(virtual_address: usize, frame: u64, flags: u64) -> bool {
     let cr3 = current_cr3();
     let p4 = (cr3 & 0x000f_ffff_ffff_f000) as *mut u64;
 
-    let Some(p3) = next_table(p4.add(p4_i), flags) else {
+    let Some(p3) = next_table(p4.add(p4_i)) else {
         return false;
     };
-    let Some(p2) = next_table(p3.add(p3_i), flags) else {
+    let Some(p2) = next_table(p3.add(p3_i)) else {
         return false;
     };
-    let Some(p1) = next_table(p2.add(p2_i), flags) else {
+    let Some(p1) = next_table(p2.add(p2_i)) else {
         return false;
     };
 
@@ -252,14 +220,12 @@ unsafe fn restore_cr0(cr0: u64) {
     asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags));
 }
 
-unsafe fn next_table(entry: *mut u64, flags: u64) -> Option<*mut u64> {
+unsafe fn next_table(entry: *mut u64) -> Option<*mut u64> {
     if *entry & 1 == 0 {
         let frame = table_frame()?;
         make_mapping_writable(frame as usize);
         zero_page(frame);
-        *entry = frame | PTE_PRESENT | PTE_WRITABLE | (flags & PTE_USER);
-    } else if flags & PTE_USER != 0 {
-        *entry |= PTE_USER;
+        *entry = frame | PTE_PRESENT | PTE_WRITABLE;
     }
     Some((*entry & 0x000f_ffff_ffff_f000) as *mut u64)
 }
@@ -341,54 +307,6 @@ unsafe fn make_mapping_writable(address: usize) -> bool {
         return false;
     }
     *e1 |= 0b10;
-    asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
-    true
-}
-
-unsafe fn mark_user_accessible_inner(address: usize) -> bool {
-    let mut cr3: u64;
-    asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
-    let p4 = (cr3 & 0x000f_ffff_ffff_f000) as *mut u64;
-
-    let p4_i = (address >> 39) & 0x1ff;
-    let p3_i = (address >> 30) & 0x1ff;
-    let p2_i = (address >> 21) & 0x1ff;
-    let p1_i = (address >> 12) & 0x1ff;
-
-    let e4 = p4.add(p4_i);
-    if *e4 & 1 == 0 {
-        return false;
-    }
-    *e4 |= PTE_USER;
-
-    let p3 = (*e4 & 0x000f_ffff_ffff_f000) as *mut u64;
-    let e3 = p3.add(p3_i);
-    if *e3 & 1 == 0 {
-        return false;
-    }
-    *e3 |= PTE_USER;
-    if *e3 & (1 << 7) != 0 {
-        asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
-        return true;
-    }
-
-    let p2 = (*e3 & 0x000f_ffff_ffff_f000) as *mut u64;
-    let e2 = p2.add(p2_i);
-    if *e2 & 1 == 0 {
-        return false;
-    }
-    *e2 |= PTE_USER;
-    if *e2 & (1 << 7) != 0 {
-        asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
-        return true;
-    }
-
-    let p1 = (*e2 & 0x000f_ffff_ffff_f000) as *mut u64;
-    let e1 = p1.add(p1_i);
-    if *e1 & 1 == 0 {
-        return false;
-    }
-    *e1 |= PTE_USER;
     asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
     true
 }

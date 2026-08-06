@@ -60,15 +60,12 @@ norx_aarch64_sync_exception:
     b 9f
 1:
     mrs x10, esr_el1
-    mrs x11, elr_el1
     b 4f
 2:
     mrs x10, esr_el2
-    mrs x11, elr_el2
     b 4f
 3:
     mrs x10, esr_el3
-    mrs x11, elr_el3
 4:
     ubfx x12, x10, #26, #6
     cmp x12, #0x15
@@ -87,15 +84,6 @@ norx_aarch64_sync_exception:
     mov x5, x13
     mov x6, x14
     bl norx_aarch64_syscall_rust
-    adrp x9, NORX_AARCH64_USER_PROBE_RETURN_PC
-    add x9, x9, :lo12:NORX_AARCH64_USER_PROBE_RETURN_PC
-    ldr x10, [x9]
-    cbz x10, 11f
-    ldr x11, [sp, #56]
-    cmp x11, #1
-    b.ne 11f
-    cbnz x10, 10f
-11:
     ldp x1, x2, [sp, #0]
     ldp x3, x4, [sp, #16]
     ldp x5, x6, [sp, #32]
@@ -105,39 +93,10 @@ norx_aarch64_sync_exception:
     ldp x13, x14, [sp, #96]
     ldp x29, x30, [sp, #112]
     add sp, sp, #160
-    mrs x9, CurrentEL
-    ubfx x9, x9, #2, #2
-    cmp x9, #1
-    b.eq 5f
-    cmp x9, #2
-    b.eq 6f
-    cmp x9, #3
-    b.eq 7f
-    eret
-5:
-    eret
-6:
-    eret
-7:
     eret
 9:
     add sp, sp, #160
     b norx_aarch64_exception
-10:
-    adrp x9, NORX_AARCH64_USER_PROBE_RETURN_SP
-    add x9, x9, :lo12:NORX_AARCH64_USER_PROBE_RETURN_SP
-    ldr x10, [x9]
-    mov sp, x10
-    adrp x9, NORX_AARCH64_USER_PROBE_RETURN_PC
-    add x9, x9, :lo12:NORX_AARCH64_USER_PROBE_RETURN_PC
-    ldr x11, [x9]
-    adrp x9, NORX_AARCH64_USER_PROBE_DONE
-    add x9, x9, :lo12:NORX_AARCH64_USER_PROBE_DONE
-    str xzr, [x9]
-    adrp x9, NORX_AARCH64_USER_PROBE_ACTIVE
-    add x9, x9, :lo12:NORX_AARCH64_USER_PROBE_ACTIVE
-    str xzr, [x9]
-    br x11
 "#
 );
 

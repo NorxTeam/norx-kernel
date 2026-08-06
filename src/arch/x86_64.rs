@@ -6,7 +6,6 @@ pub mod apic;
 pub mod paging;
 pub mod syscall;
 pub mod tables;
-pub mod user;
 
 pub fn init() {
     crate::drivers::serial::ns16550::init_port_io(0x3f8);
@@ -70,11 +69,7 @@ pub fn init_interrupt_controller() {
 
 pub fn init_syscalls() {
     syscall::init();
-    let status = syscall::status();
-    crate::bootlog::ok_fmt(format_args!(
-        "syscall entry lstar 0x{:x} fmask 0x{:x} kstack 0x{:x}",
-        status.lstar, status.fmask, status.kernel_stack_top
-    ));
+    crate::bootlog::ok("x86_64 syscall entry initialized");
 }
 
 pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
@@ -141,16 +136,4 @@ pub fn map_lazy_page(virtual_address: usize) -> bool {
 
 pub fn supports_lazy_pages() -> bool {
     true
-}
-
-pub fn user_mode_ready() -> bool {
-    tables::user_segments_ready() && user::context().ready
-}
-
-pub fn syscall_ready() -> bool {
-    syscall::status().ready
-}
-
-pub fn prepare_user_mode() -> bool {
-    user::prepare()
 }

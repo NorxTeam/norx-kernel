@@ -6,8 +6,9 @@
 2. GRUB memory map, reserved regions, framebuffer, modules, and command line.
 3. Kernel paging, physical-frame allocation, and lazy page-fault allocation.
 4. Interrupt timers and preemptive scheduling.
-5. Norx syscall ABI with SCLA activation.
-6. Process loader, address spaces, VFS, drivers, userspace services.
+5. Architecture-local syscall entry points and a deliberately unspecified ABI.
+6. Process loader, address spaces, VFS, and userspace services after the ABI is
+   designed from real requirements.
 
 ## Architecture Notes To Explore
 
@@ -66,39 +67,26 @@ Do not build speculative versions of these ideas before the required lower layer
 
 - VFS mounts a tiny in-kernel root over `norx-ram0`.
 - `/hello.txt` supports read/write through shell commands `ls`, `cat`, `write`, and `vfs`.
-- `/bin/hello` and `/bin/args` are tiny Norx object files with code sections stored in VFS over `norx-ram0`.
+- No executable objects are stored in VFS; the root currently contains only the
+  text smoke file.
 - This is a smoke layer for future ext4/zfs/btrfs/exfat adapters, not a real on-disk filesystem yet.
 
 ## Current Process Status
 
-- `run` resolves executable paths through VFS, reads the object bytes, validates the header, loads the code section into the user code page, and executes it through the architecture user-mode path.
-- `rundebug` keeps the temporary in-kernel entry-id path for smoke tests.
-- User program launches now allocate a PID and record owner, state, exit code, runtime ticks, capabilities, path, and code size in a small fixed process table exposed by `ps`, `procs`, `wait <pid>`, and `kill <pid>`.
-- Loaded user code now performs buffered `Write(ptr,len)` before `Exit`, so userspace string output reaches the kernel log path on x86_64 and aarch64.
-- Loaded user code receives a compact `argc/argv` table in the user stack and can print `argv[0]` through the same `Write(ptr,len)` path.
-- Process I/O is now bound to the shell session that launched it: VM-owned commands write to the framebuffer session, serial-owned commands write/read through serial. The current synchronous runner keeps `stdin/stdout/stderr` in a process-scoped I/O guard, with small per-session stdout/stderr rings readable through `stdio tail` and consumable through `stdio read`.
-- Executables expose a tiny Norx object header: magic, ABI version, entry id, flags, capabilities, code length.
-- Executables now carry capability bitsets in their VFS object header; shell command `sec` shows kernel/user-mode security status.
-- x86_64 GDT has ring-3 code/data descriptors and a loaded TSS with RSP0 kernel stack; `userctx` exposes selectors, user pages, and TSS diagnostics.
-- x86_64 prepares a user launch context: user code page, user stack page, selectors, kernel transition stack, and a tiny user probe payload.
 - x86_64 now clones the firmware PML4 into a Norx-owned CR3 and switches to it after direct-map setup.
-- x86_64 can enter the user probe page through `iretq`; diagnostics prove CPL3 RIP/RSP and the probe payload bytes.
-- x86_64 `userprobe` now performs a real ring3 -> `int 0x80` -> universal syscall dispatcher -> shell round-trip and returns value `42`.
-- x86_64 user syscall diagnostics expose trap count, int80 hits, fast-path hits, last op, and probe fault RIP.
-- aarch64 has the shared universal syscall dispatcher, a real `svc #0` kernel smoke path through the exception vector, and `userctx` reports EL0 PC/SP layout.
-- aarch64 allocates physical frames for the EL0 probe payload and stack, writes the payload bytes, maps both frames into the shared 44-bit-safe user VA window, and `userprobe` now performs EL0 -> `svc #0` -> kernel -> shell round-trip with value `42`.
-- Next step: move process execution out of the synchronous shell call path, using the process table and stdio ring cursors as the first async output collection path.
+- No process loader, executable format, process table, user payload, or
+  capability model is active. These are postponed until a real userspace
+  design exists.
 
 ## Current Syscall Status
 
-- SCLA constants and activation registers are documented for x86_64 and aarch64.
-- A Norx universal syscall dispatcher exists for activation, clock, byte/buffer read/write, and exit; loaded user code exercises session-routed buffered write, `argv[0]` output, and exit on both supported architectures.
-- Syscall dispatch accepts capability sets and denies unauthorized operations.
-- x86_64 configures `syscall/sysret` MSRs (`STAR`, `LSTAR`, `FMASK`) and has an entry stub wired to the universal dispatcher.
-- x86_64 syscall entry now switches from user RSP to the TSS/RSP0 kernel stack before calling Rust code, then restores user RSP for `sysretq`.
-- x86_64 also has a DPL3 `int 0x80` gate stub for the same universal dispatcher and uses a high user VA region outside firmware identity maps.
-- Shell command `syscalltrap` exercises the x86_64 trap handler path from kernel smoke; `userprobe` proves a tiny CPL3 trap round-trip through the same universal dispatcher.
-- aarch64 has an arch-local dispatcher/status layer, same-EL SVC entry, EL0 code/stack page mappings, and a working EL0 SVC probe round-trip.
+- No SCLA or universal cross-architecture dispatcher is part of the kernel.
+- x86_64 keeps the hardware `syscall/sysret` entry and a TSS-backed kernel stack;
+  an unassigned operation returns `ENOSYS`.
+- aarch64 keeps the exception-vector SVC entry; an unassigned operation returns
+  `ENOSYS`.
+- Userspace memory, process execution, capabilities, and the syscall numbers
+  remain intentionally undefined until their actual consumers exist.
 
 ## Norx Kernel Patch Backlog
 
@@ -201,16 +189,35 @@ paths below as permanent architecture decisions.
 
 ### 3. Remove universal-syscall binary smoke paths
 
-- [ ] Remove the embedded `/bin/hello` and `/bin/args` machine-code payloads,
+- [x] Remove the embedded `/bin/hello` and `/bin/args` machine-code payloads,
   `object_code`, and their architecture-specific byte arrays.
-- [ ] Remove VFS sectors and object generation used only to store those test
+- [x] Remove VFS sectors and object generation used only to store those test
   binaries.
-- [ ] Remove the universal syscall/SCLA demonstration path if the audit shows
-  it is not part of the intended kernel ABI.
-- [ ] Remove the related loader, probe, capability, status, and diagnostic
+- [x] Remove the universal syscall/SCLA demonstration path because it is not
+  part of the intended kernel ABI.
+- [x] Remove the related loader, probe, capability, status, and diagnostic
   code instead of leaving partial compatibility shims.
-- [ ] Keep only the real architecture-local syscall entry points and the
+- [x] Keep only the real architecture-local syscall entry points and the
   minimum ABI needed by the future userspace design.
+
+#### Universal-syscall cleanup outcome (2026-08-06)
+
+- [x] Deleted the embedded executable objects, architecture-specific machine
+  code, object headers, process loader, synchronous process table, user-mode
+  probes, capability set, SCLA constants, and stdio rings.
+- [x] Reduced the RAM VFS to `/hello.txt`; its one-byte sector length is now
+  bounded to 255 bytes instead of pretending a 511-byte file fits.
+- [x] Kept only architecture-local `syscall/sysret` and SVC entry stubs. They
+  do not expose an ABI yet and return `ENOSYS` for every unassigned operation.
+- [x] Removed shell commands and diagnostics that existed only to exercise the
+  deleted path: `sec`, `userctx`, `userprobe`, `procs`, `ps`, `wait`, `kill`,
+  `run`, `rundebug`, `runuser`, `syscalls`, `syscalltrap`, `sclatest`, and
+  `stdio`.
+- [x] Verified both freestanding builds, both Clippy runs with `-D warnings`,
+  formatting, diff whitespace, and a source scan with no universal syscall or
+  embedded-binary references remaining.
+- The next userspace implementation must begin with an explicit ABI and page
+  ownership design; no compatibility layer is intentionally carried forward.
 
 ### 4. Replace the kernel shell with `serial-debugger`
 
@@ -228,11 +235,11 @@ paths below as permanent architecture decisions.
 
 - [ ] Review every current command and remove anything not needed by the
   serial debugger.
-- [ ] Candidates for removal include `dmaptest`, `syscalltrap`, `sclatest`,
-  `stdio`, `lazytest`, `block`, `vfs`, `run`, `rundebug`, and `runuser`, plus
-  their backing code and state.
-- [ ] Remove test-only counters, probe payloads, fake process paths, embedded
-  binaries, smoke-only VFS data, and obsolete diagnostic formatting.
+- [ ] Candidates for removal include `dmaptest`, `lazytest`, `block`, and
+  VFS/shell diagnostics that do not help recover the kernel, plus their backing
+  code and state.
+- [ ] Remove remaining test-only counters, fake paths, smoke-only VFS data, and
+  obsolete diagnostic formatting.
 - [ ] Keep a small intentional diagnostic set for boot state, memory, paging,
   interrupts, processes, logs, and explicit panic testing.
 - [ ] Re-run the audit after deletion so no command references or dead

@@ -1,107 +1,4 @@
-use core::{
-    arch::{asm, global_asm},
-    ptr,
-};
-
-global_asm!(
-    r#"
-    .global norx_x86_64_user_probe_finish
-norx_x86_64_user_probe_finish:
-    mov qword ptr [rip + NORX_X86_64_USER_PROBE_VALUE], 42
-    mov rsp, qword ptr [rip + NORX_X86_64_USER_PROBE_RETURN_RSP]
-    mov rax, qword ptr [rip + NORX_X86_64_USER_PROBE_VALUE]
-    mov r11, qword ptr [rip + NORX_X86_64_USER_PROBE_RETURN_RIP]
-    mov byte ptr [rip + NORX_X86_64_USER_PROBE_DONE], 0
-    mov byte ptr [rip + NORX_X86_64_USER_PROBE_ACTIVE], 0
-    mov dx, 0x10
-    mov ds, dx
-    mov es, dx
-    jmp r11
-
-    .global norx_x86_64_user_probe_trap
-norx_x86_64_user_probe_trap:
-    mov qword ptr [rip + NORX_X86_64_USER_PROBE_VALUE], rdi
-    mov rsp, qword ptr [rip + NORX_X86_64_USER_PROBE_RETURN_RSP]
-    mov rax, qword ptr [rip + NORX_X86_64_USER_PROBE_VALUE]
-    mov r11, qword ptr [rip + NORX_X86_64_USER_PROBE_RETURN_RIP]
-    mov byte ptr [rip + NORX_X86_64_USER_PROBE_DONE], 0
-    mov byte ptr [rip + NORX_X86_64_USER_PROBE_ACTIVE], 0
-    mov dx, 0x10
-    mov ds, dx
-    mov es, dx
-    jmp r11
-
-    .global norx_x86_64_int80_entry
-norx_x86_64_int80_entry:
-    inc qword ptr [rip + NORX_X86_64_INT80_HITS]
-    mov qword ptr [rip + NORX_X86_64_INT80_LAST_OP], rax
-    cmp byte ptr [rip + NORX_X86_64_USER_PROBE_ACTIVE], 0
-    je .Lnorx_int80_full
-    cmp rax, 1
-    jne .Lnorx_int80_full
-    inc qword ptr [rip + NORX_X86_64_INT80_FAST_HITS]
-    mov rdi, 1
-    mov rsi, 42
-    xor rdx, rdx
-    xor rcx, rcx
-    xor r8, r8
-    xor r9, r9
-    call norx_x86_64_syscall_rust
-    mov rsp, qword ptr [rip + NORX_X86_64_USER_PROBE_RETURN_RSP]
-    mov r11, qword ptr [rip + NORX_X86_64_USER_PROBE_RETURN_RIP]
-    mov byte ptr [rip + NORX_X86_64_USER_PROBE_ACTIVE], 0
-    mov byte ptr [rip + NORX_X86_64_USER_PROBE_DONE], 0
-    mov dx, 0x10
-    mov ds, dx
-    mov es, dx
-    jmp r11
-.Lnorx_int80_full:
-    push rdi
-    push rsi
-    push rdx
-    push r10
-    push r8
-    push r9
-    push rcx
-    push r11
-    sub rsp, 8
-    mov r9, r8
-    mov r8, r10
-    mov rcx, rdx
-    mov rdx, rsi
-    mov rsi, rdi
-    mov rdi, rax
-    call norx_x86_64_syscall_rust
-    cmp byte ptr [rip + NORX_X86_64_USER_PROBE_DONE], 0
-    jne .Lnorx_int80_done
-    add rsp, 8
-    pop r11
-    pop rcx
-    pop r9
-    pop r8
-    pop r10
-    pop rdx
-    pop rsi
-    pop rdi
-    iretq
-.Lnorx_int80_done:
-    mov rsp, qword ptr [rip + NORX_X86_64_USER_PROBE_RETURN_RSP]
-    mov rax, qword ptr [rip + NORX_X86_64_USER_PROBE_VALUE]
-    mov r11, qword ptr [rip + NORX_X86_64_USER_PROBE_RETURN_RIP]
-    mov byte ptr [rip + NORX_X86_64_USER_PROBE_DONE], 0
-    mov byte ptr [rip + NORX_X86_64_USER_PROBE_ACTIVE], 0
-    mov dx, 0x10
-    mov ds, dx
-    mov es, dx
-    jmp r11
-"#
-);
-
-extern "C" {
-    fn norx_x86_64_int80_entry();
-    fn norx_x86_64_user_probe_finish() -> !;
-    static mut NORX_X86_64_USER_PROBE_FAULT_RIP: u64;
-}
+use core::{arch::asm, ptr};
 
 #[repr(C, packed)]
 struct Pointer {
@@ -147,11 +44,6 @@ impl IdtEntry {
         self.offset_mid = (addr >> 16) as u16;
         self.offset_high = (addr >> 32) as u32;
     }
-
-    fn set_user_addr(&mut self, addr: u64) {
-        self.set_addr(addr);
-        self.options = 0xee00;
-    }
 }
 
 #[repr(C)]
@@ -165,7 +57,6 @@ pub struct InterruptStackFrame {
 
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
-pub const USER_DATA_SELECTOR: u16 = 0x18 | 3;
 pub const USER_CODE_SELECTOR: u16 = 0x20 | 3;
 pub const TSS_SELECTOR: u16 = 0x28;
 
@@ -198,44 +89,6 @@ impl TaskStateSegment {
             iomap_base: 0,
         }
     }
-}
-
-#[derive(Clone, Copy)]
-pub struct TssStatus {
-    pub ready: bool,
-    pub selector: u16,
-    pub rsp0: u64,
-    pub stack_top: u64,
-    pub stack_size: usize,
-}
-
-#[derive(Clone, Copy)]
-pub struct TransitionPages {
-    pub gdt: usize,
-    pub idt: usize,
-    pub tss: usize,
-    pub int80: usize,
-}
-
-#[derive(Clone, Copy)]
-pub struct CpuTables {
-    pub gdtr_base: u64,
-    pub idtr_base: u64,
-    pub tr: u16,
-}
-
-#[derive(Clone, Copy)]
-pub struct GateStatus {
-    pub offset: u64,
-    pub selector: u16,
-    pub options: u16,
-}
-
-#[derive(Clone, Copy)]
-pub struct TssDescriptorStatus {
-    pub base: u64,
-    pub limit: u32,
-    pub access: u8,
 }
 
 static mut GDT: [u64; 7] = [
@@ -289,80 +142,8 @@ fn load_gdt() {
     }
 }
 
-pub fn user_segments_ready() -> bool {
-    USER_CODE_SELECTOR == 0x23 && USER_DATA_SELECTOR == 0x1b && tss_status().ready
-}
-
-pub fn tss_status() -> TssStatus {
-    unsafe {
-        let tss = ptr::addr_of!(TSS);
-        let rsp0 = ptr::addr_of!((*tss).rsp).cast::<u64>().read_unaligned();
-        let stack_top = kernel_stack_top();
-        TssStatus {
-            ready: TSS_READY,
-            selector: TSS_SELECTOR,
-            rsp0,
-            stack_top,
-            stack_size: KERNEL_STACK_SIZE,
-        }
-    }
-}
-
-pub fn transition_pages() -> TransitionPages {
-    TransitionPages {
-        gdt: (&raw const GDT) as usize,
-        idt: (&raw const IDT) as usize,
-        tss: (&raw const TSS) as usize,
-        int80: norx_x86_64_int80_entry as *const () as usize,
-    }
-}
-
-pub fn cpu_tables() -> CpuTables {
-    unsafe {
-        let mut gdtr = Pointer { limit: 0, base: 0 };
-        let mut idtr = Pointer { limit: 0, base: 0 };
-        let tr: u16;
-        asm!("sgdt [{}]", in(reg) &mut gdtr, options(nostack, preserves_flags));
-        asm!("sidt [{}]", in(reg) &mut idtr, options(nostack, preserves_flags));
-        asm!("str ax", out("ax") tr, options(nomem, nostack, preserves_flags));
-        CpuTables {
-            gdtr_base: ptr::addr_of!(gdtr.base).read_unaligned(),
-            idtr_base: ptr::addr_of!(idtr.base).read_unaligned(),
-            tr,
-        }
-    }
-}
-
-pub fn int80_gate() -> GateStatus {
-    unsafe {
-        let entry = (&raw const IDT).cast::<IdtEntry>().add(0x80);
-        let offset_low = ptr::addr_of!((*entry).offset_low).read_unaligned() as u64;
-        let offset_mid = ptr::addr_of!((*entry).offset_mid).read_unaligned() as u64;
-        let offset_high = ptr::addr_of!((*entry).offset_high).read_unaligned() as u64;
-        GateStatus {
-            offset: offset_low | (offset_mid << 16) | (offset_high << 32),
-            selector: ptr::addr_of!((*entry).selector).read_unaligned(),
-            options: ptr::addr_of!((*entry).options).read_unaligned(),
-        }
-    }
-}
-
-pub fn tss_descriptor() -> TssDescriptorStatus {
-    unsafe {
-        let gdt = (&raw const GDT).cast::<u64>();
-        let low = gdt.add(TSS_GDT_INDEX).read_volatile();
-        let high = gdt.add(TSS_GDT_INDEX + 1).read_volatile();
-        let limit = ((low & 0xffff) | (((low >> 48) & 0x0f) << 16)) as u32;
-        let base = ((low >> 16) & 0xffff)
-            | (((low >> 32) & 0xff) << 16)
-            | (((low >> 56) & 0xff) << 24)
-            | ((high & 0xffff_ffff) << 32);
-        TssDescriptorStatus {
-            base,
-            limit,
-            access: ((low >> 40) & 0xff) as u8,
-        }
-    }
+pub fn syscall_stack_top() -> u64 {
+    unsafe { ptr::addr_of!(TSS.rsp).cast::<u64>().read_unaligned() }
 }
 
 fn init_tss() {
@@ -413,7 +194,6 @@ fn load_idt() {
         (*idt.add(14)).set_err(page_fault);
         (*idt.add(32)).set(timer_interrupt);
         (*idt.add(33)).set(keyboard_interrupt);
-        (*idt.add(0x80)).set_user_addr(norx_x86_64_int80_entry as *const () as usize as u64);
         let ptr = Pointer {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
             base: (&raw const IDT) as u64,
@@ -462,13 +242,6 @@ extern "x86-interrupt" fn breakpoint(_stack: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn invalid_opcode(stack: InterruptStackFrame) {
-    if stack.code_segment == USER_CODE_SELECTOR as u64 && crate::arch::syscall::user_probe_active()
-    {
-        unsafe {
-            NORX_X86_64_USER_PROBE_FAULT_RIP = stack.instruction_pointer;
-            norx_x86_64_user_probe_finish()
-        };
-    }
     crate::irq::exception();
     crate::kprintln!(
         "  frame: rip=0x{:016x} rsp=0x{:016x} cs=0x{:016x} ss=0x{:016x}",

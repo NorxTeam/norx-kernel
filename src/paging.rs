@@ -8,8 +8,6 @@ pub struct Stats {
     pub lazy_pages: usize,
     pub table_pages_used: usize,
     pub table_pages_total: usize,
-    pub user_code_base: usize,
-    pub user_stack_top: usize,
 }
 
 pub fn init() {
@@ -51,8 +49,6 @@ fn arch_stats() -> Stats {
         lazy_pages: stats.lazy_pages,
         table_pages_used: stats.table_pages_used,
         table_pages_total: stats.table_pages_total,
-        user_code_base: stats.user_code_base,
-        user_stack_top: stats.user_stack_top,
     }
 }
 
@@ -67,7 +63,5 @@ fn arch_stats() -> Stats {
         lazy_pages: 0,
         table_pages_used: 0,
         table_pages_total: 0,
-        user_code_base: crate::arch::user::USER_CODE_BASE,
-        user_stack_top: crate::arch::user::USER_STACK_TOP,
     }
 }

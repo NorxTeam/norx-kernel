@@ -41,8 +41,6 @@ struct Session {
     drawn: usize,
     history_offset: usize,
     history: History,
-    stdio_stdout: usize,
-    stdio_stderr: usize,
 }
 
 impl Session {
@@ -57,8 +55,6 @@ impl Session {
             drawn: 0,
             history_offset: 0,
             history: History::new(),
-            stdio_stdout: 0,
-            stdio_stderr: 0,
         }
     }
 
@@ -66,7 +62,7 @@ impl Session {
         self.println("Norx Shell");
         self.println("sessions: user framebuffer + serial console");
         self.println(
-            "builtins: help clear echo time ticks sched irq input hw sec userctx userprobe mem paging dmaptest vm block vfs ls cat write procs ps wait kill uname drivers syscalls syscalltrap sclatest stdio [tail|read] lazytest run rundebug runuser crash halt",
+            "builtins: help clear echo time ticks sched irq input hw mem paging dmaptest vm block vfs ls cat write uname drivers lazytest crash halt",
         );
         self.prompt();
     }
@@ -213,14 +209,6 @@ impl Session {
         }
     }
 
-    fn io(&self) -> crate::abi::syscall::ProcessIo {
-        let target = match self.target {
-            Target::User => crate::abi::syscall::IoTarget::User,
-            Target::Serial => crate::abi::syscall::IoTarget::Serial,
-        };
-        crate::abi::syscall::ProcessIo::session(target)
-    }
-
     fn write_fmt(&mut self, args: fmt::Arguments) {
         let _ = SessionWriter(self).write_fmt(args);
     }
@@ -282,7 +270,7 @@ fn exec(session: &mut Session, line: &str) {
 
     match args[0] {
         "help" => session.println(
-            "builtins: help clear echo time ticks sched irq input hw sec userctx userprobe mem paging dmaptest vm block vfs ls cat write procs ps wait kill uname drivers syscalls syscalltrap sclatest stdio [tail|read] lazytest run rundebug runuser crash halt",
+            "builtins: help clear echo time ticks sched irq input hw mem paging dmaptest vm block vfs ls cat write uname drivers lazytest crash halt",
         ),
         "clear" => {
             if matches!(session.target, Target::User) {
@@ -304,9 +292,6 @@ fn exec(session: &mut Session, line: &str) {
         "irq" => irq(session),
         "input" => input(session),
         "hw" => hw(session),
-        "sec" => sec(session),
-        "userctx" => userctx(session),
-        "userprobe" => userprobe(session),
         "mem" => mem(session),
         "paging" => paging(session),
         "dmaptest" => dmaptest(session),
@@ -316,16 +301,8 @@ fn exec(session: &mut Session, line: &str) {
         "ls" => ls(session),
         "cat" => cat(session, &args[1..argc]),
         "write" => write_file(session, &args[1..argc]),
-        "procs" => procs(session),
-        "ps" => ps(session),
-        "wait" => wait_process(session, &args[1..argc]),
-        "kill" => kill_process(session, &args[1..argc]),
         "uname" => session.write_fmt(format_args!("Norx {} grub\n", crate::arch::NAME)),
         "drivers" => drivers(session),
-        "syscalls" => syscalls(session),
-        "syscalltrap" => syscalltrap(session),
-        "sclatest" => sclatest(session),
-        "stdio" => stdio(session, &args[1..argc]),
         "lazytest" => lazytest(session),
         "crash" => crate::crash::fatal(crate::error::KernelError {
             kind: crate::error::ErrorKind::Panic,
@@ -335,11 +312,8 @@ fn exec(session: &mut Session, line: &str) {
             arg0: 0,
             arg1: 0,
         }),
-        "run" => run_user_program(session, &args[1..argc]),
-        "rundebug" => run_debug_program(session, &args[1..argc]),
-        "runuser" => run_user_program(session, &args[1..argc]),
         "halt" => crate::arch::halt(),
-        cmd => run_debug_program(session, &[cmd]),
+        cmd => session.write_fmt(format_args!("unknown command: {}\n", cmd)),
     }
 }
 
@@ -442,125 +416,6 @@ fn hw(session: &mut Session) {
     ));
 }
 
-fn sec(session: &mut Session) {
-    session.write_fmt(format_args!(
-        "capabilities=true kernel=0x{:x} user-mode-ready={} syscall-ready={}\n",
-        crate::capability::KERNEL.bits(),
-        crate::arch::user_mode_ready(),
-        crate::arch::syscall_ready(),
-    ));
-    session.write("kernel caps:");
-    crate::capability::names(crate::capability::KERNEL, |name| {
-        session.write(" ");
-        session.write(name);
-    });
-    session.println("");
-}
-
-fn userctx(session: &mut Session) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let ctx = crate::arch::user::context();
-        let tss = crate::arch::tables::tss_status();
-        let pages = crate::arch::tables::transition_pages();
-        let cpu = crate::arch::tables::cpu_tables();
-        let gate = crate::arch::tables::int80_gate();
-        let tss_desc = crate::arch::tables::tss_descriptor();
-        session.write_fmt(format_args!(
-            "ready={} rip=0x{:x} rsp=0x{:x} cs=0x{:x} ss=0x{:x} code=0x{:x} stack=0x{:x} bytes={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} gdt=0x{:x} idt=0x{:x} tss=0x{:x} int80=0x{:x} gate=0x{:x}/0x{:x}/0x{:x} tssd=0x{:x}/0x{:x}/0x{:x} gdtr=0x{:x} idtr=0x{:x} tss_ready={} tr=0x{:x}/0x{:x} rsp0=0x{:x} top=0x{:x} kstack={}KiB\n",
-            ctx.ready, ctx.rip, ctx.rsp, ctx.cs, ctx.ss, ctx.code_frame, ctx.stack_frame,
-            ctx.code_prefix[0],
-            ctx.code_prefix[1],
-            ctx.code_prefix[2],
-            ctx.code_prefix[3],
-            ctx.code_prefix[4],
-            ctx.code_prefix[5],
-            ctx.code_prefix[6],
-            ctx.code_prefix[7],
-            ctx.code_prefix[8],
-            ctx.code_prefix[9],
-            ctx.code_prefix[10],
-            ctx.code_prefix[11],
-            ctx.code_prefix[12],
-            ctx.code_prefix[13],
-            ctx.code_prefix[14],
-            ctx.code_prefix[15],
-            pages.gdt,
-            pages.idt,
-            pages.tss,
-            pages.int80,
-            gate.offset,
-            gate.selector,
-            gate.options,
-            tss_desc.base,
-            tss_desc.limit,
-            tss_desc.access,
-            cpu.gdtr_base,
-            cpu.idtr_base,
-            tss.ready,
-            tss.selector,
-            cpu.tr,
-            tss.rsp0,
-            tss.stack_top,
-            tss.stack_size / 1024,
-        ));
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        let ctx = crate::arch::user::context();
-        let note = if ctx.ready {
-            "el0-probe-ready"
-        } else {
-            "el0-probe-pending"
-        };
-        session.write_fmt(format_args!(
-            "planned={} ready={} payload={} mapped={} el={} pc=0x{:x} sp=0x{:x} spsr=0x{:x} code=0x{:x} stack=0x{:x} bytes={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} note={}\n",
-            ctx.planned,
-            ctx.ready,
-            ctx.payload_ready,
-            ctx.mapped,
-            ctx.el,
-            ctx.rip,
-            ctx.rsp,
-            ctx.spsr,
-            ctx.code_frame,
-            ctx.stack_frame,
-            ctx.code_prefix[0],
-            ctx.code_prefix[1],
-            ctx.code_prefix[2],
-            ctx.code_prefix[3],
-            ctx.code_prefix[4],
-            ctx.code_prefix[5],
-            ctx.code_prefix[6],
-            ctx.code_prefix[7],
-            ctx.code_prefix[8],
-            ctx.code_prefix[9],
-            ctx.code_prefix[10],
-            ctx.code_prefix[11],
-            ctx.code_prefix[12],
-            ctx.code_prefix[13],
-            ctx.code_prefix[14],
-            ctx.code_prefix[15],
-            note,
-        ));
-    }
-}
-
-fn userprobe(session: &mut Session) {
-    #[cfg(target_arch = "x86_64")]
-    match crate::arch::user::probe() {
-        Some(value) => session.write_fmt(format_args!("userprobe ok value={}\n", value)),
-        None => session.println("userprobe unavailable"),
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    match crate::arch::user::probe() {
-        Some(value) => session.write_fmt(format_args!("userprobe ok value={}\n", value)),
-        None => session.println("userprobe unavailable"),
-    }
-}
-
 fn mem(session: &mut Session) {
     let stats = crate::memory::stats();
     session.write_fmt(format_args!(
@@ -586,7 +441,7 @@ fn vm(session: &mut Session) {
 fn paging(session: &mut Session) {
     let stats = crate::paging::stats();
     session.write_fmt(format_args!(
-        "direct_map={} base=0x{:x} bytes={}KiB norx_cr3={} cr3=0x{:x} tables={}/{} lazy_pages={} user_code=0x{:x} user_stack=0x{:x}\n",
+        "direct_map={} base=0x{:x} bytes={}KiB norx_cr3={} cr3=0x{:x} tables={}/{} lazy_pages={}\n",
         stats.direct_map_ready,
         stats.direct_map_base,
         stats.direct_map_bytes / 1024,
@@ -595,30 +450,14 @@ fn paging(session: &mut Session) {
         stats.table_pages_used,
         stats.table_pages_total,
         stats.lazy_pages,
-        stats.user_code_base,
-        stats.user_stack_top,
     ));
     #[cfg(target_arch = "aarch64")]
     {
         let reg = crate::arch::paging::status();
-        let code = crate::arch::paging::lookup(stats.user_code_base);
-        let stack = crate::arch::paging::lookup(stats.user_stack_top - 16);
         session.write_fmt(format_args!(
             "aarch64 ttbr0=0x{:x} ttbr1=0x{:x} tcr=0x{:x} mair=0x{:x} sctlr=0x{:x} tables={}\n",
             reg.ttbr0, reg.ttbr1, reg.tcr, reg.mair, reg.sctlr, reg.tables_used,
         ));
-        if let Some(code) = code {
-            session.write_fmt(format_args!(
-                "user_code_pte level={} desc=0x{:x}\n",
-                code.level, code.descriptor,
-            ));
-        }
-        if let Some(stack) = stack {
-            session.write_fmt(format_args!(
-                "user_stack_pte level={} desc=0x{:x}\n",
-                stack.level, stack.descriptor,
-            ));
-        }
     }
 }
 
@@ -685,7 +524,7 @@ fn cat(session: &mut Session, args: &[&str]) {
         session.println("cat: missing path");
         return;
     };
-    let mut out = [0u8; 511];
+    let mut out = [0u8; 255];
     let Some(len) = crate::vfs::read(path, &mut out) else {
         session.write_fmt(format_args!("cat: {}: not found\n", path));
         return;
@@ -724,306 +563,6 @@ fn write_file(session: &mut Session, args: &[&str]) {
         return;
     }
     session.write_fmt(format_args!("{} bytes written\n", len));
-}
-
-fn procs(session: &mut Session) {
-    session.println("executables:");
-    crate::process::list(|path, object, caps| {
-        session.write_fmt(format_args!(
-            "{}\tmagic=0x{:08x} abi={} entry={} flags=0x{:x} code={} caps=0x{:x}",
-            path,
-            object.magic,
-            object.abi,
-            object.entry,
-            object.flags,
-            object.code_len,
-            caps.bits(),
-        ));
-        crate::capability::names(caps, |name| {
-            session.write(" ");
-            session.write(name);
-        });
-        session.println("");
-    });
-    session.println("processes:");
-    print_process_records(session);
-}
-
-fn ps(session: &mut Session) {
-    print_process_records(session);
-}
-
-fn wait_process(session: &mut Session, args: &[&str]) {
-    let Some(pid) = args.first().and_then(|arg| parse_u64(arg)) else {
-        session.println("wait: missing pid");
-        return;
-    };
-    let Some(record) = crate::process::find(pid) else {
-        session.write_fmt(format_args!("wait: {}: no such process\n", pid));
-        return;
-    };
-    if record.state == crate::process::State::Running {
-        session.write_fmt(format_args!("wait: {} still running\n", pid));
-        return;
-    }
-    session.write_fmt(format_args!(
-        "{} {} exit={} runtime={}\n",
-        record.pid,
-        record.state.name(),
-        record.exit,
-        record.runtime(),
-    ));
-}
-
-fn kill_process(session: &mut Session, args: &[&str]) {
-    let Some(pid) = args.first().and_then(|arg| parse_u64(arg)) else {
-        session.println("kill: missing pid");
-        return;
-    };
-    match crate::process::kill(pid) {
-        Ok(record) => session.write_fmt(format_args!(
-            "{} killed exit={} runtime={}\n",
-            record.pid,
-            record.exit,
-            record.runtime(),
-        )),
-        Err(crate::process::KillError::NotFound) => {
-            session.write_fmt(format_args!("kill: {}: no such process\n", pid))
-        }
-        Err(crate::process::KillError::NotRunning(state)) => {
-            session.write_fmt(format_args!("kill: {}: already {}\n", pid, state.name()))
-        }
-    }
-}
-
-fn parse_u64(s: &str) -> Option<u64> {
-    let mut out = 0u64;
-    if s.is_empty() {
-        return None;
-    }
-    for byte in s.bytes() {
-        if !byte.is_ascii_digit() {
-            return None;
-        }
-        out = out.checked_mul(10)?.checked_add((byte - b'0') as u64)?;
-    }
-    Some(out)
-}
-
-fn print_process_records(session: &mut Session) {
-    crate::process::list_records(|record| {
-        session.write_fmt(format_args!(
-            "{}\t{}\t{}\t{}\texit={} runtime={} code={} caps=0x{:x}\n",
-            record.pid,
-            record.state.name(),
-            record.owner.name(),
-            record.path(),
-            record.exit,
-            record.runtime(),
-            record.code_len,
-            record.capabilities.bits(),
-        ));
-    });
-}
-
-fn run_debug_program(session: &mut Session, args: &[&str]) {
-    let Some(path) = args.first().copied() else {
-        session.println("rundebug: missing path");
-        return;
-    };
-
-    match crate::process::spawn(crate::process::ProcessRequest {
-        path,
-        args: &args[1..],
-    }) {
-        Ok(output) => session.write_fmt(format_args!(
-            "exit {} caps=0x{:x} user-code={}/{}\n",
-            output.code,
-            output.capabilities.bits(),
-            output.user_code_loaded,
-            output.user_code_len,
-        )),
-        Err(crate::process::SpawnError::NoLoader) => {
-            session.write_fmt(format_args!("{}: executable loader unavailable\n", path))
-        }
-        Err(crate::process::SpawnError::NotFound) => {
-            session.write_fmt(format_args!("{}: not found\n", path))
-        }
-    }
-}
-
-fn run_user_program(session: &mut Session, args: &[&str]) {
-    let Some(path) = args.first().copied() else {
-        session.println("run: missing path");
-        return;
-    };
-
-    match crate::process::run_user_code(path, &args[1..], session.io()) {
-        Ok(output) => session.write_fmt(format_args!(
-            "pid={} user-exit {} caps=0x{:x} code={}\n",
-            output.pid,
-            output.value,
-            output.capabilities.bits(),
-            output.code_len,
-        )),
-        Err(crate::process::SpawnError::NoLoader) => {
-            session.write_fmt(format_args!("{}: executable loader unavailable\n", path))
-        }
-        Err(crate::process::SpawnError::NotFound) => {
-            session.write_fmt(format_args!("{}: not found\n", path))
-        }
-    }
-}
-
-fn syscalls(session: &mut Session) {
-    session.write_fmt(format_args!(
-        "norx-native: {}\n",
-        crate::abi::syscall::native_registers()
-    ));
-    session.write_fmt(format_args!(
-        "scla: nr=0x{:x}\n",
-        crate::abi::syscall::SCLA_NUMBER
-    ));
-    session.write_fmt(format_args!(
-        "scla-magic: 0x{:x}\n",
-        crate::abi::syscall::SCLA_MAGIC
-    ));
-    session.write_fmt(format_args!(
-        "activation: {}\n",
-        crate::abi::syscall::activation_registers()
-    ));
-    session.write_fmt(format_args!(
-        "universal: {}\n",
-        crate::abi::syscall::universal_registers()
-    ));
-    session.write_fmt(format_args!("dispatch: activate clock write exit\n"));
-    #[cfg(target_arch = "x86_64")]
-    {
-        let status = crate::arch::syscall::status();
-        session.write_fmt(format_args!(
-            "entry: ready={} traps={} int80={}/{} last={} lstar=0x{:x} star=0x{:x} fmask=0x{:x} kstack=0x{:x} slot=0x{:x} probe={}/{} fault=0x{:x}\n",
-            status.ready,
-            status.traps,
-            status.int80_hits,
-            status.int80_fast_hits,
-            status.int80_last_op,
-            status.lstar,
-            status.star,
-            status.fmask,
-            status.kernel_stack_top,
-            status.kernel_stack_slot,
-            status.user_probe_active,
-            status.user_probe_done,
-            status.user_probe_fault_rip,
-        ));
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        let status = crate::arch::syscall::status();
-        session.write_fmt(format_args!(
-            "entry: dispatcher={} svc={} traps={} last={} probe={}/{}\n",
-            status.dispatcher_ready,
-            status.svc_ready,
-            status.traps,
-            status.last_op,
-            status.user_probe_active,
-            status.user_probe_done,
-        ));
-    }
-}
-
-fn syscalltrap(session: &mut Session) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let ret = crate::arch::syscall::smoke();
-        let status = crate::arch::syscall::status();
-        session.write_fmt(format_args!(
-            "syscall-smoke value={} err={} traps={}\n",
-            ret.value, ret.error, status.traps,
-        ));
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        let ret = crate::arch::syscall::smoke();
-        let status = crate::arch::syscall::status();
-        session.write_fmt(format_args!(
-            "syscall-smoke value={} err={} traps={} svc={}\n",
-            ret.value, ret.error, status.traps, status.svc_ready,
-        ));
-    }
-}
-
-fn sclatest(session: &mut Session) {
-    let active = crate::abi::syscall::dispatch(crate::abi::syscall::UniversalCall {
-        op: crate::abi::syscall::UniversalOp::Activate,
-        args: [crate::abi::syscall::SCLA_MAGIC, 0, 0, 0, 0, 0],
-    });
-    let clock = crate::abi::syscall::dispatch(crate::abi::syscall::UniversalCall {
-        op: crate::abi::syscall::UniversalOp::Clock,
-        args: [0; 6],
-    });
-    let wrote = crate::abi::syscall::dispatch(crate::abi::syscall::UniversalCall {
-        op: crate::abi::syscall::UniversalOp::Write,
-        args: [b'!' as u64, 0, 0, 0, 0, 0],
-    });
-    let denied = crate::abi::syscall::dispatch_with(
-        crate::capability::Set::NONE,
-        crate::abi::syscall::UniversalCall {
-            op: crate::abi::syscall::UniversalOp::Clock,
-            args: [0; 6],
-        },
-    );
-    session.write_fmt(format_args!(
-        "\nscla value=0x{:x} err={} clock={} write={} err={} denied-clock-err={}\n",
-        active.value, active.error, clock.value, wrote.value, wrote.error, denied.error,
-    ));
-}
-
-fn stdio(session: &mut Session, args: &[&str]) {
-    let status = crate::abi::syscall::io_status();
-    session.write_fmt(format_args!(
-        "user stdout={} stderr={} serial stdout={} stderr={}\n",
-        status.user_stdout, status.user_stderr, status.serial_stdout, status.serial_stderr,
-    ));
-    if args.first().copied() == Some("tail") {
-        stdio_tail(session, 0, "stdout");
-        stdio_tail(session, 2, "stderr");
-    } else if args.first().copied() == Some("read") {
-        stdio_read(session, 0, "stdout");
-        stdio_read(session, 2, "stderr");
-    }
-}
-
-fn stdio_tail(session: &mut Session, fd: u64, name: &str) {
-    let target = match session.target {
-        Target::User => crate::abi::syscall::IoTarget::User,
-        Target::Serial => crate::abi::syscall::IoTarget::Serial,
-    };
-    let mut bytes = [0u8; 64];
-    let len = crate::abi::syscall::io_tail(target, fd, &mut bytes);
-    session.write(name);
-    session.write(" tail: ");
-    session.write(core::str::from_utf8(&bytes[..len]).unwrap_or(""));
-    session.println("");
-}
-
-fn stdio_read(session: &mut Session, fd: u64, name: &str) {
-    let target = match session.target {
-        Target::User => crate::abi::syscall::IoTarget::User,
-        Target::Serial => crate::abi::syscall::IoTarget::Serial,
-    };
-    let mut bytes = [0u8; 64];
-    let cursor = if fd == 2 {
-        &mut session.stdio_stderr
-    } else {
-        &mut session.stdio_stdout
-    };
-    let len = crate::abi::syscall::io_read(target, fd, cursor, &mut bytes);
-    session.write(name);
-    session.write(" read: ");
-    session.write(core::str::from_utf8(&bytes[..len]).unwrap_or(""));
-    session.println("");
 }
 
 fn lazytest(session: &mut Session) {

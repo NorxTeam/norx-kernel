@@ -2,11 +2,9 @@
 #![no_main]
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 
-mod abi;
 mod arch;
 mod boot;
 mod bootlog;
-mod capability;
 mod crash;
 mod drivers;
 mod error;
@@ -17,7 +15,6 @@ mod irq;
 mod log;
 mod memory;
 mod paging;
-mod process;
 mod sched;
 mod shell;
 mod time;
@@ -88,21 +85,6 @@ pub fn kernel_start() -> ! {
     arch::init_interrupt_controller();
     arch::init_syscalls();
     paging::init();
-    if arch::prepare_user_mode() {
-        bootlog::ok("user launch context prepared");
-    } else {
-        #[cfg(target_arch = "aarch64")]
-        {
-            let ctx = arch::user::context();
-            if ctx.payload_ready {
-                bootlog::ok_fmt(format_args!(
-                    "user payload prepared code=0x{:x} stack=0x{:x} mapped={}",
-                    ctx.code_frame, ctx.stack_frame, ctx.mapped
-                ));
-            }
-        }
-        bootlog::warn("user launch context unavailable");
-    }
     vm::init();
     sched::self_check();
     sched::init_runtime();
