@@ -23,7 +23,7 @@ pub fn init() {
     });
     block::init();
     framework::register(framework::Driver {
-        name: "boa-ram0",
+        name: "norr-ram0",
         class: framework::Class::Block,
         state: framework::State::Ready,
     });

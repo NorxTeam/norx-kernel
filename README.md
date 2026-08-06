@@ -1,8 +1,8 @@
-# Boa Kernel
+# Norr Kernel
 
 [![CI](../../actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
 
-Boa is an experimental Rust kernel for a UEFI-first operating system. It boots
+Norr is an experimental Rust kernel for a UEFI-first operating system. It boots
 without an external bootloader and currently targets `x86_64-unknown-uefi` and
 `aarch64-unknown-uefi`.
 
@@ -11,7 +11,7 @@ without an external bootloader and currently targets `x86_64-unknown-uefi` and
 - Direct UEFI entry and framebuffer console.
 - Serial logging and interactive shell sessions.
 - Basic memory, paging, timer, scheduler, and interrupt infrastructure.
-- Early user-mode execution path with a small Boa syscall ABI.
+- Early user-mode execution path with a small Norr syscall ABI.
 - Minimal process I/O routing through per-session `stdin`, `stdout`, and
   `stderr` channels.
 
@@ -40,10 +40,10 @@ system partition without starting QEMU.
 
 ## Status
 
-Boa is not production-ready. The public tree is intended for kernel development,
+Norr is not production-ready. The public tree is intended for kernel development,
 architecture experiments, and reproducible boot tests.
 
 ## License
 
-Boa Kernel is licensed under the GNU General Public License v3.0 only. See
+Norr Kernel is licensed under the GNU General Public License v3.0 only. See
 `LICENSE`.

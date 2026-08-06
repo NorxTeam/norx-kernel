@@ -10,35 +10,35 @@ const EFER_SCE: u64 = 1;
 static READY: AtomicBool = AtomicBool::new(false);
 static TRAPS: AtomicU64 = AtomicU64::new(0);
 #[no_mangle]
-static mut BOA_X86_64_USER_DISPATCH_TRAPS: u64 = 0;
+static mut NORR_X86_64_USER_DISPATCH_TRAPS: u64 = 0;
 #[no_mangle]
-static mut BOA_X86_64_INT80_HITS: u64 = 0;
+static mut NORR_X86_64_INT80_HITS: u64 = 0;
 #[no_mangle]
-static mut BOA_X86_64_INT80_FAST_HITS: u64 = 0;
+static mut NORR_X86_64_INT80_FAST_HITS: u64 = 0;
 #[no_mangle]
-static mut BOA_X86_64_INT80_LAST_OP: u64 = 0;
+static mut NORR_X86_64_INT80_LAST_OP: u64 = 0;
 
 #[no_mangle]
-static mut BOA_X86_64_SYSCALL_STACK_TOP: u64 = 0;
+static mut NORR_X86_64_SYSCALL_STACK_TOP: u64 = 0;
 #[no_mangle]
-static mut BOA_X86_64_USER_PROBE_ACTIVE: u8 = 0;
+static mut NORR_X86_64_USER_PROBE_ACTIVE: u8 = 0;
 #[no_mangle]
-static mut BOA_X86_64_USER_PROBE_DONE: u8 = 0;
+static mut NORR_X86_64_USER_PROBE_DONE: u8 = 0;
 #[no_mangle]
-static mut BOA_X86_64_USER_PROBE_RETURN_RSP: u64 = 0;
+static mut NORR_X86_64_USER_PROBE_RETURN_RSP: u64 = 0;
 #[no_mangle]
-static mut BOA_X86_64_USER_PROBE_RETURN_RIP: u64 = 0;
+static mut NORR_X86_64_USER_PROBE_RETURN_RIP: u64 = 0;
 #[no_mangle]
-static mut BOA_X86_64_USER_PROBE_VALUE: u64 = 0;
+static mut NORR_X86_64_USER_PROBE_VALUE: u64 = 0;
 #[no_mangle]
-static mut BOA_X86_64_USER_PROBE_FAULT_RIP: u64 = 0;
+static mut NORR_X86_64_USER_PROBE_FAULT_RIP: u64 = 0;
 
 global_asm!(
     r#"
-    .global boa_x86_64_syscall_entry
-boa_x86_64_syscall_entry:
+    .global norr_x86_64_syscall_entry
+norr_x86_64_syscall_entry:
     mov r12, rsp
-    mov rsp, qword ptr [rip + BOA_X86_64_SYSCALL_STACK_TOP]
+    mov rsp, qword ptr [rip + NORR_X86_64_SYSCALL_STACK_TOP]
     and rsp, -16
     push r12
     push rcx
@@ -50,8 +50,8 @@ boa_x86_64_syscall_entry:
     mov rdx, rsi
     mov rsi, rdi
     mov rdi, rax
-    call boa_x86_64_syscall_rust
-    cmp byte ptr [rip + BOA_X86_64_USER_PROBE_DONE], 0
+    call norr_x86_64_syscall_rust
+    cmp byte ptr [rip + NORR_X86_64_USER_PROBE_DONE], 0
     jne 3f
     add rsp, 8
     pop r11
@@ -60,11 +60,11 @@ boa_x86_64_syscall_entry:
     mov rsp, r12
     sysretq
 3:
-    mov rsp, qword ptr [rip + BOA_X86_64_USER_PROBE_RETURN_RSP]
-    mov rax, qword ptr [rip + BOA_X86_64_USER_PROBE_VALUE]
-    mov r11, qword ptr [rip + BOA_X86_64_USER_PROBE_RETURN_RIP]
-    mov byte ptr [rip + BOA_X86_64_USER_PROBE_DONE], 0
-    mov byte ptr [rip + BOA_X86_64_USER_PROBE_ACTIVE], 0
+    mov rsp, qword ptr [rip + NORR_X86_64_USER_PROBE_RETURN_RSP]
+    mov rax, qword ptr [rip + NORR_X86_64_USER_PROBE_VALUE]
+    mov r11, qword ptr [rip + NORR_X86_64_USER_PROBE_RETURN_RIP]
+    mov byte ptr [rip + NORR_X86_64_USER_PROBE_DONE], 0
+    mov byte ptr [rip + NORR_X86_64_USER_PROBE_ACTIVE], 0
     mov dx, 0x10
     mov ds, dx
     mov es, dx
@@ -74,7 +74,7 @@ boa_x86_64_syscall_entry:
 );
 
 extern "C" {
-    fn boa_x86_64_syscall_entry();
+    fn norr_x86_64_syscall_entry();
 }
 
 #[derive(Clone, Copy)]
@@ -96,7 +96,7 @@ pub struct Status {
 
 pub fn init() {
     unsafe {
-        BOA_X86_64_SYSCALL_STACK_TOP = crate::arch::tables::tss_status().rsp0;
+        NORR_X86_64_SYSCALL_STACK_TOP = crate::arch::tables::tss_status().rsp0;
 
         let efer = rdmsr(IA32_EFER) | EFER_SCE;
         wrmsr(IA32_EFER, efer);
@@ -106,7 +106,7 @@ pub fn init() {
         wrmsr(IA32_STAR, (user << 48) | (kernel << 32));
         wrmsr(
             IA32_LSTAR,
-            boa_x86_64_syscall_entry as *const () as usize as u64,
+            norr_x86_64_syscall_entry as *const () as usize as u64,
         );
         wrmsr(IA32_FMASK, 1 << 9);
     }
@@ -117,19 +117,21 @@ pub fn status() -> Status {
     Status {
         ready: READY.load(Ordering::Relaxed),
         traps: TRAPS.load(Ordering::Relaxed)
-            + unsafe { core::ptr::addr_of!(BOA_X86_64_USER_DISPATCH_TRAPS).read_volatile() },
-        int80_hits: unsafe { core::ptr::addr_of!(BOA_X86_64_INT80_HITS).read_volatile() },
-        int80_fast_hits: unsafe { core::ptr::addr_of!(BOA_X86_64_INT80_FAST_HITS).read_volatile() },
-        int80_last_op: unsafe { core::ptr::addr_of!(BOA_X86_64_INT80_LAST_OP).read_volatile() },
+            + unsafe { core::ptr::addr_of!(NORR_X86_64_USER_DISPATCH_TRAPS).read_volatile() },
+        int80_hits: unsafe { core::ptr::addr_of!(NORR_X86_64_INT80_HITS).read_volatile() },
+        int80_fast_hits: unsafe {
+            core::ptr::addr_of!(NORR_X86_64_INT80_FAST_HITS).read_volatile()
+        },
+        int80_last_op: unsafe { core::ptr::addr_of!(NORR_X86_64_INT80_LAST_OP).read_volatile() },
         lstar: unsafe { rdmsr(IA32_LSTAR) },
         star: unsafe { rdmsr(IA32_STAR) },
         fmask: unsafe { rdmsr(IA32_FMASK) },
-        kernel_stack_top: unsafe { BOA_X86_64_SYSCALL_STACK_TOP },
-        kernel_stack_slot: (&raw const BOA_X86_64_SYSCALL_STACK_TOP) as u64,
-        user_probe_active: unsafe { BOA_X86_64_USER_PROBE_ACTIVE },
-        user_probe_done: unsafe { BOA_X86_64_USER_PROBE_DONE },
+        kernel_stack_top: unsafe { NORR_X86_64_SYSCALL_STACK_TOP },
+        kernel_stack_slot: (&raw const NORR_X86_64_SYSCALL_STACK_TOP) as u64,
+        user_probe_active: unsafe { NORR_X86_64_USER_PROBE_ACTIVE },
+        user_probe_done: unsafe { NORR_X86_64_USER_PROBE_DONE },
         user_probe_fault_rip: unsafe {
-            core::ptr::addr_of!(BOA_X86_64_USER_PROBE_FAULT_RIP).read_volatile()
+            core::ptr::addr_of!(NORR_X86_64_USER_PROBE_FAULT_RIP).read_volatile()
         },
     }
 }
@@ -139,7 +141,7 @@ pub fn smoke() -> crate::abi::syscall::Return {
 }
 
 pub fn user_probe_active() -> bool {
-    unsafe { BOA_X86_64_USER_PROBE_ACTIVE != 0 }
+    unsafe { NORR_X86_64_USER_PROBE_ACTIVE != 0 }
 }
 
 #[allow(dead_code)]
@@ -148,10 +150,10 @@ pub fn begin_user_probe() -> bool {
         return false;
     }
     unsafe {
-        BOA_X86_64_USER_PROBE_VALUE = 0;
-        BOA_X86_64_USER_PROBE_FAULT_RIP = 0;
-        BOA_X86_64_USER_PROBE_DONE = 0;
-        BOA_X86_64_USER_PROBE_ACTIVE = 1;
+        NORR_X86_64_USER_PROBE_VALUE = 0;
+        NORR_X86_64_USER_PROBE_FAULT_RIP = 0;
+        NORR_X86_64_USER_PROBE_DONE = 0;
+        NORR_X86_64_USER_PROBE_ACTIVE = 1;
     }
     true
 }
@@ -162,8 +164,8 @@ pub fn enter_user_probe(rip: u64, rsp: u64) -> u64 {
     unsafe {
         asm!(
             "lea rax, [rip + 2f]",
-            "mov qword ptr [rip + BOA_X86_64_USER_PROBE_RETURN_RIP], rax",
-            "mov qword ptr [rip + BOA_X86_64_USER_PROBE_RETURN_RSP], rsp",
+            "mov qword ptr [rip + NORR_X86_64_USER_PROBE_RETURN_RIP], rax",
+            "mov qword ptr [rip + NORR_X86_64_USER_PROBE_RETURN_RSP], rsp",
             "mov ax, 0x1b",
             "mov ds, ax",
             "mov es, ax",
@@ -214,9 +216,9 @@ fn handle(op: u64, args: [u64; 6]) -> crate::abi::syscall::Return {
     let ret = crate::abi::syscall::dispatch(crate::abi::syscall::UniversalCall { op, args });
     if matches!(op, crate::abi::syscall::UniversalOp::Exit) && ret.error == 0 {
         unsafe {
-            if BOA_X86_64_USER_PROBE_ACTIVE != 0 {
-                BOA_X86_64_USER_PROBE_VALUE = ret.value;
-                BOA_X86_64_USER_PROBE_DONE = 1;
+            if NORR_X86_64_USER_PROBE_ACTIVE != 0 {
+                NORR_X86_64_USER_PROBE_VALUE = ret.value;
+                NORR_X86_64_USER_PROBE_DONE = 1;
             }
         }
     }
@@ -224,7 +226,7 @@ fn handle(op: u64, args: [u64; 6]) -> crate::abi::syscall::Return {
 }
 
 #[no_mangle]
-extern "sysv64" fn boa_x86_64_syscall_rust(
+extern "sysv64" fn norr_x86_64_syscall_rust(
     op: u64,
     a0: u64,
     a1: u64,

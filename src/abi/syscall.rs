@@ -371,11 +371,11 @@ pub fn activation_registers() -> &'static str {
 pub fn universal_registers() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
-        "Boa universal: op=rax args=rdi,rsi,rdx,r10,r8,r9"
+        "Norr universal: op=rax args=rdi,rsi,rdx,r10,r8,r9"
     }
     #[cfg(target_arch = "aarch64")]
     {
-        "Boa universal: op=x8 args=x0..x5"
+        "Norr universal: op=x8 args=x0..x5"
     }
 }
 

@@ -5,57 +5,57 @@ use core::{
 
 global_asm!(
     r#"
-    .global boa_x86_64_user_probe_finish
-boa_x86_64_user_probe_finish:
-    mov qword ptr [rip + BOA_X86_64_USER_PROBE_VALUE], 42
-    mov rsp, qword ptr [rip + BOA_X86_64_USER_PROBE_RETURN_RSP]
-    mov rax, qword ptr [rip + BOA_X86_64_USER_PROBE_VALUE]
-    mov r11, qword ptr [rip + BOA_X86_64_USER_PROBE_RETURN_RIP]
-    mov byte ptr [rip + BOA_X86_64_USER_PROBE_DONE], 0
-    mov byte ptr [rip + BOA_X86_64_USER_PROBE_ACTIVE], 0
+    .global norr_x86_64_user_probe_finish
+norr_x86_64_user_probe_finish:
+    mov qword ptr [rip + NORR_X86_64_USER_PROBE_VALUE], 42
+    mov rsp, qword ptr [rip + NORR_X86_64_USER_PROBE_RETURN_RSP]
+    mov rax, qword ptr [rip + NORR_X86_64_USER_PROBE_VALUE]
+    mov r11, qword ptr [rip + NORR_X86_64_USER_PROBE_RETURN_RIP]
+    mov byte ptr [rip + NORR_X86_64_USER_PROBE_DONE], 0
+    mov byte ptr [rip + NORR_X86_64_USER_PROBE_ACTIVE], 0
     mov dx, 0x10
     mov ds, dx
     mov es, dx
     jmp r11
 
-    .global boa_x86_64_user_probe_trap
-boa_x86_64_user_probe_trap:
-    mov qword ptr [rip + BOA_X86_64_USER_PROBE_VALUE], rdi
-    mov rsp, qword ptr [rip + BOA_X86_64_USER_PROBE_RETURN_RSP]
-    mov rax, qword ptr [rip + BOA_X86_64_USER_PROBE_VALUE]
-    mov r11, qword ptr [rip + BOA_X86_64_USER_PROBE_RETURN_RIP]
-    mov byte ptr [rip + BOA_X86_64_USER_PROBE_DONE], 0
-    mov byte ptr [rip + BOA_X86_64_USER_PROBE_ACTIVE], 0
+    .global norr_x86_64_user_probe_trap
+norr_x86_64_user_probe_trap:
+    mov qword ptr [rip + NORR_X86_64_USER_PROBE_VALUE], rdi
+    mov rsp, qword ptr [rip + NORR_X86_64_USER_PROBE_RETURN_RSP]
+    mov rax, qword ptr [rip + NORR_X86_64_USER_PROBE_VALUE]
+    mov r11, qword ptr [rip + NORR_X86_64_USER_PROBE_RETURN_RIP]
+    mov byte ptr [rip + NORR_X86_64_USER_PROBE_DONE], 0
+    mov byte ptr [rip + NORR_X86_64_USER_PROBE_ACTIVE], 0
     mov dx, 0x10
     mov ds, dx
     mov es, dx
     jmp r11
 
-    .global boa_x86_64_int80_entry
-boa_x86_64_int80_entry:
-    inc qword ptr [rip + BOA_X86_64_INT80_HITS]
-    mov qword ptr [rip + BOA_X86_64_INT80_LAST_OP], rax
-    cmp byte ptr [rip + BOA_X86_64_USER_PROBE_ACTIVE], 0
-    je .Lboa_int80_full
+    .global norr_x86_64_int80_entry
+norr_x86_64_int80_entry:
+    inc qword ptr [rip + NORR_X86_64_INT80_HITS]
+    mov qword ptr [rip + NORR_X86_64_INT80_LAST_OP], rax
+    cmp byte ptr [rip + NORR_X86_64_USER_PROBE_ACTIVE], 0
+    je .Lnorr_int80_full
     cmp rax, 1
-    jne .Lboa_int80_full
-    inc qword ptr [rip + BOA_X86_64_INT80_FAST_HITS]
+    jne .Lnorr_int80_full
+    inc qword ptr [rip + NORR_X86_64_INT80_FAST_HITS]
     mov rdi, 1
     mov rsi, 42
     xor rdx, rdx
     xor rcx, rcx
     xor r8, r8
     xor r9, r9
-    call boa_x86_64_syscall_rust
-    mov rsp, qword ptr [rip + BOA_X86_64_USER_PROBE_RETURN_RSP]
-    mov r11, qword ptr [rip + BOA_X86_64_USER_PROBE_RETURN_RIP]
-    mov byte ptr [rip + BOA_X86_64_USER_PROBE_ACTIVE], 0
-    mov byte ptr [rip + BOA_X86_64_USER_PROBE_DONE], 0
+    call norr_x86_64_syscall_rust
+    mov rsp, qword ptr [rip + NORR_X86_64_USER_PROBE_RETURN_RSP]
+    mov r11, qword ptr [rip + NORR_X86_64_USER_PROBE_RETURN_RIP]
+    mov byte ptr [rip + NORR_X86_64_USER_PROBE_ACTIVE], 0
+    mov byte ptr [rip + NORR_X86_64_USER_PROBE_DONE], 0
     mov dx, 0x10
     mov ds, dx
     mov es, dx
     jmp r11
-.Lboa_int80_full:
+.Lnorr_int80_full:
     push rdi
     push rsi
     push rdx
@@ -71,9 +71,9 @@ boa_x86_64_int80_entry:
     mov rdx, rsi
     mov rsi, rdi
     mov rdi, rax
-    call boa_x86_64_syscall_rust
-    cmp byte ptr [rip + BOA_X86_64_USER_PROBE_DONE], 0
-    jne .Lboa_int80_done
+    call norr_x86_64_syscall_rust
+    cmp byte ptr [rip + NORR_X86_64_USER_PROBE_DONE], 0
+    jne .Lnorr_int80_done
     add rsp, 8
     pop r11
     pop rcx
@@ -84,12 +84,12 @@ boa_x86_64_int80_entry:
     pop rsi
     pop rdi
     iretq
-.Lboa_int80_done:
-    mov rsp, qword ptr [rip + BOA_X86_64_USER_PROBE_RETURN_RSP]
-    mov rax, qword ptr [rip + BOA_X86_64_USER_PROBE_VALUE]
-    mov r11, qword ptr [rip + BOA_X86_64_USER_PROBE_RETURN_RIP]
-    mov byte ptr [rip + BOA_X86_64_USER_PROBE_DONE], 0
-    mov byte ptr [rip + BOA_X86_64_USER_PROBE_ACTIVE], 0
+.Lnorr_int80_done:
+    mov rsp, qword ptr [rip + NORR_X86_64_USER_PROBE_RETURN_RSP]
+    mov rax, qword ptr [rip + NORR_X86_64_USER_PROBE_VALUE]
+    mov r11, qword ptr [rip + NORR_X86_64_USER_PROBE_RETURN_RIP]
+    mov byte ptr [rip + NORR_X86_64_USER_PROBE_DONE], 0
+    mov byte ptr [rip + NORR_X86_64_USER_PROBE_ACTIVE], 0
     mov dx, 0x10
     mov ds, dx
     mov es, dx
@@ -98,9 +98,9 @@ boa_x86_64_int80_entry:
 );
 
 extern "C" {
-    fn boa_x86_64_int80_entry();
-    fn boa_x86_64_user_probe_finish() -> !;
-    static mut BOA_X86_64_USER_PROBE_FAULT_RIP: u64;
+    fn norr_x86_64_int80_entry();
+    fn norr_x86_64_user_probe_finish() -> !;
+    static mut NORR_X86_64_USER_PROBE_FAULT_RIP: u64;
 }
 
 #[repr(C, packed)]
@@ -313,7 +313,7 @@ pub fn transition_pages() -> TransitionPages {
         gdt: (&raw const GDT) as usize,
         idt: (&raw const IDT) as usize,
         tss: (&raw const TSS) as usize,
-        int80: boa_x86_64_int80_entry as *const () as usize,
+        int80: norr_x86_64_int80_entry as *const () as usize,
     }
 }
 
@@ -413,7 +413,7 @@ fn load_idt() {
         (*idt.add(14)).set_err(page_fault);
         (*idt.add(32)).set(timer_interrupt);
         (*idt.add(33)).set(keyboard_interrupt);
-        (*idt.add(0x80)).set_user_addr(boa_x86_64_int80_entry as *const () as usize as u64);
+        (*idt.add(0x80)).set_user_addr(norr_x86_64_int80_entry as *const () as usize as u64);
         let ptr = Pointer {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
             base: (&raw const IDT) as u64,
@@ -465,8 +465,8 @@ extern "x86-interrupt" fn invalid_opcode(stack: InterruptStackFrame) {
     if stack.code_segment == USER_CODE_SELECTOR as u64 && crate::arch::syscall::user_probe_active()
     {
         unsafe {
-            BOA_X86_64_USER_PROBE_FAULT_RIP = stack.instruction_pointer;
-            boa_x86_64_user_probe_finish()
+            NORR_X86_64_USER_PROBE_FAULT_RIP = stack.instruction_pointer;
+            norr_x86_64_user_probe_finish()
         };
     }
     crate::irq::exception();

@@ -1,4 +1,4 @@
-# Boa Roadmap
+# Norr Roadmap
 
 ## Current Track
 
@@ -6,7 +6,7 @@
 2. ExitBootServices, memory map, physical frame allocator.
 3. Kernel paging, heap, and lazy page-fault allocation.
 4. Interrupt timers and preemptive scheduling.
-5. Boa syscall ABI with SCLA activation.
+5. Norr syscall ABI with SCLA activation.
 6. Process loader, address spaces, VFS, drivers, userspace services.
 
 ## Architecture Notes To Explore
@@ -59,14 +59,14 @@ Do not build speculative versions of these ideas before the required lower layer
 
 - x86_64 detects/enables local APIC through CPUID + IA32_APIC_BASE MSR and LAPIC MMIO SVR, while IRQ routing still uses legacy PIC/PIT.
 - aarch64 reports GIC as deferred until controller discovery and MMIO setup exist.
-- A tiny architecture-neutral RAM block device `boa-ram0` exists for future VFS/filesystem smoke tests.
+- A tiny architecture-neutral RAM block device `norr-ram0` exists for future VFS/filesystem smoke tests.
 - Shell diagnostics now include `hw`, `mem`, `vm`, and `block`.
 
 ## Current VFS Status
 
-- VFS mounts a tiny in-kernel root over `boa-ram0`.
+- VFS mounts a tiny in-kernel root over `norr-ram0`.
 - `/hello.txt` supports read/write through shell commands `ls`, `cat`, `write`, and `vfs`.
-- `/bin/hello` and `/bin/args` are tiny Boa object files with code sections stored in VFS over `boa-ram0`.
+- `/bin/hello` and `/bin/args` are tiny Norr object files with code sections stored in VFS over `norr-ram0`.
 - This is a smoke layer for future ext4/zfs/btrfs/exfat adapters, not a real on-disk filesystem yet.
 
 ## Current Process Status
@@ -77,11 +77,11 @@ Do not build speculative versions of these ideas before the required lower layer
 - Loaded user code now performs buffered `Write(ptr,len)` before `Exit`, so userspace string output reaches the kernel log path on x86_64 and aarch64.
 - Loaded user code receives a compact `argc/argv` table in the user stack and can print `argv[0]` through the same `Write(ptr,len)` path.
 - Process I/O is now bound to the shell session that launched it: VM-owned commands write to the framebuffer session, serial-owned commands write/read through serial. The current synchronous runner keeps `stdin/stdout/stderr` in a process-scoped I/O guard, with small per-session stdout/stderr rings readable through `stdio tail` and consumable through `stdio read`.
-- Executables expose a tiny Boa object header: magic, ABI version, entry id, flags, capabilities, code length.
+- Executables expose a tiny Norr object header: magic, ABI version, entry id, flags, capabilities, code length.
 - Executables now carry capability bitsets in their VFS object header; shell command `sec` shows kernel/user-mode security status.
 - x86_64 GDT has ring-3 code/data descriptors and a loaded TSS with RSP0 kernel stack; `userctx` exposes selectors, user pages, and TSS diagnostics.
 - x86_64 prepares a user launch context: user code page, user stack page, selectors, kernel transition stack, and a tiny user probe payload.
-- x86_64 now clones the firmware PML4 into a Boa-owned CR3 and switches to it after direct-map setup.
+- x86_64 now clones the firmware PML4 into a Norr-owned CR3 and switches to it after direct-map setup.
 - x86_64 can enter the user probe page through `iretq`; diagnostics prove CPL3 RIP/RSP and the probe payload bytes.
 - x86_64 `userprobe` now performs a real ring3 -> `int 0x80` -> universal syscall dispatcher -> shell round-trip and returns value `42`.
 - x86_64 user syscall diagnostics expose trap count, int80 hits, fast-path hits, last op, and probe fault RIP.
@@ -92,7 +92,7 @@ Do not build speculative versions of these ideas before the required lower layer
 ## Current Syscall Status
 
 - SCLA constants and activation registers are documented for x86_64 and aarch64.
-- A Boa universal syscall dispatcher exists for activation, clock, byte/buffer read/write, and exit; loaded user code exercises session-routed buffered write, `argv[0]` output, and exit on both supported architectures.
+- A Norr universal syscall dispatcher exists for activation, clock, byte/buffer read/write, and exit; loaded user code exercises session-routed buffered write, `argv[0]` output, and exit on both supported architectures.
 - Syscall dispatch accepts capability sets and denies unauthorized operations.
 - x86_64 configures `syscall/sysret` MSRs (`STAR`, `LSTAR`, `FMASK`) and has an entry stub wired to the universal dispatcher.
 - x86_64 syscall entry now switches from user RSP to the TSS/RSP0 kernel stack before calling Rust code, then restores user RSP for `sysretq`.

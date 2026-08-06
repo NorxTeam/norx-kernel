@@ -30,8 +30,8 @@ pub struct Stats {
     pub direct_map_base: usize,
     pub direct_map_bytes: usize,
     pub direct_map_ready: bool,
-    pub boa_cr3_ready: bool,
-    pub boa_cr3: u64,
+    pub norr_cr3_ready: bool,
+    pub norr_cr3: u64,
     pub user_code_base: usize,
     pub user_stack_top: usize,
 }
@@ -40,8 +40,8 @@ pub struct Stats {
 static mut TABLE_POOL: [Page; TABLE_PAGES] = [Page::data(); TABLE_PAGES];
 static mut TABLE_POOL_NEXT: usize = 0;
 static mut DIRECT_MAP_READY: bool = false;
-static mut BOA_CR3_READY: bool = false;
-static mut BOA_CR3: u64 = 0;
+static mut NORR_CR3_READY: bool = false;
+static mut NORR_CR3: u64 = 0;
 
 pub fn init_direct_map() -> bool {
     unsafe {
@@ -86,17 +86,17 @@ pub fn stats() -> Stats {
             direct_map_base: DIRECT_MAP_BASE,
             direct_map_bytes: DIRECT_MAP_BYTES,
             direct_map_ready: DIRECT_MAP_READY,
-            boa_cr3_ready: BOA_CR3_READY,
-            boa_cr3: BOA_CR3,
+            norr_cr3_ready: NORR_CR3_READY,
+            norr_cr3: NORR_CR3,
             user_code_base: USER_CODE_BASE,
             user_stack_top: USER_STACK_TOP,
         }
     }
 }
 
-pub fn init_boa_cr3() -> bool {
+pub fn init_norr_cr3() -> bool {
     unsafe {
-        if BOA_CR3_READY {
+        if NORR_CR3_READY {
             return true;
         }
 
@@ -112,9 +112,9 @@ pub fn init_boa_cr3() -> bool {
             new.add(i).write_volatile(old.add(i).read_volatile());
         }
         restore_cr0(cr0);
-        BOA_CR3 = new_p4;
+        NORR_CR3 = new_p4;
         asm!("mov cr3, {}", in(reg) new_p4, options(nostack, preserves_flags));
-        BOA_CR3_READY = true;
+        NORR_CR3_READY = true;
         true
     }
 }

@@ -21,7 +21,7 @@ pub fn init() {
 
 pub fn device() -> Device {
     Device {
-        name: "boa-ram0",
+        name: "norr-ram0",
         sectors: RAMDISK_SECTORS,
         sector_size: SECTOR_SIZE,
     }
