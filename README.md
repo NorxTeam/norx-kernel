@@ -10,7 +10,7 @@ Norx is an experimental Rust kernel booted by GRUB. It currently targets
 
 - GRUB hand-off with memory regions, reserved ranges, modules, command line,
   architecture information, and optional framebuffer.
-- Serial logging and interactive shell sessions.
+- Serial logging and a line-oriented `serial-debugger`.
 - Basic memory, paging, timer, scheduler, and interrupt infrastructure.
 - A text-only VFS smoke layer over the built-in RAM block device.
 - Architecture-local syscall entry stubs reserved for the future userspace ABI;

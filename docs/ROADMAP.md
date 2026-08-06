@@ -33,8 +33,10 @@ Do not build speculative versions of these ideas before the required lower layer
 - x86_64 has a working first lazy fault path for a small kernel-resident page pool.
 - x86_64 lazy pages are backed by real physical frames through the direct map.
 - aarch64 keeps the shared VM API but needs real syndrome/fault-address exception entry before lazy mapping is enabled there.
-- Paging now has an architecture-neutral status API and shell command `paging`.
-- x86_64 maps the first 16 MiB at `0xffff800000000000` and exposes `dmaptest`.
+- Paging now has an architecture-neutral status API and serial-debugger command
+  `paging`.
+- x86_64 maps the first 16 MiB at `0xffff800000000000`; the direct-map smoke
+  read is internal paging support, not a debugger command.
 - aarch64 direct-map base is planned but not active.
 
 ## Current Scheduler/Timer Status
@@ -46,14 +48,15 @@ Do not build speculative versions of these ideas before the required lower layer
 
 ## Current Input Status
 
-- Serial input is always active for the serial shell session.
-- x86_64 PS/2 keyboard uses IRQ1 with a small scancode ring buffer and polling fallback.
-- aarch64 needs USB HID or platform keyboard input wiring.
+- Serial input is always active for the serial-debugger session.
+- The framebuffer keyboard path and PS/2 input queue were removed with the
+  kernel shell; future interactive input must be added as an explicit debugger
+  or userspace feature.
 
 ## Current Interrupt Status
 
-- x86_64 counts timer, keyboard, spurious interrupts, and fatal exceptions.
-- Shell command `irq` exposes interrupt counters for smoke testing.
+- x86_64 counts timer, spurious interrupts, and fatal exceptions.
+- Serial-debugger command `irq` exposes interrupt counters for diagnostics.
 - aarch64 interrupt counters exist but stay zero until GIC/timer IRQ entry is wired.
 
 ## Current Hardware/Block Status
@@ -61,12 +64,14 @@ Do not build speculative versions of these ideas before the required lower layer
 - x86_64 detects/enables local APIC through CPUID + IA32_APIC_BASE MSR and LAPIC MMIO SVR, while IRQ routing still uses legacy PIC/PIT.
 - aarch64 reports GIC as deferred until controller discovery and MMIO setup exist.
 - A tiny architecture-neutral RAM block device `norx-ram0` exists for future VFS/filesystem smoke tests.
-- Shell diagnostics now include `hw`, `mem`, `vm`, and `block`.
+- Serial-debugger diagnostics include `hw`, `mem`, `vm`, and `block` while they
+  remain useful during the current bring-up.
 
 ## Current VFS Status
 
 - VFS mounts a tiny in-kernel root over `norx-ram0`.
-- `/hello.txt` supports read/write through shell commands `ls`, `cat`, `write`, and `vfs`.
+- `/hello.txt` supports read/write through serial-debugger commands `ls`, `cat`,
+  `write`, and `vfs`.
 - No executable objects are stored in VFS; the root currently contains only the
   text smoke file.
 - This is a smoke layer for future ext4/zfs/btrfs/exfat adapters, not a real on-disk filesystem yet.
@@ -221,29 +226,58 @@ paths below as permanent architecture decisions.
 
 ### 4. Replace the kernel shell with `serial-debugger`
 
-- [ ] Remove the framebuffer keyboard shell and its role as a system control
+- [x] Remove the framebuffer keyboard shell and its role as a system control
   interface.
-- [ ] Keep a minimal serial-only input/output loop for kernel diagnostics.
-- [ ] Rename shell-facing types, functions, messages, and documentation to
+- [x] Keep a minimal serial-only input/output loop for kernel diagnostics.
+- [x] Rename shell-facing types, functions, messages, and documentation to
   `serial-debugger`.
-- [ ] Make command parsing line-oriented, deterministic, and safe during early
+- [x] Make command parsing line-oriented, deterministic, and safe during early
   boot and failure handling.
-- [ ] Keep only commands that are explicitly useful for inspecting or
+- [x] Keep only commands that are explicitly useful for inspecting or
   recovering the kernel.
+
+#### Serial-debugger outcome (2026-08-06)
+
+- [x] Replaced the dual framebuffer/serial session shell with one
+  `serial_debugger` loop that reads and writes only through the serial driver.
+- [x] Removed the framebuffer keyboard input module, PS/2 scancode queue, IRQ1
+  handler, and keyboard-only counters.
+- [x] The parser accepts one bounded line, handles CR/LF and backspace, ignores
+  unsupported control bytes, caps arguments at eight, and never writes past its
+  128-byte line buffer.
+- [x] Kept diagnostics for time, scheduler, IRQs, hardware, memory, paging,
+  drivers, VFS, file inspection/recovery, explicit crash, and halt.
+- [x] Verified the serial-debugger rename has no remaining shell/input-session
+  references in source; obsolete command deletion is complete in task 5.
 
 ### 5. Delete obsolete test commands and debugger baggage
 
-- [ ] Review every current command and remove anything not needed by the
+- [x] Review every current command and remove anything not needed by the
   serial debugger.
-- [ ] Candidates for removal include `dmaptest`, `lazytest`, `block`, and
+- [x] Remove the former `dmaptest`, `lazytest`, and `block` debugger commands and
   VFS/shell diagnostics that do not help recover the kernel, plus their backing
   code and state.
-- [ ] Remove remaining test-only counters, fake paths, smoke-only VFS data, and
+- [x] Remove remaining test-only counters, fake paths, smoke-only VFS data, and
   obsolete diagnostic formatting.
-- [ ] Keep a small intentional diagnostic set for boot state, memory, paging,
-  interrupts, processes, logs, and explicit panic testing.
-- [ ] Re-run the audit after deletion so no command references or dead
+- [x] Keep a small intentional diagnostic set for boot state, memory, paging,
+  interrupts, future process state, logs, VFS file recovery, and explicit panic
+  testing.
+- [x] Re-run the audit after deletion so no command references or dead
   dependencies remain.
+
+#### Debugger cleanup outcome (2026-08-06)
+
+- [x] Deleted `dmaptest`, `lazytest`, and the block-device `Device` test view;
+  the RAM block device remains only as the VFS backing store.
+- [x] Removed the unused VM probe/status API, keyboard counters, and all old
+  shell command text. The serial-debugger command set is now explicit and
+  bounded instead of falling through to fake process execution.
+- [x] Kept only commands with a current inspection or recovery use: help, time,
+  scheduler/IRQ/hardware/memory/paging/driver state, uname, VFS listing and
+  file recovery, explicit crash, and halt.
+- [x] Verified both builds, both Clippy runs with `-D warnings`, formatting,
+  whitespace, and a source scan for removed command names and shell/input
+  paths.
 
 ### 6. Implement the Norx boot presentation
 

@@ -3,27 +3,12 @@ const RAMDISK_SECTORS: usize = 8;
 
 static mut RAMDISK: [u8; SECTOR_SIZE * RAMDISK_SECTORS] = [0; SECTOR_SIZE * RAMDISK_SECTORS];
 
-#[derive(Clone, Copy)]
-pub struct Device {
-    pub name: &'static str,
-    pub sectors: usize,
-    pub sector_size: usize,
-}
-
 pub fn init() {
     unsafe {
         let disk = (&raw mut RAMDISK).cast::<u8>();
         for i in 0..SECTOR_SIZE * RAMDISK_SECTORS {
             disk.add(i).write((i & 0xff) as u8);
         }
-    }
-}
-
-pub fn device() -> Device {
-    Device {
-        name: "norx-ram0",
-        sectors: RAMDISK_SECTORS,
-        sector_size: SECTOR_SIZE,
     }
 }
 

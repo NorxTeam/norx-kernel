@@ -5,7 +5,6 @@ const MAX_DRIVERS: usize = 32;
 pub enum Class {
     Clock,
     Display,
-    Input,
     Serial,
     Block,
     Filesystem,
@@ -62,7 +61,6 @@ pub fn class_name(class: Class) -> &'static str {
     match class {
         Class::Clock => "clock",
         Class::Display => "display",
-        Class::Input => "input",
         Class::Serial => "serial",
         Class::Block => "block",
         Class::Filesystem => "filesystem",

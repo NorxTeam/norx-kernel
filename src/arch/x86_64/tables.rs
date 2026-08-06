@@ -193,7 +193,6 @@ fn load_idt() {
         (*idt.add(13)).set_err(general_protection);
         (*idt.add(14)).set_err(page_fault);
         (*idt.add(32)).set(timer_interrupt);
-        (*idt.add(33)).set(keyboard_interrupt);
         let ptr = Pointer {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
             base: (&raw const IDT) as u64,
@@ -218,12 +217,6 @@ extern "x86-interrupt" fn spurious(_stack: InterruptStackFrame) {
 extern "x86-interrupt" fn timer_interrupt(_stack: InterruptStackFrame) {
     crate::irq::timer();
     crate::sched::on_timer_tick();
-    super::end_timer_interrupt();
-}
-
-extern "x86-interrupt" fn keyboard_interrupt(_stack: InterruptStackFrame) {
-    crate::irq::keyboard();
-    crate::drivers::keyboard::handle_interrupt();
     super::end_timer_interrupt();
 }
 

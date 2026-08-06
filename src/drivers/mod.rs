@@ -1,7 +1,5 @@
 pub mod block;
 pub mod framework;
-#[cfg(target_arch = "x86_64")]
-pub mod keyboard;
 pub mod serial;
 
 pub fn init() {
@@ -25,12 +23,6 @@ pub fn init() {
     framework::register(framework::Driver {
         name: "norx-ram0",
         class: framework::Class::Block,
-        state: framework::State::Ready,
-    });
-    #[cfg(target_arch = "x86_64")]
-    framework::register(framework::Driver {
-        name: "ps2-keyboard",
-        class: framework::Class::Input,
         state: framework::State::Ready,
     });
 }

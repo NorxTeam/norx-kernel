@@ -10,13 +10,12 @@ mod drivers;
 mod error;
 mod font;
 mod framebuffer;
-mod input;
 mod irq;
 mod log;
 mod memory;
 mod paging;
 mod sched;
-mod shell;
+mod serial_debugger;
 mod time;
 mod timer;
 mod vfs;
@@ -43,10 +42,7 @@ pub fn kernel_start() -> ! {
     bootlog::ok("driver framework initialized");
     vfs::init();
     bootlog::ok("vfs initialized");
-    bootlog::spin(1, "probing input devices");
-    input::init();
-    bootlog::ok("input subsystem initialized");
-    bootlog::warn("usb hid input deferred; using early console input");
+    bootlog::ok("serial-debugger input ready");
 
     if let Some(raw) = boot.framebuffer {
         crash::init(raw);
@@ -99,7 +95,7 @@ pub fn kernel_start() -> ! {
     bootlog::ok_fmt(format_args!("architecture {}", arch::NAME));
     bootlog::ok_fmt(format_args!("timer ticks {}", time::ticks()));
     bootlog::ok("kernel alive");
-    shell::run()
+    serial_debugger::run()
 }
 
 #[panic_handler]

@@ -57,25 +57,9 @@ pub fn init_framebuffer(raw: RawFramebuffer) {
     }
 }
 
-pub fn clear_screen() {
-    unsafe {
-        let Some(slot) = (&raw mut CONSOLE).as_mut() else {
-            return;
-        };
-        let Some(console) = slot.as_mut() else {
-            return;
-        };
-        reset_screen(console);
-    }
-}
-
 pub fn write(args: fmt::Arguments) {
     crate::drivers::serial::write(args);
     let _ = Screen.write_fmt(args);
-}
-
-pub fn screen_write_str(s: &str) {
-    let _ = Screen.write_str(s);
 }
 
 struct Screen;
