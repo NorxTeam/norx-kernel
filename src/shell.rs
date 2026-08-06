@@ -63,7 +63,7 @@ impl Session {
     }
 
     fn banner(&mut self) {
-        self.println("Norr Shell");
+        self.println("Norx Shell");
         self.println("sessions: user framebuffer + serial console");
         self.println(
             "builtins: help clear echo time ticks sched irq input hw sec userctx userprobe mem paging dmaptest vm block vfs ls cat write procs ps wait kill uname drivers syscalls syscalltrap sclatest stdio [tail|read] lazytest run rundebug runuser crash halt",
@@ -320,7 +320,7 @@ fn exec(session: &mut Session, line: &str) {
         "ps" => ps(session),
         "wait" => wait_process(session, &args[1..argc]),
         "kill" => kill_process(session, &args[1..argc]),
-        "uname" => session.write_fmt(format_args!("Norr {} uefi\n", crate::arch::NAME)),
+        "uname" => session.write_fmt(format_args!("Norx {} uefi\n", crate::arch::NAME)),
         "drivers" => drivers(session),
         "syscalls" => syscalls(session),
         "syscalltrap" => syscalltrap(session),
@@ -585,12 +585,12 @@ fn vm(session: &mut Session) {
 fn paging(session: &mut Session) {
     let stats = crate::paging::stats();
     session.write_fmt(format_args!(
-        "direct_map={} base=0x{:x} bytes={}KiB norr_cr3={} cr3=0x{:x} tables={}/{} lazy_pages={} user_code=0x{:x} user_stack=0x{:x}\n",
+        "direct_map={} base=0x{:x} bytes={}KiB norx_cr3={} cr3=0x{:x} tables={}/{} lazy_pages={} user_code=0x{:x} user_stack=0x{:x}\n",
         stats.direct_map_ready,
         stats.direct_map_base,
         stats.direct_map_bytes / 1024,
-        stats.norr_cr3_ready,
-        stats.norr_cr3,
+        stats.norx_cr3_ready,
+        stats.norx_cr3,
         stats.table_pages_used,
         stats.table_pages_total,
         stats.lazy_pages,
@@ -876,7 +876,7 @@ fn run_user_program(session: &mut Session, args: &[&str]) {
 
 fn syscalls(session: &mut Session) {
     session.write_fmt(format_args!(
-        "norr-native: {}\n",
+        "norx-native: {}\n",
         crate::abi::syscall::native_registers()
     ));
     session.write_fmt(format_args!(

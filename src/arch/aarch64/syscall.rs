@@ -5,13 +5,13 @@ use core::{
 
 global_asm!(
     r#"
-    .global norr_aarch64_enter_user_probe
-norr_aarch64_enter_user_probe:
-    adrp x9, NORR_AARCH64_USER_PROBE_RETURN_PC
-    add x9, x9, :lo12:NORR_AARCH64_USER_PROBE_RETURN_PC
+    .global norx_aarch64_enter_user_probe
+norx_aarch64_enter_user_probe:
+    adrp x9, NORX_AARCH64_USER_PROBE_RETURN_PC
+    add x9, x9, :lo12:NORX_AARCH64_USER_PROBE_RETURN_PC
     str x30, [x9]
-    adrp x9, NORR_AARCH64_USER_PROBE_RETURN_SP
-    add x9, x9, :lo12:NORR_AARCH64_USER_PROBE_RETURN_SP
+    adrp x9, NORX_AARCH64_USER_PROBE_RETURN_SP
+    add x9, x9, :lo12:NORX_AARCH64_USER_PROBE_RETURN_SP
     mov x10, sp
     str x10, [x9]
     msr sp_el0, x1
@@ -23,24 +23,24 @@ norr_aarch64_enter_user_probe:
 );
 
 extern "C" {
-    fn norr_aarch64_enter_user_probe(rip: u64, rsp: u64) -> u64;
+    fn norx_aarch64_enter_user_probe(rip: u64, rsp: u64) -> u64;
 }
 
 static DISPATCHER_READY: AtomicBool = AtomicBool::new(false);
 static SVC_READY: AtomicBool = AtomicBool::new(false);
 static TRAPS: AtomicU64 = AtomicU64::new(0);
 #[no_mangle]
-static NORR_AARCH64_LAST_OP: AtomicU64 = AtomicU64::new(0);
+static NORX_AARCH64_LAST_OP: AtomicU64 = AtomicU64::new(0);
 #[no_mangle]
-static mut NORR_AARCH64_USER_PROBE_ACTIVE: u64 = 0;
+static mut NORX_AARCH64_USER_PROBE_ACTIVE: u64 = 0;
 #[no_mangle]
-static mut NORR_AARCH64_USER_PROBE_DONE: u64 = 0;
+static mut NORX_AARCH64_USER_PROBE_DONE: u64 = 0;
 #[no_mangle]
-static mut NORR_AARCH64_USER_PROBE_RETURN_SP: u64 = 0;
+static mut NORX_AARCH64_USER_PROBE_RETURN_SP: u64 = 0;
 #[no_mangle]
-static mut NORR_AARCH64_USER_PROBE_RETURN_PC: u64 = 0;
+static mut NORX_AARCH64_USER_PROBE_RETURN_PC: u64 = 0;
 #[no_mangle]
-static mut NORR_AARCH64_USER_PROBE_VALUE: u64 = 0;
+static mut NORX_AARCH64_USER_PROBE_VALUE: u64 = 0;
 
 #[derive(Clone, Copy)]
 pub struct Status {
@@ -62,12 +62,12 @@ pub fn status() -> Status {
         dispatcher_ready: DISPATCHER_READY.load(Ordering::Relaxed),
         svc_ready: SVC_READY.load(Ordering::Relaxed),
         traps: TRAPS.load(Ordering::Relaxed),
-        last_op: NORR_AARCH64_LAST_OP.load(Ordering::Relaxed),
+        last_op: NORX_AARCH64_LAST_OP.load(Ordering::Relaxed),
         user_probe_active: unsafe {
-            core::ptr::addr_of!(NORR_AARCH64_USER_PROBE_ACTIVE).read_volatile()
+            core::ptr::addr_of!(NORX_AARCH64_USER_PROBE_ACTIVE).read_volatile()
         },
         user_probe_done: unsafe {
-            core::ptr::addr_of!(NORR_AARCH64_USER_PROBE_DONE).read_volatile()
+            core::ptr::addr_of!(NORX_AARCH64_USER_PROBE_DONE).read_volatile()
         },
     }
 }
@@ -100,7 +100,7 @@ pub fn smoke() -> crate::abi::syscall::Return {
 
 fn handle(op: u64, args: [u64; 6]) -> crate::abi::syscall::Return {
     TRAPS.fetch_add(1, Ordering::Relaxed);
-    NORR_AARCH64_LAST_OP.store(op, Ordering::Relaxed);
+    NORX_AARCH64_LAST_OP.store(op, Ordering::Relaxed);
     let op = match op {
         0 => crate::abi::syscall::UniversalOp::Activate,
         1 => crate::abi::syscall::UniversalOp::Exit,
@@ -122,9 +122,9 @@ fn handle(op: u64, args: [u64; 6]) -> crate::abi::syscall::Return {
     let ret = crate::abi::syscall::dispatch(crate::abi::syscall::UniversalCall { op, args });
     if matches!(op, crate::abi::syscall::UniversalOp::Exit) && ret.error == 0 {
         unsafe {
-            if NORR_AARCH64_USER_PROBE_ACTIVE != 0 {
-                NORR_AARCH64_USER_PROBE_VALUE = ret.value;
-                NORR_AARCH64_USER_PROBE_DONE = 1;
+            if NORX_AARCH64_USER_PROBE_ACTIVE != 0 {
+                NORX_AARCH64_USER_PROBE_VALUE = ret.value;
+                NORX_AARCH64_USER_PROBE_DONE = 1;
             }
         }
     }
@@ -136,19 +136,19 @@ pub fn begin_user_probe() -> bool {
         return false;
     }
     unsafe {
-        NORR_AARCH64_USER_PROBE_VALUE = 0;
-        NORR_AARCH64_USER_PROBE_DONE = 0;
-        NORR_AARCH64_USER_PROBE_ACTIVE = 1;
+        NORX_AARCH64_USER_PROBE_VALUE = 0;
+        NORX_AARCH64_USER_PROBE_DONE = 0;
+        NORX_AARCH64_USER_PROBE_ACTIVE = 1;
     }
     true
 }
 
 pub fn enter_user_probe(rip: u64, rsp: u64) -> u64 {
-    unsafe { norr_aarch64_enter_user_probe(rip, rsp) }
+    unsafe { norx_aarch64_enter_user_probe(rip, rsp) }
 }
 
 #[no_mangle]
-extern "C" fn norr_aarch64_syscall_rust(
+extern "C" fn norx_aarch64_syscall_rust(
     op: u64,
     a0: u64,
     a1: u64,

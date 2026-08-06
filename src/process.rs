@@ -90,11 +90,11 @@ pub struct UserCodeOutput {
 
 type Program = fn(&[&str]) -> i32;
 
-pub const NORR_EXEC_MAGIC: u32 = 0x5845_4f42;
-pub const NORR_EXEC_ABI: u16 = 1;
+pub const NORX_EXEC_MAGIC: u32 = 0x5845_4f42;
+pub const NORX_EXEC_ABI: u16 = 1;
 
 #[derive(Clone, Copy)]
-pub struct NorrExecutable {
+pub struct NorxExecutable {
     pub magic: u32,
     pub abi: u16,
     pub entry: u16,
@@ -178,7 +178,7 @@ pub fn run_user_code(
     })
 }
 
-pub fn list(mut f: impl FnMut(&'static str, NorrExecutable, crate::capability::Set)) {
+pub fn list(mut f: impl FnMut(&'static str, NorxExecutable, crate::capability::Set)) {
     for executable in EXECUTABLES {
         if let Some(object) = load_object(executable.path) {
             f(executable.path, object, object.capabilities);
@@ -273,24 +273,24 @@ fn finish(pid: u64, state: State, exit: u64) {
     });
 }
 
-fn valid_object(object: NorrExecutable) -> bool {
-    object.magic == NORR_EXEC_MAGIC
-        && object.abi == NORR_EXEC_ABI
+fn valid_object(object: NorxExecutable) -> bool {
+    object.magic == NORX_EXEC_MAGIC
+        && object.abi == NORX_EXEC_ABI
         && object.entry != 0
         && object.code_len <= 491
 }
 
-fn load_object(path: &str) -> Option<NorrExecutable> {
+fn load_object(path: &str) -> Option<NorxExecutable> {
     Some(load_object_with_code(path)?.0)
 }
 
-fn load_object_with_code(path: &str) -> Option<(NorrExecutable, &'static [u8])> {
+fn load_object_with_code(path: &str) -> Option<(NorxExecutable, &'static [u8])> {
     let mut bytes = [0u8; 511];
     let len = crate::vfs::read(path, &mut bytes)?;
     if len < 20 {
         return None;
     }
-    let object = NorrExecutable {
+    let object = NorxExecutable {
         magic: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
         abi: u16::from_le_bytes([bytes[4], bytes[5]]),
         entry: u16::from_le_bytes([bytes[6], bytes[7]]),
@@ -321,7 +321,7 @@ fn leak_code(code: [u8; 491], len: usize) -> &'static [u8] {
 }
 
 fn hello(args: &[&str]) -> i32 {
-    crate::kprint!("hello from Norr process");
+    crate::kprint!("hello from Norx process");
     for arg in args {
         crate::kprint!(" {}", arg);
     }

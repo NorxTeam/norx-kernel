@@ -3,43 +3,43 @@ use core::arch::{asm, global_asm};
 global_asm!(
     r#"
     .align 11
-    .global norr_exception_vectors
-norr_exception_vectors:
-    b norr_aarch64_sync_exception
+    .global norx_exception_vectors
+norx_exception_vectors:
+    b norx_aarch64_sync_exception
     .space 124
-    b norr_aarch64_exception
+    b norx_aarch64_exception
     .space 124
-    b norr_aarch64_exception
+    b norx_aarch64_exception
     .space 124
-    b norr_aarch64_exception
+    b norx_aarch64_exception
     .space 124
-    b norr_aarch64_sync_exception
+    b norx_aarch64_sync_exception
     .space 124
-    b norr_aarch64_exception
+    b norx_aarch64_exception
     .space 124
-    b norr_aarch64_exception
+    b norx_aarch64_exception
     .space 124
-    b norr_aarch64_exception
+    b norx_aarch64_exception
     .space 124
-    b norr_aarch64_sync_exception
+    b norx_aarch64_sync_exception
     .space 124
-    b norr_aarch64_exception
+    b norx_aarch64_exception
     .space 124
-    b norr_aarch64_exception
+    b norx_aarch64_exception
     .space 124
-    b norr_aarch64_exception
+    b norx_aarch64_exception
     .space 124
-    b norr_aarch64_exception
+    b norx_aarch64_exception
     .space 124
-    b norr_aarch64_exception
+    b norx_aarch64_exception
     .space 124
-    b norr_aarch64_exception
+    b norx_aarch64_exception
     .space 124
-    b norr_aarch64_exception
+    b norx_aarch64_exception
     .space 124
 
-    .global norr_aarch64_sync_exception
-norr_aarch64_sync_exception:
+    .global norx_aarch64_sync_exception
+norx_aarch64_sync_exception:
     sub sp, sp, #160
     stp x1, x2, [sp, #0]
     stp x3, x4, [sp, #16]
@@ -86,9 +86,9 @@ norr_aarch64_sync_exception:
     mov x4, x12
     mov x5, x13
     mov x6, x14
-    bl norr_aarch64_syscall_rust
-    adrp x9, NORR_AARCH64_USER_PROBE_RETURN_PC
-    add x9, x9, :lo12:NORR_AARCH64_USER_PROBE_RETURN_PC
+    bl norx_aarch64_syscall_rust
+    adrp x9, NORX_AARCH64_USER_PROBE_RETURN_PC
+    add x9, x9, :lo12:NORX_AARCH64_USER_PROBE_RETURN_PC
     ldr x10, [x9]
     cbz x10, 11f
     ldr x11, [sp, #56]
@@ -122,32 +122,32 @@ norr_aarch64_sync_exception:
     eret
 9:
     add sp, sp, #160
-    b norr_aarch64_exception
+    b norx_aarch64_exception
 10:
-    adrp x9, NORR_AARCH64_USER_PROBE_RETURN_SP
-    add x9, x9, :lo12:NORR_AARCH64_USER_PROBE_RETURN_SP
+    adrp x9, NORX_AARCH64_USER_PROBE_RETURN_SP
+    add x9, x9, :lo12:NORX_AARCH64_USER_PROBE_RETURN_SP
     ldr x10, [x9]
     mov sp, x10
-    adrp x9, NORR_AARCH64_USER_PROBE_RETURN_PC
-    add x9, x9, :lo12:NORR_AARCH64_USER_PROBE_RETURN_PC
+    adrp x9, NORX_AARCH64_USER_PROBE_RETURN_PC
+    add x9, x9, :lo12:NORX_AARCH64_USER_PROBE_RETURN_PC
     ldr x11, [x9]
-    adrp x9, NORR_AARCH64_USER_PROBE_DONE
-    add x9, x9, :lo12:NORR_AARCH64_USER_PROBE_DONE
+    adrp x9, NORX_AARCH64_USER_PROBE_DONE
+    add x9, x9, :lo12:NORX_AARCH64_USER_PROBE_DONE
     str xzr, [x9]
-    adrp x9, NORR_AARCH64_USER_PROBE_ACTIVE
-    add x9, x9, :lo12:NORR_AARCH64_USER_PROBE_ACTIVE
+    adrp x9, NORX_AARCH64_USER_PROBE_ACTIVE
+    add x9, x9, :lo12:NORX_AARCH64_USER_PROBE_ACTIVE
     str xzr, [x9]
     br x11
 "#
 );
 
 extern "C" {
-    static norr_exception_vectors: u8;
+    static norx_exception_vectors: u8;
 }
 
 pub fn init() {
     let current_el: u64;
-    let vectors = unsafe { &norr_exception_vectors as *const u8 as u64 };
+    let vectors = unsafe { &norx_exception_vectors as *const u8 as u64 };
 
     unsafe {
         asm!(
@@ -172,7 +172,7 @@ pub fn init() {
 }
 
 #[no_mangle]
-extern "C" fn norr_aarch64_exception() -> ! {
+extern "C" fn norx_aarch64_exception() -> ! {
     let current_el: u64;
     let esr: u64;
     let far: u64;

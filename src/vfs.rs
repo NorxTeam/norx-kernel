@@ -12,7 +12,7 @@ pub struct Stats {
 
 pub fn init() {
     let mut sector = [0u8; 512];
-    let text = b"Welcome to Norr VFS\n";
+    let text = b"Welcome to Norx VFS\n";
     sector[0] = text.len() as u8;
     sector[1..1 + text.len()].copy_from_slice(text);
     let _ = crate::drivers::block::write_sector(HELLO_LBA, &sector);
@@ -85,8 +85,8 @@ fn write_object(lba: usize, entry: u16, caps: crate::capability::Set) {
     let code = object_code();
     let len = 20 + code.len();
     sector[0] = len as u8;
-    sector[1..5].copy_from_slice(&crate::process::NORR_EXEC_MAGIC.to_le_bytes());
-    sector[5..7].copy_from_slice(&crate::process::NORR_EXEC_ABI.to_le_bytes());
+    sector[1..5].copy_from_slice(&crate::process::NORX_EXEC_MAGIC.to_le_bytes());
+    sector[5..7].copy_from_slice(&crate::process::NORX_EXEC_ABI.to_le_bytes());
     sector[7..9].copy_from_slice(&entry.to_le_bytes());
     sector[9..13].copy_from_slice(&0u32.to_le_bytes());
     sector[13..17].copy_from_slice(&(caps.bits() as u32).to_le_bytes());

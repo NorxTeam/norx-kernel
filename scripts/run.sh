@@ -34,10 +34,10 @@ vars_copy="build/$arch/$vars"
 
 if [ "$profile" = release ]; then
     cargo build --release --target "$target"
-    kernel="target/$target/release/norr_kernel.efi"
+    kernel="target/$target/release/norx_kernel.efi"
 else
     cargo build --target "$target"
-    kernel="target/$target/debug/norr_kernel.efi"
+    kernel="target/$target/debug/norx_kernel.efi"
 fi
 
 esp="build/$arch/esp"
