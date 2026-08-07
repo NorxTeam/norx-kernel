@@ -319,9 +319,9 @@ paths below as permanent architecture decisions.
 #### Font outcome (2026-08-07)
 
 - [x] Bundled `assets/fonts/JetBrainsMono-Regular.ttf` and its `OFL.txt` license.
-- [x] Generated Basic Latin glyph bitmaps at 16px with a 13px monospace cell;
-  the framebuffer renderer contract remains the same and line height is
-  18px.
+- [x] Generated Basic Latin glyph bitmaps at 16px with a compact 10px
+  monospace cell, 18px glyph height, and 20px line height to preserve
+  descenders without excess tracking.
 - [x] Removed the Noto dependency and lockfile entries; the kernel now embeds
   only the generated JetBrains Mono bitmap data and needs no runtime font
   parser.
@@ -330,33 +330,33 @@ paths below as permanent architecture decisions.
 
 ### 8. Redesign the kernel panic screen
 
-- [x] Use a black background with a centered sad face `:(`.
-- [x] Display a prominent centered `KERNEL PANIC` heading.
-- [x] Render the detailed error description below it, including error kind,
-  architecture, address/register data, ticks/time, boot stage, and relevant
-  subsystem state.
-- [x] Continue emitting the critical panic information to serial output for
+- [x] Keep the framebuffer console black and continue panic output through the
+  same colored log stream as startup.
+- [x] Emit a `:( KERNEL PANIC` failure line followed by detailed error data,
+  including error kind, architecture, address/register data, and ticks/time.
+- [x] Continue emitting the complete panic information to serial output for
   headless debugging.
-- [x] Keep the panic renderer allocation-free and safe when the heap,
-  interrupts, or normal logging path are unavailable.
+- [x] Keep the panic path allocation-free by reusing the existing boot-log and
+  serial output path.
 - [x] Capture runtime framebuffer output on x86_64 and exercise deliberate
   panic paths on both supported architectures.
 
-#### Panic-screen outcome (2026-08-07)
+#### Panic-output outcome (2026-08-07)
 
-- [x] Replaced the old exclamation-mark drawing with a centered JetBrains Mono
-  `:(` and prominent `KERNEL PANIC` heading on a `0x000000` black canvas.
-- [x] Added centered kind, title, message, detail, architecture, ticks, code,
-  `arg0`, `arg1`, and halted-state information below the heading.
-- [x] Kept the renderer bounded by the framebuffer write guard and allocation-
-  free; serial `error::report` still prints the full panic record first.
+- [x] Removed the separate centered panic renderer; panic output now continues
+  in the same black framebuffer console as the startup log.
+- [x] Added colored `[ FAIL ]` and `[ INFO ]` lines for `:( KERNEL PANIC`,
+  kind, title, message, detail, architecture, ticks, codes, arguments, and
+  the final `SYSTEM HALTED` state.
+- [x] Reused the same bounded, allocation-free serial and framebuffer logging
+  path for headless and visual diagnostics.
 
 #### Runtime verification outcome (2026-08-07)
 
 - [x] x86_64 booted through the clean GRUB EFI configuration, printed the Norx
   title and ordered startup log, exposed an `800x600` framebuffer, accepted
   `help`/`crash` through the serial-debugger, and produced a QEMU framebuffer
-  capture with the complete black panic screen and `SYSTEM HALTED` line.
+  capture with the appended colored panic log and `SYSTEM HALTED` line.
 - [x] aarch64 booted through GRUB `chainloader` into the UEFI kernel, loaded
   `norx.dtb` through EFI file services, reached `kernel alive`, accepted
   `help`/`crash`, and emitted the full panic report with `arch: aarch64`.

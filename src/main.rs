@@ -27,8 +27,6 @@ pub fn kernel_start() -> ! {
     log::init();
     let boot = boot::info();
     if let Some(raw) = boot.framebuffer {
-        crash::init(raw);
-        let _ = framebuffer::init(raw);
         log::init_framebuffer(raw);
     }
     bootlog::title();

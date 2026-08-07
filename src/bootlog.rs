@@ -71,6 +71,10 @@ pub fn fail(message: &str) {
     status(Status::Fail, message);
 }
 
+pub fn fail_fmt(args: fmt::Arguments) {
+    status_fmt(Status::Fail, args);
+}
+
 pub fn warn(message: &str) {
     status(Status::Warn, message);
 }
@@ -81,6 +85,10 @@ pub fn warn_fmt(args: fmt::Arguments) {
 
 pub fn info(message: &str) {
     status(Status::Info, message);
+}
+
+pub fn info_fmt(args: fmt::Arguments) {
+    status_fmt(Status::Info, args);
 }
 
 pub fn spin(frame: u8, message: &str) {

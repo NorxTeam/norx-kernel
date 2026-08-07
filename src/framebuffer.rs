@@ -1,6 +1,5 @@
 use crate::{
     boot::{PixelFormat, RawFramebuffer},
-    error::KernelError,
     font,
 };
 
@@ -36,30 +35,6 @@ impl Fb {
         }
     }
 
-    pub fn crash(&mut self, error: KernelError) {
-        self.clear(0x000000);
-        let top = self.height().saturating_sub(430) / 2;
-
-        self.text_centered(top, ":(", 2, 0xf4f7fb);
-        self.text_centered(top + 48, "KERNEL PANIC", 2, 0xf4f7fb);
-        self.text_centered(top + 92, error.title(), 1, 0xc8d0da);
-        self.text_centered(top + 114, error.message, 1, 0xc8d0da);
-        self.text_centered(top + 136, error.detail, 1, 0xaeb7c2);
-        self.text_centered(top + 160, "KIND", 1, 0x7f8894);
-        self.text_centered(top + 178, error.kind_name(), 1, 0xaeb7c2);
-        self.text_centered(top + 200, "ARCH", 1, 0x7f8894);
-        self.text_centered(top + 218, crate::arch::NAME, 1, 0xaeb7c2);
-        self.text_centered(top + 240, "TICKS", 1, 0x7f8894);
-        self.hex_centered(top + 258, crate::time::ticks(), 1, 0xaeb7c2);
-        self.text_centered(top + 280, "CODE", 1, 0x7f8894);
-        self.hex_centered(top + 298, error.code, 1, 0xaeb7c2);
-        self.text_centered(top + 320, "ARG0", 1, 0x7f8894);
-        self.hex_centered(top + 338, error.arg0, 1, 0xaeb7c2);
-        self.text_centered(top + 360, "ARG1", 1, 0x7f8894);
-        self.hex_centered(top + 378, error.arg1, 1, 0xaeb7c2);
-        self.text_centered(top + 414, "SYSTEM HALTED", 1, 0x7f8894);
-    }
-
     pub fn term_char(&mut self, x: usize, y: usize, byte: u8, fg: u32, bg: u32) {
         let x = x as u64;
         let y = y as u64;
@@ -86,39 +61,6 @@ impl Fb {
         }
     }
 
-    fn text_centered(&mut self, y: u64, text: &str, scale: u64, rgb: u32) {
-        let width = text.len() as u64 * TERM_W as u64 * scale;
-        let x = (self.raw.width as u64).saturating_sub(width) / 2;
-        self.text(x, y, text, scale, rgb);
-    }
-
-    fn text(&mut self, x: u64, y: u64, text: &str, scale: u64, rgb: u32) {
-        let mut cursor = x;
-        for byte in text.bytes() {
-            self.glyph(cursor, y, byte, scale, rgb);
-            cursor += TERM_W as u64 * scale;
-        }
-    }
-
-    fn glyph(&mut self, x: u64, y: u64, byte: u8, scale: u64, rgb: u32) {
-        let Some(glyph) = font::glyph(byte) else {
-            return;
-        };
-        for (yy, row) in glyph.raster().iter().enumerate() {
-            for (xx, alpha) in row.iter().enumerate() {
-                if *alpha != 0 {
-                    self.rect(
-                        x + xx as u64 * scale,
-                        y + yy as u64 * scale,
-                        scale,
-                        scale,
-                        scale_rgb(rgb, *alpha),
-                    );
-                }
-            }
-        }
-    }
-
     fn terminal_glyph(&mut self, x: u64, y: u64, byte: u8, rgb: u32) {
         let Some(glyph) = font::glyph(byte) else {
             return;
@@ -129,23 +71,6 @@ impl Fb {
                     self.put_pixel(x + xx as u64, y + yy as u64, scale_rgb(rgb, *alpha));
                 }
             }
-        }
-    }
-
-    fn hex_centered(&mut self, y: u64, value: u64, scale: u64, rgb: u32) {
-        let chars = 18;
-        let width = chars * TERM_W as u64 * scale;
-        let x = (self.raw.width as u64).saturating_sub(width) / 2;
-        self.text(x, y, "0x", scale, rgb);
-        for i in 0..16 {
-            let shift = (15 - i) * 4;
-            let nibble = ((value >> shift) & 0xf) as u8;
-            let ch = if nibble < 10 {
-                b'0' + nibble
-            } else {
-                b'a' + nibble - 10
-            };
-            self.glyph(x + (2 + i) * TERM_W as u64 * scale, y, ch, scale, rgb);
         }
     }
 
