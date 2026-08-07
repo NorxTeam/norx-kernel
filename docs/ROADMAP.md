@@ -306,8 +306,8 @@ paths below as permanent architecture decisions.
   syscall entry, paging, VM, scheduler, timer, and completed initialization.
 - [x] Console overflow scrolls the existing log by one line instead of clearing
   the framebuffer, preserving the boot history through serial-debugger startup.
-- [x] Added phase checks with a moving four-star loader that is replaced by the
-  completed status on the same log line.
+- [x] Added a white bouncing-arrow loader that pulses during long memory and
+  paging checks, then is replaced by `OK` or `FAILED` on the same log line.
 - [x] Deferred OS hand-off is marked as `WARN`; informational diagnostics stay
   white and framebuffer RGB/BGR modes preserve their intended colors.
 - [x] Status labels use fixed-width colored markers with the requested `[  OK  ]`

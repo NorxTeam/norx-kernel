@@ -9,6 +9,9 @@ pub enum Status {
     Spin(u8),
 }
 
+static mut ACTIVE_MESSAGE: Option<&'static str> = None;
+static mut SPIN_FRAME: u8 = 0;
+
 impl Status {
     fn label(self) -> &'static str {
         match self {
@@ -16,11 +19,15 @@ impl Status {
             Status::Fail => "FAILED",
             Status::Warn => " WARN ",
             Status::Info => " INFO ",
-            Status::Spin(frame) => match frame & 3 {
-                0 => "****  ",
-                1 => " **** ",
-                2 => "  ****",
-                _ => " **** ",
+            Status::Spin(frame) => match frame & 7 {
+                0 => "  >   ",
+                1 => "   >  ",
+                2 => "    > ",
+                3 => "     >",
+                4 => "    < ",
+                5 => "   <  ",
+                6 => "  <   ",
+                _ => " <    ",
             },
         }
     }
@@ -49,12 +56,14 @@ pub fn title() {
 }
 
 pub fn status(status: Status, message: &str) {
+    clear_active();
     line_start();
     prefix(status);
     crate::kprintln!("{}", message);
 }
 
 pub fn status_fmt(status: Status, args: fmt::Arguments) {
+    clear_active();
     line_start();
     prefix(status);
     crate::log::write(args);
@@ -85,10 +94,40 @@ pub fn info(message: &str) {
     status(Status::Info, message);
 }
 
-pub fn start(frame: u8, message: &str) {
-    line_start();
-    prefix(Status::Spin(frame));
-    crate::kprint!("{}", message);
+pub fn start(frame: u8, message: &'static str) {
+    unsafe {
+        ACTIVE_MESSAGE = Some(message);
+        SPIN_FRAME = frame;
+    }
+    render_active();
+}
+
+pub fn pulse() {
+    unsafe {
+        let active = ACTIVE_MESSAGE;
+        if active.is_none() {
+            return;
+        }
+        SPIN_FRAME = SPIN_FRAME.wrapping_add(1);
+    }
+    render_active();
+}
+
+fn render_active() {
+    unsafe {
+        let active = ACTIVE_MESSAGE;
+        if let Some(message) = active {
+            line_start();
+            prefix(Status::Spin(SPIN_FRAME));
+            crate::kprint!("{}", message);
+        }
+    }
+}
+
+fn clear_active() {
+    unsafe {
+        ACTIVE_MESSAGE = None;
+    }
 }
 
 fn line_start() {

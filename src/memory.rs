@@ -53,7 +53,16 @@ pub fn init(info: BootInfo) -> Summary {
         SKIPPED_RANGES = 0;
     }
 
-    for region in info.memory.iter().take(info.memory_len).copied() {
+    for (index, region) in info
+        .memory
+        .iter()
+        .take(info.memory_len)
+        .copied()
+        .enumerate()
+    {
+        if index & 3 == 0 {
+            crate::bootlog::pulse();
+        }
         add_available(region, &info);
     }
 

@@ -52,6 +52,9 @@ pub fn init_direct_map() -> bool {
                 break;
             }
             physical += 4096;
+            if physical.is_multiple_of(4096 * 256) {
+                crate::bootlog::pulse();
+            }
         }
         restore_cr0(cr0);
         DIRECT_MAP_READY = mapped;
