@@ -27,7 +27,8 @@ boot path is GRUB-based:
 
 The current VFS is only a smoke layer backed by an in-kernel RAM block device
 and contains `/hello.txt`. Norx is not production-ready. See the
-[roadmap](docs/ROADMAP.md) for the current implementation status.
+[shared roadmap](../ROADMAP.md) for the current implementation status and
+future system work.
 
 ## Requirements
 
