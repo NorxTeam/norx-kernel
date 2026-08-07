@@ -4,7 +4,8 @@
 
 Norx is an experimental Rust kernel booted by GRUB. It currently targets
 `x86_64-unknown-none` through GRUB's Multiboot2 EFI hand-off and
-`aarch64-unknown-none-softfloat` through GRUB's ARM64 Linux-image/FDT hand-off.
+`aarch64-unknown-uefi` through GRUB's EFI chainloader and the firmware DTB
+configuration table.
 
 ## Current Scope
 
@@ -18,17 +19,16 @@ Norx is an experimental Rust kernel booted by GRUB. It currently targets
 
 ## Requirements
 
-- Rustup. The repository pins nightly Rust and freestanding targets in
+- Rustup. The repository pins nightly Rust and kernel targets in
   `rust-toolchain.toml`.
 - GRUB's `grub-mkstandalone` and `grub-file` tools.
-- An `objcopy` compatible with LLVM binary output for the ARM64 image.
 - QEMU with EDK2 firmware files available in QEMU's share directory.
 
 ## Build
 
 ```sh
 cargo build --target x86_64-unknown-none
-cargo build --target aarch64-unknown-none-softfloat
+cargo build --target aarch64-unknown-uefi
 ```
 
 ## Run
@@ -40,8 +40,9 @@ cargo build --target aarch64-unknown-none-softfloat
 
 The script builds a GRUB EFI system partition under `build/<arch>/esp` and
 starts QEMU with it. Set `PROFILE=release` for a release build or `MODE=build`
-to create the partition without starting QEMU. The ARM64 path converts the
-freestanding ELF into the Linux `Image` layout expected by GRUB.
+to create the partition without starting QEMU. On aarch64, set `NORX_DTB` to
+use a board-provided DTB file; the run script generates a QEMU `virt` DTB when
+the variable is not set.
 
 ## Status
 

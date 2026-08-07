@@ -15,18 +15,18 @@ case "$arch" in
         machine="q35"
         firmware="edk2-x86_64-code.fd"
         vars="edk2-i386-vars.fd"
-        modules="normal configfile multiboot2 fat"
+        modules="normal configfile multiboot2 fat efi_gop all_video gfxterm"
         ;;
     aarch64)
-        target="aarch64-unknown-none-softfloat"
         grub_format="arm64-efi"
         boot_file="BOOTAA64.EFI"
-        kernel_name="norx.img"
+        target="aarch64-unknown-uefi"
+        kernel_name="norx.efi"
         qemu="qemu-system-aarch64"
         machine="virt"
         firmware="edk2-aarch64-code.fd"
         vars="edk2-arm-vars.fd"
-        modules="normal configfile linux fat"
+        modules="normal configfile chain fat efi_gop all_video gfxterm"
         ;;
     *)
         echo "usage: $0 [x86_64|aarch64]" >&2
@@ -55,26 +55,12 @@ rm -rf "$root"
 mkdir -p "$boot_dir" "$esp/boot/grub"
 cp "$grub_cfg" "$esp/boot/grub/grub.cfg"
 
-if [ "$arch" = aarch64 ]; then
-    objcopy="${OBJCOPY:-}"
-    if [ -z "$objcopy" ]; then
-        for candidate in rust-objcopy llvm-objcopy objcopy; do
-            if command -v "$candidate" >/dev/null 2>&1; then
-                objcopy="$candidate"
-                break
-            fi
-        done
-    fi
-    if [ -z "$objcopy" ]; then
-        echo "an objcopy compatible with LLVM binary output is required for aarch64" >&2
-        exit 1
-    fi
-    "$objcopy" --set-section-flags .bss=alloc,load,contents -O binary "$kernel" "$esp/boot/$kernel_name"
-else
-    cp "$kernel" "$esp/boot/$kernel_name"
-    if command -v grub-file >/dev/null 2>&1; then
-        grub-file --is-x86-multiboot2 "$kernel"
-    fi
+cp "$kernel" "$esp/boot/$kernel_name"
+if [ "$arch" = x86_64 ] && command -v grub-file >/dev/null 2>&1; then
+    grub-file --is-x86-multiboot2 "$kernel"
+fi
+if [ "$arch" = aarch64 ] && [ -n "${NORX_DTB:-}" ]; then
+    cp "$NORX_DTB" "$esp/boot/norx.dtb"
 fi
 
 grub-mkstandalone \
@@ -95,6 +81,19 @@ command -v "$qemu" >/dev/null 2>&1 || {
 
 qemu_bin="$(command -v "$qemu")"
 qemu_share="${QEMU_SHARE:-$(dirname "$(dirname "$(realpath "$qemu_bin")")")/share/qemu}"
+if [ "$arch" = aarch64 ] && [ ! -f "$esp/boot/norx.dtb" ]; then
+    "$qemu_bin" \
+        -machine "$machine,dumpdtb=$esp/boot/norx.dtb" \
+        -m 256M \
+        -display none \
+        -S \
+        -no-reboot \
+        -no-shutdown &
+    dtb_pid=$!
+    sleep 1
+    kill "$dtb_pid" 2>/dev/null || true
+    wait "$dtb_pid" 2>/dev/null || true
+fi
 vars_copy="$root/$vars"
 cp "$qemu_share/$vars" "$vars_copy"
 

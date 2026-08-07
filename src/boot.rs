@@ -9,8 +9,13 @@ const MAX_MODULES: usize = 8;
 const CMDLINE_MAX: usize = 128;
 #[cfg(target_arch = "x86_64")]
 const MAX_MULTIBOOT_INFO: usize = 16 * 1024 * 1024;
+#[cfg(target_arch = "x86_64")]
+const EFI_MEMORY_MAP_SIZE: usize = 64 * 1024;
 #[cfg(target_arch = "aarch64")]
 const MAX_FDT_SIZE: usize = 16 * 1024 * 1024;
+
+#[cfg(target_arch = "x86_64")]
+static mut EFI_MEMORY_MAP: [u8; EFI_MEMORY_MAP_SIZE] = [0; EFI_MEMORY_MAP_SIZE];
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
@@ -61,6 +66,7 @@ norx_multiboot2_header_end:
 _start:
     cli
     cld
+    lea rsp, [rip + norx_boot_stack_top]
     mov edi, eax
     mov rsi, rbx
     call norx_multiboot2_entry
@@ -68,34 +74,12 @@ _start:
     hlt
     jmp 1b
     .size _start, .-_start
-"#
-);
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    r#"
-    .section .image_header,"a"
-    .align 3
-    .long 0
-    .long 0
-    .quad 0x80000
-    .quad 0
-    .quad 0
-    .quad 0
-    .quad 0
-    .quad 0
-    .long 0x644d5241
-    .long 0
-
-    .section .text.boot,"ax"
-    .global _start
-    .type _start,%function
-_start:
-    bl norx_fdt_entry
-1:
-    wfi
-    b 1b
-    .size _start, .-_start
+    .section .bss,"aw",@nobits
+    .align 16
+norx_boot_stack:
+    .skip 16384
+norx_boot_stack_top:
 "#
 );
 
@@ -131,6 +115,7 @@ pub struct RawFramebuffer {
     pub width: u32,
     pub height: u32,
     pub stride: usize,
+    pub bytes_per_pixel: usize,
     pub format: PixelFormat,
 }
 
@@ -200,19 +185,41 @@ pub fn info() -> BootInfo {
 pub extern "C" fn norx_multiboot2_entry(magic: u32, info_address: u64) -> ! {
     crate::arch::init();
     if !init_multiboot2(magic, info_address) {
-        crate::drivers::serial::write_str("Norx: invalid Multiboot2 hand-off\r\n");
+        crate::drivers::serial::write(format_args!(
+            "Norx: invalid Multiboot2 hand-off magic=0x{:08x} info=0x{:016x}\r\n",
+            magic, info_address
+        ));
         crate::arch::halt();
     }
     crate::kernel_start()
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(target_os = "uefi")]
 #[no_mangle]
-pub extern "C" fn norx_fdt_entry(fdt_address: u64) -> ! {
+pub extern "efiapi" fn efi_main(_image_handle: u64, system_table: u64) -> ! {
     crate::arch::init();
-    if !init_fdt(fdt_address) {
-        crate::drivers::serial::write_str("Norx: invalid ARM64 FDT hand-off\r\n");
+    let Some(fdt_address) =
+        (unsafe { efi_fdt(system_table).or_else(|| efi_file_fdt(_image_handle, system_table)) })
+    else {
+        crate::drivers::serial::write_str("Norx: EFI DTB table unavailable\r\n");
         crate::arch::halt();
+    };
+    if !init_fdt(fdt_address) {
+        crate::drivers::serial::write_str("Norx: invalid EFI DTB hand-off\r\n");
+        crate::arch::halt();
+    }
+    if let Some((base, size)) = unsafe { efi_image_region(_image_handle, system_table) } {
+        unsafe { add_reserved(&mut *core::ptr::addr_of_mut!(INFO), base, size) };
+    }
+    if let Some(framebuffer) = unsafe { efi_framebuffer(system_table) } {
+        unsafe {
+            add_reserved(
+                &mut *core::ptr::addr_of_mut!(INFO),
+                framebuffer.base as u64,
+                framebuffer.size as u64,
+            );
+            (*core::ptr::addr_of_mut!(INFO)).framebuffer = Some(framebuffer);
+        }
     }
     crate::kernel_start()
 }
@@ -238,6 +245,7 @@ pub fn init_fdt(fdt_address: u64) -> bool {
     true
 }
 
+#[cfg(not(target_os = "uefi"))]
 fn reserve_kernel(info: &mut BootInfo) {
     let start = (&raw const __kernel_start) as u64;
     let end = (&raw const __kernel_end) as u64;
@@ -285,8 +293,13 @@ fn framebuffer(
     bpp: u8,
     format: PixelFormat,
 ) -> Option<RawFramebuffer> {
-    let minimum_pitch = width.checked_mul(4)?;
-    if base == 0 || width == 0 || height == 0 || bpp != 32 || pitch < minimum_pitch {
+    let bytes_per_pixel: usize = match bpp {
+        24 => 3,
+        32 => 4,
+        _ => return None,
+    };
+    let minimum_pitch = width.checked_mul(bytes_per_pixel as u64)?;
+    if base == 0 || width == 0 || height == 0 || pitch < minimum_pitch {
         return None;
     }
     let stride = usize::try_from(pitch).ok()?;
@@ -299,6 +312,7 @@ fn framebuffer(
         width,
         height,
         stride,
+        bytes_per_pixel,
         format,
     })
 }
@@ -313,6 +327,8 @@ unsafe fn parse_multiboot2(address: usize) -> Option<BootInfo> {
     let mut info = BootInfo::empty(Architecture::X86_64);
     let mut offset = 8usize;
     let mut framebuffer_info = None;
+    let mut efi_system_table = 0u64;
+    let mut efi_image_handle = 0u64;
 
     while offset.checked_add(8)? <= total_size {
         let tag = address.checked_add(offset)?;
@@ -322,7 +338,7 @@ unsafe fn parse_multiboot2(address: usize) -> Option<BootInfo> {
             return None;
         }
         match tag_type {
-            1 => copy_c_string(read_ptr(tag + 8)?, &mut info.cmdline, &mut info.cmdline_len),
+            1 => copy_c_string(tag + 8, &mut info.cmdline, &mut info.cmdline_len, size - 8),
             3 if size >= 16 => {
                 let start = read_u32(tag + 8)? as u64;
                 let end = read_u32(tag + 12)? as u64;
@@ -350,7 +366,8 @@ unsafe fn parse_multiboot2(address: usize) -> Option<BootInfo> {
                 let width = read_u32(tag + 20)? as u64;
                 let height = read_u32(tag + 24)? as u64;
                 let bpp = read_u8(tag + 28)?;
-                if read_u8(tag + 29)? == 1 && size >= 38 {
+                let pixel_type = read_u8(tag + 29)?;
+                if pixel_type == 1 && size >= 38 {
                     let red = read_u8(tag + 32)?;
                     let blue = read_u8(tag + 36)?;
                     if red == 0 && blue == 16 {
@@ -362,6 +379,8 @@ unsafe fn parse_multiboot2(address: usize) -> Option<BootInfo> {
                     }
                 }
             }
+            12 if size >= 16 => efi_system_table = read_u64(tag + 8)?,
+            20 if size >= 16 => efi_image_handle = read_u64(tag + 8)?,
             0 => break,
             _ => {}
         }
@@ -369,13 +388,82 @@ unsafe fn parse_multiboot2(address: usize) -> Option<BootInfo> {
     }
 
     if info.memory_len == 0 {
-        return None;
+        efi_memory_map(efi_system_table, efi_image_handle, &mut info)?;
+    }
+    if let Some(framebuffer) = framebuffer_info {
+        add_reserved(&mut info, framebuffer.base as u64, framebuffer.size as u64);
     }
     info.framebuffer = framebuffer_info;
     info.handoff_address = address as u64;
     add_reserved(&mut info, address as u64, total_size as u64);
+    #[cfg(not(target_os = "uefi"))]
     reserve_kernel(&mut info);
     Some(info)
+}
+
+#[cfg(target_arch = "x86_64")]
+type EfiGetMemoryMap = unsafe extern "efiapi" fn(
+    memory_map_size: *mut usize,
+    memory_map: *mut u8,
+    map_key: *mut usize,
+    descriptor_size: *mut usize,
+    descriptor_version: *mut u32,
+) -> usize;
+
+#[cfg(target_arch = "x86_64")]
+type EfiExitBootServices = unsafe extern "efiapi" fn(image_handle: u64, map_key: usize) -> usize;
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn efi_memory_map(system_table: u64, image_handle: u64, info: &mut BootInfo) -> Option<()> {
+    if system_table == 0 || image_handle == 0 {
+        return None;
+    }
+
+    let system_table = system_table as usize;
+    let boot_services = read_u64(system_table + 96)? as usize;
+    let get_memory_map = read_u64(boot_services + 56)? as usize;
+    let exit_boot_services = read_u64(boot_services + 232)? as usize;
+    if get_memory_map == 0 || exit_boot_services == 0 {
+        return None;
+    }
+
+    let mut map_size = EFI_MEMORY_MAP_SIZE;
+    let mut map_key = 0usize;
+    let mut descriptor_size = 0usize;
+    let mut descriptor_version = 0u32;
+    let map_ptr = core::ptr::addr_of_mut!(EFI_MEMORY_MAP) as *mut u8;
+    let get_memory_map: EfiGetMemoryMap = core::mem::transmute(get_memory_map);
+    if get_memory_map(
+        &mut map_size,
+        map_ptr,
+        &mut map_key,
+        &mut descriptor_size,
+        &mut descriptor_version,
+    ) != 0
+        || descriptor_size < 40
+        || map_size > EFI_MEMORY_MAP_SIZE
+    {
+        return None;
+    }
+
+    let exit_boot_services: EfiExitBootServices = core::mem::transmute(exit_boot_services);
+    if exit_boot_services(image_handle, map_key) != 0 {
+        return None;
+    }
+
+    let mut offset = 0usize;
+    while offset.checked_add(descriptor_size)? <= map_size {
+        let descriptor = map_ptr.add(offset) as usize;
+        let kind = read_u32(descriptor)?;
+        let base = read_u64(descriptor + 8)?;
+        let pages = read_u64(descriptor + 24)?;
+        if matches!(kind, 1..=4 | 7) {
+            add_memory(info, base, pages.checked_mul(0x1000)?);
+        }
+        offset = offset.checked_add(descriptor_size)?;
+    }
+    let _ = descriptor_version;
+    Some(())
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -512,14 +600,226 @@ unsafe fn parse_fdt(address: usize) -> Option<BootInfo> {
             format,
         ) {
             if fb.size as u64 <= framebuffer_size {
+                add_reserved(&mut info, fb.base as u64, fb.size as u64);
                 info.framebuffer = Some(fb);
             }
         }
     }
     info.handoff_address = address as u64;
     add_reserved(&mut info, address as u64, total_size as u64);
+    #[cfg(not(target_os = "uefi"))]
     reserve_kernel(&mut info);
     Some(info)
+}
+
+#[cfg(target_os = "uefi")]
+const EFI_DTB_TABLE_GUID: [u8; 16] = [
+    0xd5, 0x21, 0xb6, 0xb1, 0x9c, 0xf1, 0xa5, 0x41, 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0,
+];
+
+#[cfg(target_os = "uefi")]
+const EFI_LOADED_IMAGE_PROTOCOL_GUID: [u8; 16] = [
+    0xa1, 0x31, 0x1b, 0x5b, 0x62, 0x95, 0xd2, 0x11, 0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b,
+];
+
+#[cfg(target_os = "uefi")]
+const EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID: [u8; 16] = [
+    0x22, 0x5b, 0x4e, 0x96, 0x59, 0x64, 0xd2, 0x11, 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b,
+];
+
+#[cfg(target_os = "uefi")]
+const EFI_FILE_INFO_GUID: [u8; 16] = [
+    0x92, 0x6e, 0x57, 0x09, 0x3f, 0x6d, 0xd2, 0x11, 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b,
+];
+
+#[cfg(target_os = "uefi")]
+const EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID: [u8; 16] = [
+    0xde, 0xa9, 0x42, 0x90, 0xdc, 0x23, 0x38, 0x4a, 0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0xa7,
+];
+
+#[cfg(target_os = "uefi")]
+const EFI_DTB_PATH: [u16; 15] = [
+    b'\\' as u16,
+    b'b' as u16,
+    b'o' as u16,
+    b'o' as u16,
+    b't' as u16,
+    b'\\' as u16,
+    b'n' as u16,
+    b'o' as u16,
+    b'r' as u16,
+    b'x' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b't' as u16,
+    b'b' as u16,
+    0,
+];
+
+#[cfg(target_os = "uefi")]
+type EfiHandleProtocol = unsafe extern "efiapi" fn(u64, *const u8, *mut u64) -> usize;
+#[cfg(target_os = "uefi")]
+type EfiOpenVolume = unsafe extern "efiapi" fn(u64, *mut u64) -> usize;
+#[cfg(target_os = "uefi")]
+type EfiFileOpen = unsafe extern "efiapi" fn(u64, *mut u64, *const u16, u64, u64) -> usize;
+#[cfg(target_os = "uefi")]
+type EfiFileClose = unsafe extern "efiapi" fn(u64) -> usize;
+#[cfg(target_os = "uefi")]
+type EfiFileRead = unsafe extern "efiapi" fn(u64, *mut usize, *mut u8) -> usize;
+#[cfg(target_os = "uefi")]
+type EfiFileGetInfo = unsafe extern "efiapi" fn(u64, *const u8, *mut usize, *mut u8) -> usize;
+#[cfg(target_os = "uefi")]
+type EfiAllocatePool = unsafe extern "efiapi" fn(u32, usize, *mut u64) -> usize;
+#[cfg(target_os = "uefi")]
+type EfiLocateProtocol = unsafe extern "efiapi" fn(*const u8, *const u8, *mut u64) -> usize;
+
+#[cfg(target_os = "uefi")]
+unsafe fn efi_fdt(system_table: u64) -> Option<u64> {
+    if system_table == 0 {
+        return None;
+    }
+    let system_table = system_table as usize;
+    let count = read_u64(system_table + 104)? as usize;
+    let tables = read_u64(system_table + 112)? as usize;
+    for index in 0..count {
+        let entry = tables.checked_add(index.checked_mul(24)?)?;
+        let guid = core::slice::from_raw_parts(entry as *const u8, 16);
+        if guid == EFI_DTB_TABLE_GUID {
+            return read_u64(entry + 16);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "uefi")]
+unsafe fn efi_image_region(image_handle: u64, system_table: u64) -> Option<(u64, u64)> {
+    if image_handle == 0 || system_table == 0 {
+        return None;
+    }
+    let loaded_image = efi_loaded_image(image_handle, system_table)?;
+    let image_base = read_u64(loaded_image as usize + 64)?;
+    let image_size = read_u64(loaded_image as usize + 72)?;
+    Some((image_base, image_size))
+}
+
+#[cfg(target_os = "uefi")]
+unsafe fn efi_loaded_image(image_handle: u64, system_table: u64) -> Option<u64> {
+    let boot_services = read_u64(system_table as usize + 96)? as usize;
+    let handle_protocol = read_u64(boot_services + 152)? as usize;
+    if handle_protocol == 0 {
+        return None;
+    }
+    let handle_protocol: EfiHandleProtocol = core::mem::transmute(handle_protocol);
+    let mut loaded_image = 0u64;
+    if handle_protocol(
+        image_handle,
+        EFI_LOADED_IMAGE_PROTOCOL_GUID.as_ptr(),
+        &mut loaded_image,
+    ) != 0
+    {
+        return None;
+    }
+    Some(loaded_image)
+}
+
+#[cfg(target_os = "uefi")]
+unsafe fn efi_file_fdt(image_handle: u64, system_table: u64) -> Option<u64> {
+    let loaded_image = efi_loaded_image(image_handle, system_table)?;
+    let device_handle = read_u64(loaded_image as usize + 24)?;
+    let boot_services = read_u64(system_table as usize + 96)? as usize;
+    let handle_protocol = read_u64(boot_services + 152)? as usize;
+    let handle_protocol: EfiHandleProtocol = core::mem::transmute(handle_protocol);
+    let mut file_system = 0u64;
+    if handle_protocol(
+        device_handle,
+        EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID.as_ptr(),
+        &mut file_system,
+    ) != 0
+    {
+        return None;
+    }
+
+    let open_volume: EfiOpenVolume = core::mem::transmute(read_u64(file_system as usize + 8)?);
+    let mut root = 0u64;
+    if open_volume(file_system, &mut root) != 0 {
+        return None;
+    }
+    let open: EfiFileOpen = core::mem::transmute(read_u64(root as usize + 8)?);
+    let mut file = 0u64;
+    if open(root, &mut file, EFI_DTB_PATH.as_ptr(), 1, 0) != 0 {
+        return None;
+    }
+    let close: EfiFileClose = core::mem::transmute(read_u64(file as usize + 16)?);
+
+    let get_info: EfiFileGetInfo = core::mem::transmute(read_u64(file as usize + 64)?);
+    let mut info_size = 128usize;
+    let mut info = [0u8; 128];
+    if get_info(
+        file,
+        EFI_FILE_INFO_GUID.as_ptr(),
+        &mut info_size,
+        info.as_mut_ptr(),
+    ) != 0
+    {
+        close(file);
+        return None;
+    }
+    let file_size = read_u64(info.as_ptr() as usize + 8)? as usize;
+    if !(40..=MAX_FDT_SIZE).contains(&file_size) {
+        close(file);
+        return None;
+    }
+
+    let allocate_pool: EfiAllocatePool = core::mem::transmute(read_u64(boot_services + 64)?);
+    let mut buffer = 0u64;
+    if allocate_pool(2, file_size, &mut buffer) != 0 {
+        close(file);
+        return None;
+    }
+    let read: EfiFileRead = core::mem::transmute(read_u64(file as usize + 32)?);
+    let mut read_size = file_size;
+    if read(file, &mut read_size, buffer as *mut u8) != 0 || read_size != file_size {
+        close(file);
+        return None;
+    }
+    close(file);
+    Some(buffer)
+}
+
+#[cfg(target_os = "uefi")]
+unsafe fn efi_framebuffer(system_table: u64) -> Option<RawFramebuffer> {
+    let boot_services = read_u64(system_table as usize + 96)? as usize;
+    let locate_protocol: EfiLocateProtocol = core::mem::transmute(read_u64(boot_services + 320)?);
+    let mut graphics = 0u64;
+    if locate_protocol(
+        EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID.as_ptr(),
+        core::ptr::null(),
+        &mut graphics,
+    ) != 0
+    {
+        return None;
+    }
+    let mode = read_u64(graphics as usize + 32)? as usize;
+    let info = read_u64(mode + 8)? as usize;
+    let width = read_u32(info + 4)? as u64;
+    let height = read_u32(info + 8)? as u64;
+    let format = match read_u32(info + 12)? {
+        0 => PixelFormat::Rgb,
+        1 => PixelFormat::Bgr,
+        _ => return None,
+    };
+    let pixels_per_scan_line = read_u32(info + 32)? as u64;
+    let base = read_u64(mode + 24)?;
+    let size = read_u64(mode + 32)?;
+    let framebuffer = framebuffer(
+        base,
+        pixels_per_scan_line.checked_mul(4)?,
+        width,
+        height,
+        32,
+        format,
+    )?;
+    (framebuffer.size as u64 <= size).then_some(framebuffer)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -591,9 +891,9 @@ unsafe fn read_cells(address: usize, length: usize, cells: usize) -> Option<u64>
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn copy_c_string(address: usize, out: &mut [u8], len: &mut usize) {
+unsafe fn copy_c_string(address: usize, out: &mut [u8], len: &mut usize, limit: usize) {
     let mut index = 0;
-    while index < out.len() {
+    while index < out.len() && index < limit {
         let byte = read_u8(address + index).unwrap_or(0);
         if byte == 0 {
             break;
@@ -637,21 +937,16 @@ unsafe fn align4(value: usize) -> Option<usize> {
     value.checked_add(3).map(|value| value & !3)
 }
 
-#[cfg(target_arch = "x86_64")]
-unsafe fn read_ptr(address: usize) -> Option<usize> {
-    Some(read_u32(address)? as usize)
-}
-
 unsafe fn read_u8(address: usize) -> Option<u8> {
     Some((address as *const u8).read_unaligned())
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 unsafe fn read_u32(address: usize) -> Option<u32> {
     Some((address as *const u32).read_unaligned())
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 unsafe fn read_u64(address: usize) -> Option<u64> {
     Some((address as *const u64).read_unaligned())
 }

@@ -25,7 +25,7 @@ impl Fb {
     }
 
     pub fn pitch(&self) -> u64 {
-        (self.raw.stride * 4) as u64
+        self.raw.stride as u64
     }
 
     pub fn clear(&mut self, rgb: u32) {
@@ -38,26 +38,26 @@ impl Fb {
 
     pub fn crash(&mut self, error: KernelError) {
         self.clear(0x20242b);
-        let cy = self.raw.height as u64 / 2;
+        let top = self.height().saturating_sub(430) / 2;
 
-        self.text_centered(cy.saturating_sub(142), ":(", 3, 0xf4f7fb);
-        self.text_centered(cy.saturating_sub(82), "KERNEL PANIC", 2, 0xf4f7fb);
-        self.text_centered(cy.saturating_sub(42), error.title(), 1, 0xc8d0da);
-        self.text_centered(cy.saturating_sub(20), error.message, 1, 0xc8d0da);
-        self.text_centered(cy + 2, error.detail, 1, 0xaeb7c2);
-        self.text_centered(cy + 28, "KIND", 1, 0x7f8894);
-        self.text_centered(cy + 46, error.kind_name(), 1, 0xaeb7c2);
-        self.text_centered(cy + 70, "ARCH", 1, 0x7f8894);
-        self.text_centered(cy + 88, crate::arch::NAME, 1, 0xaeb7c2);
-        self.text_centered(cy + 112, "TICKS", 1, 0x7f8894);
-        self.hex_centered(cy + 130, crate::time::ticks(), 1, 0xaeb7c2);
-        self.text_centered(cy + 154, "CODE", 1, 0x7f8894);
-        self.hex_centered(cy + 172, error.code, 1, 0xaeb7c2);
-        self.text_centered(cy + 196, "ARG0", 1, 0x7f8894);
-        self.hex_centered(cy + 214, error.arg0, 1, 0xaeb7c2);
-        self.text_centered(cy + 238, "ARG1", 1, 0x7f8894);
-        self.hex_centered(cy + 256, error.arg1, 1, 0xaeb7c2);
-        self.text_centered(cy + 296, "SYSTEM HALTED", 1, 0x7f8894);
+        self.text_centered(top, ":(", 2, 0xf4f7fb);
+        self.text_centered(top + 48, "KERNEL PANIC", 2, 0xf4f7fb);
+        self.text_centered(top + 92, error.title(), 1, 0xc8d0da);
+        self.text_centered(top + 114, error.message, 1, 0xc8d0da);
+        self.text_centered(top + 136, error.detail, 1, 0xaeb7c2);
+        self.text_centered(top + 160, "KIND", 1, 0x7f8894);
+        self.text_centered(top + 178, error.kind_name(), 1, 0xaeb7c2);
+        self.text_centered(top + 200, "ARCH", 1, 0x7f8894);
+        self.text_centered(top + 218, crate::arch::NAME, 1, 0xaeb7c2);
+        self.text_centered(top + 240, "TICKS", 1, 0x7f8894);
+        self.hex_centered(top + 258, crate::time::ticks(), 1, 0xaeb7c2);
+        self.text_centered(top + 280, "CODE", 1, 0x7f8894);
+        self.hex_centered(top + 298, error.code, 1, 0xaeb7c2);
+        self.text_centered(top + 320, "ARG0", 1, 0x7f8894);
+        self.hex_centered(top + 338, error.arg0, 1, 0xaeb7c2);
+        self.text_centered(top + 360, "ARG1", 1, 0x7f8894);
+        self.hex_centered(top + 378, error.arg1, 1, 0xaeb7c2);
+        self.text_centered(top + 414, "SYSTEM HALTED", 1, 0x7f8894);
     }
 
     pub fn term_char(&mut self, x: usize, y: usize, byte: u8, fg: u32, bg: u32) {
@@ -154,8 +154,8 @@ impl Fb {
             return;
         }
 
-        let offset = (y as usize * self.raw.stride + x as usize) * 4;
-        if offset + 3 >= self.raw.size {
+        let offset = y as usize * self.raw.stride + x as usize * self.raw.bytes_per_pixel;
+        if offset + self.raw.bytes_per_pixel > self.raw.size {
             return;
         }
 
@@ -165,11 +165,17 @@ impl Fb {
                 bytes[offset] = (rgb >> 16) as u8;
                 bytes[offset + 1] = (rgb >> 8) as u8;
                 bytes[offset + 2] = rgb as u8;
+                if self.raw.bytes_per_pixel == 4 {
+                    bytes[offset + 3] = 0xff;
+                }
             }
             PixelFormat::Bgr => {
                 bytes[offset] = rgb as u8;
                 bytes[offset + 1] = (rgb >> 8) as u8;
                 bytes[offset + 2] = (rgb >> 16) as u8;
+                if self.raw.bytes_per_pixel == 4 {
+                    bytes[offset + 3] = 0xff;
+                }
             }
         }
     }

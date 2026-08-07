@@ -171,24 +171,23 @@ paths below as permanent architecture decisions.
   usable memory, records modules, validates a 32-bit RGB/BGR framebuffer, and
   reserves the kernel image, Multiboot information block, and modules before
   the physical allocator sees the map.
-- [x] Added the aarch64 GRUB Linux-image/FDT contract. The image header carries
-  the ARM64 Linux magic and text offset; the FDT parser reads memory `reg`,
-  `/chosen` bootargs/initrd, and an optional `simple-framebuffer`, while the
-  FDT, kernel, and initrd are reserved. This matches upstream GRUB's ARM64
-  Linux-only boot support instead of pretending that x86 Multiboot2 is portable
-  to ARM64.
-- [x] Replaced the UEFI PE targets and `efi_main` with freestanding ELF targets,
-  architecture-specific linker scripts, GRUB EFI entry stubs, and a small
-  `build.rs` linker-script dependency hook. x86_64 uses the EFI64 Multiboot2
-  entry tag; aarch64 is converted to the Linux `Image` binary layout.
+- [x] Added the aarch64 GRUB EFI contract. GRUB uses `chainloader` to start the
+  `aarch64-unknown-uefi` kernel image; the EFI entry reads the standard DTB
+  configuration table and falls back to `\\boot\\norx.dtb` through the EFI
+  Simple File System protocol. The existing FDT parser still owns memory,
+  initrd, command-line, and optional framebuffer extraction.
+- [x] Kept the x86_64 freestanding Multiboot2 entry and added an aarch64 UEFI
+  entry with loaded-image reservation and GOP framebuffer detection. The ARM
+  Linux `Image` path was removed from the runnable GRUB contract because GRUB's
+  ARM64 `linux` loader requires a Linux EFI stub, which Norx is not.
 - [x] Replaced the UEFI run path with `scripts/run.sh`, standalone GRUB EFI
   images, architecture-specific `grub.cfg`, QEMU firmware-variable handling,
   CI image builds, and updated contribution/build documentation.
-- [x] Verified both freestanding builds and both Clippy runs with
-  `-D warnings`, checked the x86 Multiboot2 header checksum/EFI64 entry address,
-  checked the ARM64 image magic/text offset, and passed shell syntax validation.
-  Full GRUB image execution is wired into CI; the local Windows environment has
-  QEMU but no `grub-mkstandalone` installation.
+- [x] Verified x86_64 Multiboot2 and aarch64 UEFI builds plus Clippy with
+  `-D warnings`. Full GRUB image execution is wired into CI; the local Windows
+  environment lacks `grub-mkstandalone`, `grub-file`, and `xorriso`, so the
+  runtime smoke used the official Debian GRUB EFI binaries and QEMU's FAT
+  volume fallback.
 
 ### 3. Remove universal-syscall binary smoke paths
 
@@ -216,7 +215,7 @@ paths below as permanent architecture decisions.
   deleted path: `sec`, `userctx`, `userprobe`, `procs`, `ps`, `wait`, `kill`,
   `run`, `rundebug`, `runuser`, `syscalls`, `syscalltrap`, `sclatest`, and
   `stdio`.
-- [x] Verified both freestanding builds, both Clippy runs with `-D warnings`,
+- [x] Verified both supported target builds, both Clippy runs with `-D warnings`,
   formatting, diff whitespace, and a source scan with no universal syscall or
   embedded-binary references remaining.
 - The next userspace implementation must begin with an explicit ABI and page
@@ -301,7 +300,7 @@ paths below as permanent architecture decisions.
 - [x] Status labels use fixed-width colored markers with the requested `[    OK    ]`
   style; the final line explicitly reports the future OS bootloader hand-off as
   deferred.
-- [x] Verified both freestanding builds, both Clippy runs with `-D warnings`,
+- [x] Verified both supported target builds, both Clippy runs with `-D warnings`,
   formatting, and diff whitespace.
 
 ### 7. Replace the console font with JetBrains Mono
@@ -326,7 +325,7 @@ paths below as permanent architecture decisions.
 - [x] Removed the Noto dependency and lockfile entries; the kernel now embeds
   only the generated JetBrains Mono bitmap data and needs no runtime font
   parser.
-- [x] Verified both freestanding builds, both Clippy runs with `-D warnings`,
+- [x] Verified both supported target builds, both Clippy runs with `-D warnings`,
   formatting, and diff whitespace.
 
 ### 8. Redesign the kernel panic screen
@@ -340,8 +339,11 @@ paths below as permanent architecture decisions.
   headless debugging.
 - [x] Keep the panic renderer allocation-free and safe when the heap,
   interrupts, or normal logging path are unavailable.
-- [ ] Capture runtime framebuffer output on both supported architectures and
-  exercise deliberate panic paths.
+- [x] Capture runtime framebuffer output on x86_64 and exercise deliberate
+  panic paths on both supported architectures.
+- [ ] Capture an aarch64 framebuffer panic image on a QEMU firmware/device
+  combination that exposes GOP; the tested `virt` firmware correctly falls
+  back to serial when GOP is unavailable.
 
 #### Panic-screen outcome (2026-08-06)
 
@@ -351,9 +353,16 @@ paths below as permanent architecture decisions.
   `arg0`, `arg1`, and halted-state information below the heading.
 - [x] Kept the renderer bounded by the framebuffer write guard and allocation-
   free; serial `error::report` still prints the full panic record first.
-- [x] Verified both freestanding builds, both Clippy runs with `-D warnings`,
-  formatting, and diff whitespace. The direct aarch64 QEMU smoke attempt did
-  not produce serial output; full framebuffer capture remains gated by the
-  missing local GRUB image tools.
-- [ ] Re-run the runtime panic capture after installing `grub-mkstandalone`,
-  `grub-file`, and `xorriso` (or an equivalent image-building toolchain).
+
+#### Runtime verification outcome (2026-08-06)
+
+- [x] x86_64 booted through the clean GRUB EFI configuration, printed the Norx
+  title and ordered startup log, exposed an `800x600` framebuffer, accepted
+  `help`/`crash` through the serial-debugger, and produced a QEMU framebuffer
+  capture with the complete dark-gray panic screen and `SYSTEM HALTED` line.
+- [x] aarch64 booted through GRUB `chainloader` into the UEFI kernel, loaded
+  `norx.dtb` through EFI file services, reached `kernel alive`, accepted
+  `help`/`crash`, and emitted the full panic report with `arch: aarch64`.
+- [x] Added a UEFI GOP fallback so the same framebuffer renderer is used when
+  ARM firmware exposes a graphics mode; the tested QEMU `virt` setup exposed
+  no GOP and correctly stayed serial-only.
