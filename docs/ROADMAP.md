@@ -333,8 +333,8 @@ paths below as permanent architecture decisions.
 - [x] Generated crisp Basic Latin 8×16 bitmap glyphs with a 16px line height.
 - [x] Added embedded UTF-8 handling and block glyphs for the title's `▄`, `█`,
   and `▀` characters without adding a runtime font parser.
-- [x] Added framebuffer SGR support for bold text; status opening brackets are
-  bold white while closing brackets remain gray.
+- [x] Added framebuffer SGR support for bold text; status brackets stay gray
+  and regular while the status labels retain their individual colors.
 - [x] Removed the Noto dependency and lockfile entries; the kernel now embeds
   only the generated Terminus bitmap data and needs no runtime font parser.
 - [x] Verified both supported target builds, both Clippy runs with `-D warnings`,
