@@ -1,7 +1,7 @@
 mod data;
 
 pub const WIDTH: usize = data::WIDTH;
-pub const LINE_HEIGHT: usize = 16;
+pub const LINE_HEIGHT: usize = data::HEIGHT;
 pub const SCALE: usize = 2;
 
 pub struct RasterizedChar {

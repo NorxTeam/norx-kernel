@@ -16,8 +16,8 @@ boot path is GRUB-based:
   architecture information, and optional framebuffer.
 - x86_64 VGA text fallback followed by a framebuffer-console takeover using the
   bootloader's active resolution and full pixel surface.
-- Terminus 8×16 Linux-console bitmap font rendered at 2× scale and
-  allocation-free black console panic output with detailed diagnostics.
+- Terminus 6x12 Linux-console bitmap font rendered at 2x scale (12x24 cells)
+  and allocation-free black console panic output with detailed diagnostics.
 - Serial-only, line-oriented `serial-debugger`; there is no framebuffer
   keyboard shell.
 - Basic memory, paging, timer, scheduler, interrupt, VFS, and driver
