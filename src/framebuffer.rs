@@ -53,6 +53,40 @@ impl Fb {
         );
     }
 
+    pub fn scroll_text(&mut self, top_row: usize, bottom_row: usize, bg: u32) {
+        if bottom_row <= top_row + 1 {
+            return;
+        }
+
+        let row_bytes = self.raw.stride.saturating_mul(TERM_H);
+        let source = top_row.saturating_add(1).saturating_mul(row_bytes);
+        let destination = top_row.saturating_mul(row_bytes);
+        let count = bottom_row
+            .saturating_sub(top_row + 1)
+            .saturating_mul(row_bytes);
+
+        if source.saturating_add(count) > self.raw.size
+            || destination.saturating_add(count) > self.raw.size
+        {
+            return;
+        }
+
+        unsafe {
+            core::ptr::copy(
+                self.raw.base.add(source),
+                self.raw.base.add(destination),
+                count,
+            );
+        }
+        self.rect(
+            0,
+            bottom_row.saturating_sub(1).saturating_mul(TERM_H) as u64,
+            self.raw.width as u64,
+            TERM_H as u64,
+            bg,
+        );
+    }
+
     fn rect(&mut self, x: u64, y: u64, w: u64, h: u64, rgb: u32) {
         for yy in y..y.saturating_add(h) {
             for xx in x..x.saturating_add(w) {

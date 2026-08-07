@@ -134,9 +134,9 @@ fn screen_byte(byte: u8) {
 
         if console.row >= console.rows {
             let mut fb = framebuffer::init(console.raw);
-            fb.clear(0x000000);
+            fb.scroll_text(2, console.rows, console.bg);
             console.col = 2;
-            console.row = 2;
+            console.row = console.rows.saturating_sub(1);
         }
 
         draw_cursor(console, true);

@@ -303,7 +303,9 @@ paths below as permanent architecture decisions.
   a fallback.
 - [x] Startup output now follows a linear order: GRUB hand-off, framebuffer,
   clock, drivers, VFS, serial-debugger, memory, architecture tables, interrupts,
-  syscall entry, paging, VM, scheduler, timer, and kernel-alive state.
+  syscall entry, paging, VM, scheduler, timer, and `kernel started` state.
+- [x] Console overflow scrolls the existing log by one line instead of clearing
+  the framebuffer, preserving the boot history through serial-debugger startup.
 - [x] Deferred OS hand-off is marked as `WARN`; informational diagnostics stay
   cyan and framebuffer RGB/BGR modes preserve their intended colors.
 - [x] Status labels use fixed-width colored markers with the requested `[    OK    ]`
@@ -367,5 +369,5 @@ paths below as permanent architecture decisions.
   `help`/`crash` through the serial-debugger, and produced a QEMU framebuffer
   capture with the appended colored panic log and `SYSTEM HALTED` line.
 - [x] aarch64 booted through GRUB `chainloader` into the UEFI kernel, loaded
-  `norx.dtb` through EFI file services, reached `kernel alive`, accepted
+  `norx.dtb` through EFI file services, reached `kernel started`, accepted
   `help`/`crash`, and emitted the full panic report with `arch: aarch64`.

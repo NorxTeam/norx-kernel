@@ -101,8 +101,8 @@ pub fn kernel_start() -> ! {
     }
     bootlog::ok_fmt(format_args!("architecture {}", arch::NAME));
     bootlog::ok_fmt(format_args!("timer ticks {}", time::ticks()));
-    bootlog::ok("kernel alive");
     bootlog::warn("future OS bootloader hand-off deferred");
+    bootlog::ok("kernel started");
     serial_debugger::run()
 }
 

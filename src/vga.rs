@@ -70,9 +70,8 @@ fn put(state: &mut Vga, value: u8) {
         next_line(state);
     }
     if state.row >= HEIGHT {
-        clear();
-        state.col = 0;
-        state.row = 0;
+        scroll();
+        state.row = HEIGHT - 1;
     }
 
     let offset = (state.row * WIDTH + state.col) * 2;
@@ -90,6 +89,20 @@ fn next_line(state: &mut Vga) {
 
 fn clear() {
     for cell in 0..WIDTH * HEIGHT {
+        let offset = cell * 2;
+        unsafe {
+            core::ptr::write_volatile(MEMORY.add(offset), b' ');
+            core::ptr::write_volatile(MEMORY.add(offset + 1), ATTRIBUTE);
+        }
+    }
+}
+
+fn scroll() {
+    let row_bytes = WIDTH * 2;
+    unsafe {
+        core::ptr::copy(MEMORY.add(row_bytes), MEMORY, (HEIGHT - 1) * row_bytes);
+    }
+    for cell in (HEIGHT - 1) * WIDTH..HEIGHT * WIDTH {
         let offset = cell * 2;
         unsafe {
             core::ptr::write_volatile(MEMORY.add(offset), b' ');
