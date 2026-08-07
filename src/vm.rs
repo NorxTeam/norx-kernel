@@ -3,6 +3,7 @@ const LAZY_PAGES: usize = 16;
 const PAGE_SIZE: usize = 4096;
 
 pub fn init() {
+    crate::bootlog::start(2, "checking lazy virtual memory");
     if crate::arch::supports_lazy_pages() {
         crate::bootlog::ok_fmt(format_args!(
             "lazy vm range 0x{:x}..0x{:x}",

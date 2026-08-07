@@ -34,6 +34,7 @@ pub fn kernel_start() -> ! {
         log::init_framebuffer(raw);
     }
     bootlog::title();
+    bootlog::start(0, "accepting GRUB hand-off");
     bootlog::ok_fmt(format_args!(
         "GRUB hand-off accepted arch={} memory={} modules={}",
         boot.architecture.name(),
@@ -41,9 +42,11 @@ pub fn kernel_start() -> ! {
         boot.modules_len
     ));
     if !boot.cmdline().is_empty() {
+        bootlog::start(1, "reading kernel command line");
         bootlog::info(boot.cmdline());
     }
     if let Some(raw) = boot.framebuffer {
+        bootlog::start(2, "initializing framebuffer");
         let fb = framebuffer::init(raw);
         bootlog::ok_fmt(format_args!(
             "framebuffer {}x{} pitch {}",
@@ -52,6 +55,7 @@ pub fn kernel_start() -> ! {
             fb.pitch()
         ));
     }
+    bootlog::start(3, "initializing kernel clock");
     time::init();
     bootlog::ok("kernel clock initialized");
     bootlog::start(0, "probing built-in drivers");
@@ -60,25 +64,30 @@ pub fn kernel_start() -> ! {
     bootlog::start(1, "checking virtual filesystem");
     vfs::init();
     bootlog::ok("vfs initialized");
+    bootlog::start(2, "initializing serial-debugger");
     bootlog::ok("serial-debugger input ready");
 
     if boot.framebuffer.is_none() {
+        bootlog::start(3, "checking framebuffer");
         bootlog::warn("framebuffer unavailable; serial remains active");
     }
 
     bootlog::start(2, "checking physical memory map");
     let summary = memory::init(boot);
     bootlog::ok_fmt(format_args!("memory map {} regions", summary.descriptors));
+    bootlog::start(3, "checking physical allocator");
     bootlog::ok_fmt(format_args!(
         "physical allocator {} KiB usable",
         summary.usable_pages * 4
     ));
     if summary.skipped_ranges != 0 {
+        bootlog::start(0, "checking memory range coverage");
         bootlog::warn_fmt(format_args!(
             "physical allocator skipped {} memory ranges",
             summary.skipped_ranges
         ));
     }
+    bootlog::start(1, "allocating first free frame");
     if let Some(frame) = memory::alloc_frame() {
         bootlog::ok_fmt(format_args!("first free frame 0x{:x}", frame));
     } else {
@@ -88,26 +97,38 @@ pub fn kernel_start() -> ! {
     bootlog::start(3, "checking architecture tables");
     arch::tables::init();
     bootlog::ok("architecture tables initialized");
+    bootlog::start(0, "checking interrupt controller");
     arch::init_interrupt_controller();
+    bootlog::start(1, "initializing syscall entry");
     arch::init_syscalls();
-    bootlog::start(0, "checking virtual memory");
     paging::init();
     vm::init();
     bootlog::start(1, "checking scheduler");
     sched::self_check();
+    bootlog::ok("scheduler self-check passed");
+    bootlog::start(2, "initializing scheduler runtime");
     sched::init_runtime();
-    bootlog::ok("scheduler initialized");
+    bootlog::ok("scheduler runtime initialized");
     bootlog::start(2, "checking timer source");
-    if timer::init() {
+    let timer_ready = timer::init();
+    if timer_ready {
         bootlog::ok("hardware scheduler timer initialized");
-        bootlog::info("timer source irq");
     } else {
         bootlog::warn("hardware scheduler timer unavailable; using polling");
+    }
+    bootlog::start(3, "selecting timer source");
+    if timer_ready {
+        bootlog::info("timer source irq");
+    } else {
         bootlog::info("timer source polling");
     }
+    bootlog::start(0, "reporting architecture");
     bootlog::ok_fmt(format_args!("architecture {}", arch::NAME));
+    bootlog::start(1, "reading timer ticks");
     bootlog::ok_fmt(format_args!("timer ticks {}", time::ticks()));
+    bootlog::start(2, "checking future OS hand-off");
     bootlog::warn("future OS bootloader hand-off deferred");
+    bootlog::start(3, "finalizing kernel initialization");
     bootlog::ok("kernel initialization complete");
     serial_debugger::run()
 }

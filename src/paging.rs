@@ -12,22 +12,31 @@ pub struct Stats {
 
 pub fn init() {
     #[cfg(target_arch = "x86_64")]
-    let _ = crate::arch::paging::init_direct_map();
+    crate::bootlog::start(0, "building direct map");
+    #[cfg(target_arch = "aarch64")]
+    crate::bootlog::start(0, "checking direct map support");
     #[cfg(target_arch = "x86_64")]
-    let _ = crate::arch::paging::init_norx_cr3();
+    let _ = crate::arch::paging::init_direct_map();
 
-    let stats = stats();
-    if stats.direct_map_ready {
+    let stats_after_map = stats();
+    if stats_after_map.direct_map_ready {
         crate::bootlog::ok_fmt(format_args!(
             "direct map ready base 0x{:x}",
-            stats.direct_map_base
+            stats_after_map.direct_map_base
         ));
     } else {
         crate::bootlog::warn_fmt(format_args!(
             "direct map planned base 0x{:x}",
-            stats.direct_map_base
+            stats_after_map.direct_map_base
         ));
     }
+
+    #[cfg(target_arch = "x86_64")]
+    crate::bootlog::start(1, "installing kernel page tables");
+    #[cfg(target_arch = "x86_64")]
+    let _ = crate::arch::paging::init_norx_cr3();
+
+    let stats = stats();
     if stats.norx_cr3_ready {
         crate::bootlog::ok_fmt(format_args!("norx cr3 ready 0x{:x}", stats.norx_cr3));
     }

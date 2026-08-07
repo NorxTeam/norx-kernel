@@ -307,7 +307,8 @@ paths below as permanent architecture decisions.
 - [x] Console overflow scrolls the existing log by one line instead of clearing
   the framebuffer, preserving the boot history through serial-debugger startup.
 - [x] Added a white bouncing-arrow loader that pulses during long memory and
-  paging checks, then is replaced by `OK` or `FAILED` on the same log line.
+  paging checks. Every boot action now starts with that loader and replaces it
+  with its final `OK`, `WARN`, `INFO`, or `FAILED` status on the same line.
 - [x] Deferred OS hand-off is marked as `WARN`; informational diagnostics stay
   white and framebuffer RGB/BGR modes preserve their intended colors.
 - [x] Status labels use fixed-width colored markers with the requested `[  OK  ]`
