@@ -317,32 +317,26 @@ paths below as permanent architecture decisions.
 - [x] Verified both supported target builds, both Clippy runs with `-D warnings`,
   formatting, and diff whitespace.
 
-### 7. Replace the console font with JetBrains Mono
+### 7. Use a Linux-console bitmap font
 
-- [x] Locate the already-downloaded JetBrains Mono font asset and verify its
-  format and license before bundling it.
-- [x] Convert the required glyph range to the bitmap representation used by
-  the Norx console.
-- [x] Replace the current `noto-sans-mono-bitmap` dependency and generated
-  font data with the JetBrains Mono asset.
-- [x] Preserve the existing low-level renderer contract unless the font size
-  requires a measured layout change.
+- [x] Use Terminus 4.49 normal 8×16, matching the fixed-size bitmap style used
+  by a traditional Linux virtual console.
+- [x] Convert the required Basic Latin glyph range to the bitmap
+  representation used by the Norx console.
+- [x] Keep the renderer allocation-free and free of any runtime font parser.
 - [x] Verify ASCII-art alignment, boot logs, serial-debugger output, and panic
   text at the target resolution.
 
 #### Font outcome (2026-08-07)
 
-- [x] Bundled `assets/fonts/JetBrainsMono-Regular.ttf` and its `OFL.txt` license.
-- [x] Generated Basic Latin grayscale glyph bitmaps at 12px with a compact 8px
-  monospace cell, 16px glyph height, and 17px line height to preserve
-  descenders without excess tracking.
+- [x] Bundled `assets/fonts/Terminus-u16n.bdf` and its `Terminus-OFL.txt` license.
+- [x] Generated crisp Basic Latin 8×16 bitmap glyphs with a 16px line height.
 - [x] Added embedded UTF-8 handling and block glyphs for the title's `▄`, `█`,
   and `▀` characters without adding a runtime font parser.
 - [x] Added framebuffer SGR support for bold text; status opening brackets are
   bold white while closing brackets remain gray.
 - [x] Removed the Noto dependency and lockfile entries; the kernel now embeds
-  only the generated JetBrains Mono bitmap data and needs no runtime font
-  parser.
+  only the generated Terminus bitmap data and needs no runtime font parser.
 - [x] Verified both supported target builds, both Clippy runs with `-D warnings`,
   formatting, and diff whitespace.
 
