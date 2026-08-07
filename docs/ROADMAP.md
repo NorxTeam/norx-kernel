@@ -345,7 +345,7 @@ paths below as permanent architecture decisions.
   combination that exposes GOP; the tested `virt` firmware correctly falls
   back to serial when GOP is unavailable.
 
-#### Panic-screen outcome (2026-08-06)
+#### Panic-screen outcome (2026-08-07)
 
 - [x] Replaced the old exclamation-mark drawing with a centered JetBrains Mono
   `:(` and prominent `KERNEL PANIC` heading on a `0x20242b` dark-gray canvas.
