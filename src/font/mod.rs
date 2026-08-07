@@ -2,6 +2,7 @@ mod data;
 
 pub const WIDTH: usize = data::WIDTH;
 pub const LINE_HEIGHT: usize = 16;
+pub const SCALE: usize = 2;
 
 pub struct RasterizedChar {
     raster: &'static [[u8; WIDTH]; data::HEIGHT],

@@ -330,7 +330,8 @@ paths below as permanent architecture decisions.
 #### Font outcome (2026-08-07)
 
 - [x] Bundled `assets/fonts/Terminus-u16n.bdf` and its `Terminus-OFL.txt` license.
-- [x] Generated crisp Basic Latin 8×16 bitmap glyphs with a 16px line height.
+- [x] Generated crisp Basic Latin 8×16 bitmap glyphs with a 16px source line
+  height and rendered them at 2× scale as 16×32 console cells.
 - [x] Added embedded UTF-8 handling and block glyphs for the title's `▄`, `█`,
   and `▀` characters without adding a runtime font parser.
 - [x] Added framebuffer SGR support for bold text; status brackets stay gray

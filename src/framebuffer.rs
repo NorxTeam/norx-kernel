@@ -3,8 +3,8 @@ use crate::{
     font,
 };
 
-pub const TERM_W: usize = font::WIDTH;
-pub const TERM_H: usize = font::LINE_HEIGHT;
+pub const TERM_W: usize = font::WIDTH * font::SCALE;
+pub const TERM_H: usize = font::LINE_HEIGHT * font::SCALE;
 
 pub struct Fb {
     raw: RawFramebuffer,
@@ -111,12 +111,28 @@ impl Fb {
         let Some(glyph) = font::glyph(codepoint) else {
             return;
         };
+        let scale = font::SCALE as u64;
         for (yy, row) in glyph.raster().iter().enumerate() {
             for (xx, alpha) in row.iter().enumerate() {
                 if *alpha != 0 {
-                    self.put_pixel(x + xx as u64, y + yy as u64, scale_rgb(rgb, *alpha));
-                    if bold && xx + 1 < TERM_W {
-                        self.put_pixel(x + xx as u64 + 1, y + yy as u64, scale_rgb(rgb, *alpha));
+                    let color = scale_rgb(rgb, *alpha);
+                    let pixel_x = x + xx as u64 * scale;
+                    let pixel_y = y + yy as u64 * scale;
+                    for dy in 0..font::SCALE {
+                        for dx in 0..font::SCALE {
+                            self.put_pixel(pixel_x + dx as u64, pixel_y + dy as u64, color);
+                        }
+                    }
+                    if bold && xx + 1 < font::WIDTH {
+                        for dy in 0..font::SCALE {
+                            for dx in 0..font::SCALE {
+                                self.put_pixel(
+                                    pixel_x + scale + dx as u64,
+                                    pixel_y + dy as u64,
+                                    color,
+                                );
+                            }
+                        }
                     }
                 }
             }
