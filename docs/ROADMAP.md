@@ -333,8 +333,8 @@ paths below as permanent architecture decisions.
 
 - [x] Bundled `assets/fonts/JetBrainsMono-Regular.ttf` and its `OFL.txt` license.
 - [x] Generated Basic Latin glyph bitmaps at 16px with a compact 10px
-  monospace cell, 18px glyph height, and 20px line height to preserve
-  descenders without excess tracking.
+  monospace cell, crisp 20px glyph height, and 22px line height to preserve
+  descenders without excess tracking or antialiasing blur.
 - [x] Removed the Noto dependency and lockfile entries; the kernel now embeds
   only the generated JetBrains Mono bitmap data and needs no runtime font
   parser.
