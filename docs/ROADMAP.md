@@ -278,7 +278,7 @@ paths below as permanent architecture decisions.
 
 ### 6. Implement the Norx boot presentation
 
-- [x] Add a compact ASCII-art `Norx` title as the first visible boot output.
+- [x] Add the compact block-art `Norx` title as the first visible boot output.
 - [x] Emit ordered kernel startup logs for each initialization stage.
 - [x] Use consistent colored status markers in the style of `[  OK  ]`,
   with matching failure and warning states.
@@ -336,6 +336,8 @@ paths below as permanent architecture decisions.
 - [x] Generated Basic Latin grayscale glyph bitmaps at 12px with a compact 8px
   monospace cell, 16px glyph height, and 17px line height to preserve
   descenders without excess tracking.
+- [x] Added embedded UTF-8 handling and block glyphs for the title's `▄`, `█`,
+  and `▀` characters without adding a runtime font parser.
 - [x] Added framebuffer SGR support for bold text; status opening brackets are
   bold white while closing brackets remain gray.
 - [x] Removed the Noto dependency and lockfile entries; the kernel now embeds

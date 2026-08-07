@@ -14,6 +14,8 @@ struct Console {
     fg: u32,
     bg: u32,
     bold: bool,
+    utf8_codepoint: u32,
+    utf8_remaining: u8,
 }
 
 static mut CONSOLE: Option<Console> = None;
@@ -60,6 +62,8 @@ pub fn init_framebuffer(raw: RawFramebuffer) {
             fg: 0xd8dee9,
             bg: 0x000000,
             bold: false,
+            utf8_codepoint: 0,
+            utf8_remaining: 0,
         });
     }
 }
@@ -99,6 +103,20 @@ fn screen_byte(byte: u8) {
             return;
         }
 
+        if console.utf8_remaining != 0 {
+            if byte & 0xc0 == 0x80 {
+                console.utf8_codepoint = (console.utf8_codepoint << 6) | (byte as u32 & 0x3f);
+                console.utf8_remaining -= 1;
+                if console.utf8_remaining == 0 {
+                    put_codepoint(console, console.utf8_codepoint);
+                }
+                draw_cursor(console, true);
+                return;
+            }
+            console.utf8_codepoint = 0;
+            console.utf8_remaining = 0;
+        }
+
         match byte {
             0x1b => console.ansi = 1,
             b'\n' => {
@@ -120,22 +138,19 @@ fn screen_byte(byte: u8) {
                     );
                 }
             }
-            byte => {
-                let mut fb = framebuffer::init(console.raw);
-                fb.term_char(
-                    console.col * framebuffer::TERM_W,
-                    console.row * framebuffer::TERM_H,
-                    byte,
-                    console.fg,
-                    console.bg,
-                    console.bold,
-                );
-                console.col += 1;
-                if console.col >= console.cols {
-                    console.col = 2;
-                    console.row += 1;
-                }
+            0xc2..=0xdf => {
+                console.utf8_codepoint = (byte & 0x1f) as u32;
+                console.utf8_remaining = 1;
             }
+            0xe0..=0xef => {
+                console.utf8_codepoint = (byte & 0x0f) as u32;
+                console.utf8_remaining = 2;
+            }
+            0xf0..=0xf4 => {
+                console.utf8_codepoint = (byte & 0x07) as u32;
+                console.utf8_remaining = 3;
+            }
+            byte => put_codepoint(console, byte as u32),
         }
 
         if console.row >= console.rows {
@@ -209,6 +224,8 @@ fn reset_screen(console: &mut Console) {
     console.fg = 0xd8dee9;
     console.bg = 0x000000;
     console.bold = false;
+    console.utf8_codepoint = 0;
+    console.utf8_remaining = 0;
 }
 
 fn apply_sgr(console: &mut Console) {
@@ -248,6 +265,23 @@ fn apply_sgr_value(console: &mut Console, value: u8) {
         90..=97 => console.fg = ansi_color(value - 90, true),
         100..=107 => console.bg = ansi_color(value - 100, true),
         _ => {}
+    }
+}
+
+fn put_codepoint(console: &mut Console, codepoint: u32) {
+    let mut fb = framebuffer::init(console.raw);
+    fb.term_codepoint(
+        console.col * framebuffer::TERM_W,
+        console.row * framebuffer::TERM_H,
+        codepoint,
+        console.fg,
+        console.bg,
+        console.bold,
+    );
+    console.col += 1;
+    if console.col >= console.cols {
+        console.col = 2;
+        console.row += 1;
     }
 }
 

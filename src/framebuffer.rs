@@ -36,10 +36,22 @@ impl Fb {
     }
 
     pub fn term_char(&mut self, x: usize, y: usize, byte: u8, fg: u32, bg: u32, bold: bool) {
+        self.term_codepoint(x, y, byte as u32, fg, bg, bold);
+    }
+
+    pub fn term_codepoint(
+        &mut self,
+        x: usize,
+        y: usize,
+        codepoint: u32,
+        fg: u32,
+        bg: u32,
+        bold: bool,
+    ) {
         let x = x as u64;
         let y = y as u64;
         self.rect(x, y, TERM_W as u64, TERM_H as u64, bg);
-        self.terminal_glyph(x, y, byte, fg, bold);
+        self.terminal_glyph(x, y, codepoint, fg, bold);
     }
 
     pub fn term_cursor(&mut self, x: usize, y: usize, on: bool, fg: u32, bg: u32) {
@@ -95,8 +107,8 @@ impl Fb {
         }
     }
 
-    fn terminal_glyph(&mut self, x: u64, y: u64, byte: u8, rgb: u32, bold: bool) {
-        let Some(glyph) = font::glyph(byte) else {
+    fn terminal_glyph(&mut self, x: u64, y: u64, codepoint: u32, rgb: u32, bold: bool) {
+        let Some(glyph) = font::glyph(codepoint) else {
             return;
         };
         for (yy, row) in glyph.raster().iter().enumerate() {
