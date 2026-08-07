@@ -13,6 +13,7 @@ struct Console {
     sgr_len: usize,
     fg: u32,
     bg: u32,
+    bold: bool,
 }
 
 static mut CONSOLE: Option<Console> = None;
@@ -58,6 +59,7 @@ pub fn init_framebuffer(raw: RawFramebuffer) {
             sgr_len: 0,
             fg: 0xd8dee9,
             bg: 0x000000,
+            bold: false,
         });
     }
 }
@@ -114,6 +116,7 @@ fn screen_byte(byte: u8) {
                         b' ',
                         console.fg,
                         console.bg,
+                        console.bold,
                     );
                 }
             }
@@ -125,6 +128,7 @@ fn screen_byte(byte: u8) {
                     byte,
                     console.fg,
                     console.bg,
+                    console.bold,
                 );
                 console.col += 1;
                 if console.col >= console.cols {
@@ -147,7 +151,10 @@ fn screen_byte(byte: u8) {
 
 fn handle_ansi(console: &mut Console, byte: u8) {
     match (console.ansi, byte) {
-        (1, b'[') => console.ansi = 2,
+        (1, b'[') => {
+            console.sgr_len = 0;
+            console.ansi = 2;
+        }
         (2, b'0'..=b'9') if console.sgr_len < console.sgr.len() => {
             console.sgr[console.sgr_len] = byte - b'0';
             console.sgr_len += 1;
@@ -201,6 +208,7 @@ fn reset_screen(console: &mut Console) {
     console.sgr_len = 0;
     console.fg = 0xd8dee9;
     console.bg = 0x000000;
+    console.bold = false;
 }
 
 fn apply_sgr(console: &mut Console) {
@@ -231,7 +239,10 @@ fn apply_sgr_value(console: &mut Console, value: u8) {
         0 => {
             console.fg = 0xd8dee9;
             console.bg = 0x000000;
+            console.bold = false;
         }
+        1 => console.bold = true,
+        22 => console.bold = false,
         30..=37 => console.fg = ansi_color(value - 30, false),
         40..=47 => console.bg = ansi_color(value - 40, false),
         90..=97 => console.fg = ansi_color(value - 90, true),
@@ -263,6 +274,7 @@ fn erase_line(console: &mut Console) {
             b' ',
             console.fg,
             console.bg,
+            console.bold,
         );
     }
 }

@@ -136,7 +136,7 @@ fn line_start() {
 
 fn prefix(status: Status) {
     crate::kprint!(
-        "\x1b[90m[\x1b[0m{}{}\x1b[0m\x1b[90m]\x1b[0m ",
+        "\x1b[1;97m[\x1b[0m{}{}\x1b[0m\x1b[90m]\x1b[0m ",
         status.color(),
         status.label()
     );

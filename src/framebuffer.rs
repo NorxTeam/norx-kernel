@@ -35,11 +35,11 @@ impl Fb {
         }
     }
 
-    pub fn term_char(&mut self, x: usize, y: usize, byte: u8, fg: u32, bg: u32) {
+    pub fn term_char(&mut self, x: usize, y: usize, byte: u8, fg: u32, bg: u32, bold: bool) {
         let x = x as u64;
         let y = y as u64;
         self.rect(x, y, TERM_W as u64, TERM_H as u64, bg);
-        self.terminal_glyph(x, y, byte, fg);
+        self.terminal_glyph(x, y, byte, fg, bold);
     }
 
     pub fn term_cursor(&mut self, x: usize, y: usize, on: bool, fg: u32, bg: u32) {
@@ -95,7 +95,7 @@ impl Fb {
         }
     }
 
-    fn terminal_glyph(&mut self, x: u64, y: u64, byte: u8, rgb: u32) {
+    fn terminal_glyph(&mut self, x: u64, y: u64, byte: u8, rgb: u32, bold: bool) {
         let Some(glyph) = font::glyph(byte) else {
             return;
         };
@@ -103,6 +103,9 @@ impl Fb {
             for (xx, alpha) in row.iter().enumerate() {
                 if *alpha != 0 {
                     self.put_pixel(x + xx as u64, y + yy as u64, scale_rgb(rgb, *alpha));
+                    if bold && xx + 1 < TERM_W {
+                        self.put_pixel(x + xx as u64 + 1, y + yy as u64, scale_rgb(rgb, *alpha));
+                    }
                 }
             }
         }
