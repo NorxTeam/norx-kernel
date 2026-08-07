@@ -365,9 +365,10 @@ paths below as permanent architecture decisions.
 #### Runtime verification outcome (2026-08-07)
 
 - [x] x86_64 booted through the clean GRUB EFI configuration, printed the Norx
-  title and ordered startup log, exposed an `800x600` framebuffer, accepted
-  `help`/`crash` through the serial-debugger, and produced a QEMU framebuffer
-  capture with the appended plain panic log and `SYSTEM HALTED` line.
+  title and ordered startup log, accepted `help`/`crash` through the
+  serial-debugger, and produced a QEMU framebuffer capture with the appended
+  plain panic log and `SYSTEM HALTED` line. The current OVMF virtio-GOP
+  exposes `1280x800`; `1200x800` remains the requested target mode.
 - [x] aarch64 booted through GRUB `chainloader` into the UEFI kernel, loaded
   `norx.dtb` through EFI file services, reached completed initialization, accepted
   `help`/`crash`, and emitted the full panic report with `arch: aarch64`.

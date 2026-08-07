@@ -15,7 +15,7 @@ case "$arch" in
         machine="q35"
         firmware="edk2-x86_64-code.fd"
         vars="edk2-i386-vars.fd"
-        modules="normal configfile multiboot2 fat efi_gop all_video gfxterm"
+        modules="normal configfile multiboot2 fat part_msdos efi_gop all_video gfxterm"
         ;;
     aarch64)
         grub_format="arm64-efi"
@@ -26,7 +26,7 @@ case "$arch" in
         machine="virt"
         firmware="edk2-aarch64-code.fd"
         vars="edk2-arm-vars.fd"
-        modules="normal configfile chain fat efi_gop all_video gfxterm"
+        modules="normal configfile chain fat part_msdos efi_gop all_video gfxterm"
         ;;
     *)
         echo "usage: $0 [x86_64|aarch64]" >&2
@@ -97,10 +97,17 @@ fi
 vars_copy="$root/$vars"
 cp "$qemu_share/$vars" "$vars_copy"
 
+if [ "$arch" = x86_64 ]; then
+    qemu_video_args="-vga none -device virtio-vga,edid=on,xres=1200,yres=800"
+else
+    qemu_video_args=""
+fi
+
 exec "$qemu" \
     -M "${QEMU_MACHINE:-$machine}" \
     -m 256M \
     -display none \
+    $qemu_video_args \
     -serial stdio \
     -no-reboot \
     -no-shutdown \
