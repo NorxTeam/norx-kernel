@@ -372,10 +372,10 @@ unsafe fn parse_multiboot2(address: usize) -> Option<BootInfo> {
                     let blue = read_u8(tag + 36)?;
                     if red == 0 && blue == 16 {
                         framebuffer_info =
-                            framebuffer(base, pitch, width, height, bpp, PixelFormat::Bgr);
+                            framebuffer(base, pitch, width, height, bpp, PixelFormat::Rgb);
                     } else if red == 16 && blue == 0 {
                         framebuffer_info =
-                            framebuffer(base, pitch, width, height, bpp, PixelFormat::Rgb);
+                            framebuffer(base, pitch, width, height, bpp, PixelFormat::Bgr);
                     }
                 }
             }

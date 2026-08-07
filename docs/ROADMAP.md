@@ -304,6 +304,8 @@ paths below as permanent architecture decisions.
 - [x] Startup output now follows a linear order: GRUB hand-off, framebuffer,
   clock, drivers, VFS, serial-debugger, memory, architecture tables, interrupts,
   syscall entry, paging, VM, scheduler, timer, and kernel-alive state.
+- [x] Deferred OS hand-off is marked as `WARN`; informational diagnostics stay
+  cyan and framebuffer RGB/BGR modes preserve their intended colors.
 - [x] Status labels use fixed-width colored markers with the requested `[    OK    ]`
   style; the final line explicitly reports the future OS bootloader hand-off as
   deferred.
