@@ -343,9 +343,9 @@ paths below as permanent architecture decisions.
 
 ### 8. Redesign the kernel panic screen
 
-- [x] Keep the framebuffer console black and continue panic output through the
-  same colored log stream as startup.
-- [x] Emit a `:( KERNEL PANIC` failure line followed by detailed error data,
+- [x] Keep the framebuffer console black and continue panic output after the
+  startup log without status prefixes.
+- [x] Emit a plain `:( KERNEL PANIC` line followed by detailed error data,
   including error kind, architecture, address/register data, and ticks/time.
 - [x] Continue emitting the complete panic information to serial output for
   headless debugging.
@@ -358,9 +358,8 @@ paths below as permanent architecture decisions.
 
 - [x] Removed the separate centered panic renderer; panic output now continues
   in the same black framebuffer console as the startup log.
-- [x] Added colored `[  FAIL  ]` and `[  INFO  ]` lines for `:( KERNEL PANIC`,
-  kind, title, message, detail, architecture, ticks, codes, arguments, and
-  the final `SYSTEM HALTED` state.
+- [x] Added unprefixed panic heading, diagnostics, page-fault details, and the
+  final `SYSTEM HALTED` state; startup `FAIL`/`INFO` markers remain unchanged.
 - [x] Reused the same bounded, allocation-free serial and framebuffer logging
   path for headless and visual diagnostics.
 
@@ -369,7 +368,7 @@ paths below as permanent architecture decisions.
 - [x] x86_64 booted through the clean GRUB EFI configuration, printed the Norx
   title and ordered startup log, exposed an `800x600` framebuffer, accepted
   `help`/`crash` through the serial-debugger, and produced a QEMU framebuffer
-  capture with the appended colored panic log and `SYSTEM HALTED` line.
+  capture with the appended plain panic log and `SYSTEM HALTED` line.
 - [x] aarch64 booted through GRUB `chainloader` into the UEFI kernel, loaded
   `norx.dtb` through EFI file services, reached completed initialization, accepted
   `help`/`crash`, and emitted the full panic report with `arch: aarch64`.

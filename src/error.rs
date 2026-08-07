@@ -89,25 +89,25 @@ impl KernelError {
 
 pub fn report(error: KernelError) {
     crate::kprintln!();
-    crate::bootlog::fail_fmt(format_args!(":( {}", error.title()));
-    crate::bootlog::info_fmt(format_args!("kind: {}", error.kind_name()));
-    crate::bootlog::info_fmt(format_args!("code: 0x{:016x}", error.code));
-    crate::bootlog::info_fmt(format_args!("message: {}", error.message));
-    crate::bootlog::info_fmt(format_args!("detail: {}", error.detail));
-    crate::bootlog::info_fmt(format_args!("arch: {}", crate::arch::NAME));
-    crate::bootlog::info_fmt(format_args!("ticks: {}", crate::time::ticks()));
-    crate::bootlog::info_fmt(format_args!("arg0: 0x{:016x}", error.arg0));
-    crate::bootlog::info_fmt(format_args!("arg1: 0x{:016x}", error.arg1));
+    crate::kprintln!(":( {}", error.title());
+    crate::kprintln!("  kind: {}", error.kind_name());
+    crate::kprintln!("  code: 0x{:016x}", error.code);
+    crate::kprintln!("  message: {}", error.message);
+    crate::kprintln!("  detail: {}", error.detail);
+    crate::kprintln!("  arch: {}", crate::arch::NAME);
+    crate::kprintln!("  ticks: {}", crate::time::ticks());
+    crate::kprintln!("  arg0: 0x{:016x}", error.arg0);
+    crate::kprintln!("  arg1: 0x{:016x}", error.arg1);
     if matches!(error.kind, ErrorKind::PageFault) {
         report_page_fault_code(error.arg0, error.arg1);
     }
-    crate::bootlog::fail("SYSTEM HALTED");
+    crate::kprintln!("SYSTEM HALTED");
 }
 
 fn report_page_fault_code(address: u64, code: u64) {
-    crate::bootlog::info_fmt(format_args!("address: 0x{:016x}", address));
-    crate::bootlog::info_fmt(format_args!(
-        "fault: present={} write={} user={} reserved={} instr={} pk={} shadow_stack={} sgx={}",
+    crate::kprintln!("  address: 0x{:016x}", address);
+    crate::kprintln!(
+        "  fault: present={} write={} user={} reserved={} instr={} pk={} shadow_stack={} sgx={}",
         yes(code & 1),
         yes(code & 2),
         yes(code & 4),
@@ -116,7 +116,7 @@ fn report_page_fault_code(address: u64, code: u64) {
         yes(code & 32),
         yes(code & 64),
         yes(code & 32768),
-    ));
+    );
 }
 
 fn yes(value: u64) -> &'static str {
