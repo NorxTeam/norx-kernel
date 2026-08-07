@@ -14,6 +14,8 @@ boot path is GRUB-based:
 - Norx ASCII-art startup screen with ordered, colored status logs.
 - GRUB hand-off for memory regions, reserved ranges, modules, command line,
   architecture information, and optional framebuffer.
+- x86_64 VGA text fallback followed by a framebuffer-console takeover using the
+  bootloader's active resolution and full pixel surface.
 - JetBrains Mono console font and allocation-free black console panic output
   with detailed diagnostics.
 - Serial-only, line-oriented `serial-debugger`; there is no framebuffer

@@ -37,7 +37,10 @@ macro_rules! kprintln {
     };
 }
 
-pub fn init() {}
+pub fn init() {
+    #[cfg(target_arch = "x86_64")]
+    crate::vga::init();
+}
 
 pub fn init_framebuffer(raw: RawFramebuffer) {
     unsafe {
@@ -59,6 +62,8 @@ pub fn init_framebuffer(raw: RawFramebuffer) {
 
 pub fn write(args: fmt::Arguments) {
     crate::drivers::serial::write(args);
+    #[cfg(target_arch = "x86_64")]
+    crate::vga::write(args);
     let _ = Screen.write_fmt(args);
 }
 

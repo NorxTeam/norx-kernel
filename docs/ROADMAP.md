@@ -286,6 +286,10 @@ paths below as permanent architecture decisions.
   the future operating-system boot stage.
 - [x] Leave an explicit extension point for the future OS bootloader without
   claiming that an unimplemented stage has completed.
+- [x] Initialize an x86_64 VGA text fallback before framebuffer takeover and
+  mirror early logs to both console paths.
+- [x] Reinitialize the framebuffer console from the bootloader's actual
+  width, height, stride, and pixel format so it fills the supplied surface.
 - [x] Keep the same essential startup information available through serial
   output when framebuffer output is unavailable.
 
@@ -294,6 +298,9 @@ paths below as permanent architecture decisions.
 - [x] `bootlog::title()` prints the cyan Norx ASCII art before the first status
   line. The framebuffer is prepared before that output, so the title reaches
   both serial and the visible console when a framebuffer exists.
+- [x] x86_64 starts its early console in VGA text memory, then switches the
+  visible path to the full GRUB framebuffer while retaining the VGA mirror as
+  a fallback.
 - [x] Startup output now follows a linear order: GRUB hand-off, framebuffer,
   clock, drivers, VFS, serial-debugger, memory, architecture tables, interrupts,
   syscall entry, paging, VM, scheduler, timer, and kernel-alive state.

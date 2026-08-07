@@ -19,6 +19,8 @@ mod serial_debugger;
 mod time;
 mod timer;
 mod vfs;
+#[cfg(target_arch = "x86_64")]
+mod vga;
 mod vm;
 
 use core::panic::PanicInfo;
@@ -26,6 +28,8 @@ use core::panic::PanicInfo;
 pub fn kernel_start() -> ! {
     log::init();
     let boot = boot::info();
+    #[cfg(target_arch = "x86_64")]
+    bootlog::info("VGA fallback initialized");
     if let Some(raw) = boot.framebuffer {
         log::init_framebuffer(raw);
     }
