@@ -12,15 +12,15 @@ pub enum Status {
 impl Status {
     fn label(self) -> &'static str {
         match self {
-            Status::Ok => "    OK    ",
-            Status::Fail => "   FAIL   ",
-            Status::Warn => "   WARN   ",
-            Status::Info => "   INFO   ",
+            Status::Ok => "   OK   ",
+            Status::Fail => "  FAIL  ",
+            Status::Warn => "  WARN  ",
+            Status::Info => "  INFO  ",
             Status::Spin(frame) => match frame & 3 {
-                0 => "    |     ",
-                1 => "    /     ",
-                2 => "    -     ",
-                _ => "    \\     ",
+                0 => "****    ",
+                1 => " ****   ",
+                2 => "  ****  ",
+                _ => "   **** ",
             },
         }
     }
@@ -30,7 +30,7 @@ impl Status {
             Status::Ok => "\x1b[92m",
             Status::Fail => "\x1b[91m",
             Status::Warn => "\x1b[93m",
-            Status::Info => "\x1b[96m",
+            Status::Info => "\x1b[97m",
             Status::Spin(_) => "\x1b[95m",
         }
     }
@@ -38,7 +38,7 @@ impl Status {
 
 pub fn title() {
     crate::kprintln!(
-        "\x1b[96m\
+        "\x1b[97m\
  _   _  ____  ____  __  __
 | \\ | |/ __ \\|  _ \\|  \\/  |
 |  \\| | |  | | |_) | |\\/| |

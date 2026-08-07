@@ -280,7 +280,7 @@ paths below as permanent architecture decisions.
 
 - [x] Add a compact ASCII-art `Norx` title as the first visible boot output.
 - [x] Emit ordered kernel startup logs for each initialization stage.
-- [x] Use consistent colored status markers in the style of `[    OK    ]`,
+- [x] Use consistent colored status markers in the style of `[   OK   ]`,
   with matching failure and warning states.
 - [x] Separate kernel initialization, hardware discovery, diagnostics, and
   the future operating-system boot stage.
@@ -295,20 +295,22 @@ paths below as permanent architecture decisions.
 
 #### Boot presentation outcome (2026-08-06)
 
-- [x] `bootlog::title()` prints the cyan Norx ASCII art before the first status
+- [x] `bootlog::title()` prints the white Norx ASCII art before the first status
   line. The framebuffer is prepared before that output, so the title reaches
   both serial and the visible console when a framebuffer exists.
 - [x] x86_64 starts its early console in VGA text memory, then switches the
-  visible path to the full GRUB framebuffer while retaining the VGA mirror as
-  a fallback.
+  visible path to the full GRUB framebuffer and disables VGA writes; VGA stays
+  available as a fallback when no framebuffer is supplied.
 - [x] Startup output now follows a linear order: GRUB hand-off, framebuffer,
   clock, drivers, VFS, serial-debugger, memory, architecture tables, interrupts,
   syscall entry, paging, VM, scheduler, timer, and completed initialization.
 - [x] Console overflow scrolls the existing log by one line instead of clearing
   the framebuffer, preserving the boot history through serial-debugger startup.
+- [x] Added phase checks with a moving four-star loader inside the fixed-width
+  status marker while the kernel brings up each subsystem.
 - [x] Deferred OS hand-off is marked as `WARN`; informational diagnostics stay
-  cyan and framebuffer RGB/BGR modes preserve their intended colors.
-- [x] Status labels use fixed-width colored markers with the requested `[    OK    ]`
+  white and framebuffer RGB/BGR modes preserve their intended colors.
+- [x] Status labels use fixed-width colored markers with the requested `[   OK   ]`
   style; the final line explicitly reports the future OS bootloader hand-off as
   deferred.
 - [x] Verified both supported target builds, both Clippy runs with `-D warnings`,
@@ -356,7 +358,7 @@ paths below as permanent architecture decisions.
 
 - [x] Removed the separate centered panic renderer; panic output now continues
   in the same black framebuffer console as the startup log.
-- [x] Added colored `[ FAIL ]` and `[ INFO ]` lines for `:( KERNEL PANIC`,
+- [x] Added colored `[  FAIL  ]` and `[  INFO  ]` lines for `:( KERNEL PANIC`,
   kind, title, message, detail, architecture, ticks, codes, arguments, and
   the final `SYSTEM HALTED` state.
 - [x] Reused the same bounded, allocation-free serial and framebuffer logging

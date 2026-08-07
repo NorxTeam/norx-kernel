@@ -43,6 +43,8 @@ pub fn init() {
 }
 
 pub fn init_framebuffer(raw: RawFramebuffer) {
+    #[cfg(target_arch = "x86_64")]
+    crate::vga::disable();
     unsafe {
         framebuffer::init(raw).clear(0x000000);
         CONSOLE = Some(Console {

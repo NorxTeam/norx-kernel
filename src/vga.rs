@@ -28,6 +28,12 @@ pub fn write(args: fmt::Arguments) {
     let _ = Writer.write_fmt(args);
 }
 
+pub fn disable() {
+    unsafe {
+        STATE = None;
+    }
+}
+
 struct Writer;
 
 impl Write for Writer {

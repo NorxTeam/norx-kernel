@@ -57,6 +57,7 @@ pub fn kernel_start() -> ! {
     bootlog::spin(0, "probing built-in drivers");
     drivers::init();
     bootlog::ok("driver framework initialized");
+    bootlog::spin(1, "checking virtual filesystem");
     vfs::init();
     bootlog::ok("vfs initialized");
     bootlog::ok("serial-debugger input ready");
@@ -65,6 +66,7 @@ pub fn kernel_start() -> ! {
         bootlog::warn("framebuffer unavailable; serial remains active");
     }
 
+    bootlog::spin(2, "checking physical memory map");
     let summary = memory::init(boot);
     bootlog::ok_fmt(format_args!("memory map {} regions", summary.descriptors));
     bootlog::ok_fmt(format_args!(
@@ -83,15 +85,19 @@ pub fn kernel_start() -> ! {
         bootlog::fail("physical allocator has no free frames");
     }
 
+    bootlog::spin(3, "checking architecture tables");
     arch::tables::init();
     bootlog::ok("architecture tables initialized");
     arch::init_interrupt_controller();
     arch::init_syscalls();
+    bootlog::spin(0, "checking virtual memory");
     paging::init();
     vm::init();
+    bootlog::spin(1, "checking scheduler");
     sched::self_check();
     sched::init_runtime();
     bootlog::ok("scheduler initialized");
+    bootlog::spin(2, "checking timer source");
     if timer::init() {
         bootlog::ok("hardware scheduler timer initialized");
         bootlog::info("timer source irq");
