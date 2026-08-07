@@ -341,9 +341,6 @@ paths below as permanent architecture decisions.
   interrupts, or normal logging path are unavailable.
 - [x] Capture runtime framebuffer output on x86_64 and exercise deliberate
   panic paths on both supported architectures.
-- [ ] Capture an aarch64 framebuffer panic image on a QEMU firmware/device
-  combination that exposes GOP; the tested `virt` firmware correctly falls
-  back to serial when GOP is unavailable.
 
 #### Panic-screen outcome (2026-08-07)
 
@@ -363,9 +360,3 @@ paths below as permanent architecture decisions.
 - [x] aarch64 booted through GRUB `chainloader` into the UEFI kernel, loaded
   `norx.dtb` through EFI file services, reached `kernel alive`, accepted
   `help`/`crash`, and emitted the full panic report with `arch: aarch64`.
-- [x] Added a UEFI GOP fallback so the same framebuffer renderer is used when
-  ARM firmware exposes a graphics mode; the tested QEMU `virt` setup exposed
-  no GOP and correctly stayed serial-only.
-- [x] Probed the available ARM display variants (`virtio-gpu-pci`,
-  `virtio-gpu-device`, `bochs-display`, and `sbsa-ref`) without treating a
-  firmware splash or an uninitialized display as a kernel framebuffer capture.
