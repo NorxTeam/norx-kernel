@@ -54,6 +54,9 @@ fn byte(value: u8) {
         if state.ansi != 0 {
             if state.ansi == 1 {
                 state.ansi = if value == b'[' { 2 } else { 0 };
+            } else if value == b'K' {
+                clear_row(state);
+                state.ansi = 0;
             } else if (b'@'..=b'~').contains(&value) {
                 state.ansi = 0;
             }
@@ -96,6 +99,19 @@ fn next_line(state: &mut Vga) {
 fn clear() {
     for cell in 0..WIDTH * HEIGHT {
         let offset = cell * 2;
+        unsafe {
+            core::ptr::write_volatile(MEMORY.add(offset), b' ');
+            core::ptr::write_volatile(MEMORY.add(offset + 1), ATTRIBUTE);
+        }
+    }
+}
+
+fn clear_row(state: &Vga) {
+    if state.row >= HEIGHT {
+        return;
+    }
+    for col in state.col..WIDTH {
+        let offset = (state.row * WIDTH + col) * 2;
         unsafe {
             core::ptr::write_volatile(MEMORY.add(offset), b' ');
             core::ptr::write_volatile(MEMORY.add(offset + 1), ATTRIBUTE);

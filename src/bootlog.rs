@@ -12,15 +12,15 @@ pub enum Status {
 impl Status {
     fn label(self) -> &'static str {
         match self {
-            Status::Ok => "   OK   ",
-            Status::Fail => "  FAIL  ",
-            Status::Warn => "  WARN  ",
-            Status::Info => "  INFO  ",
+            Status::Ok => "  OK  ",
+            Status::Fail => "FAILED",
+            Status::Warn => " WARN ",
+            Status::Info => " INFO ",
             Status::Spin(frame) => match frame & 3 {
-                0 => "****    ",
-                1 => " ****   ",
-                2 => "  ****  ",
-                _ => "   **** ",
+                0 => "****  ",
+                1 => " **** ",
+                2 => "  ****",
+                _ => " **** ",
             },
         }
     }
@@ -31,7 +31,7 @@ impl Status {
             Status::Fail => "\x1b[91m",
             Status::Warn => "\x1b[93m",
             Status::Info => "\x1b[97m",
-            Status::Spin(_) => "\x1b[95m",
+            Status::Spin(_) => "\x1b[97m",
         }
     }
 }
@@ -49,11 +49,13 @@ pub fn title() {
 }
 
 pub fn status(status: Status, message: &str) {
+    line_start();
     prefix(status);
     crate::kprintln!("{}", message);
 }
 
 pub fn status_fmt(status: Status, args: fmt::Arguments) {
+    line_start();
     prefix(status);
     crate::log::write(args);
     crate::kprintln!();
@@ -91,8 +93,14 @@ pub fn info_fmt(args: fmt::Arguments) {
     status_fmt(Status::Info, args);
 }
 
-pub fn spin(frame: u8, message: &str) {
-    status(Status::Spin(frame), message);
+pub fn start(frame: u8, message: &str) {
+    line_start();
+    prefix(Status::Spin(frame));
+    crate::kprint!("{}", message);
+}
+
+fn line_start() {
+    crate::kprint!("\r\x1b[2K");
 }
 
 fn prefix(status: Status) {

@@ -46,9 +46,9 @@ impl Fb {
         let color = if on { fg } else { bg };
         self.rect(
             x as u64,
-            y as u64 + TERM_H as u64 - 2,
+            y as u64 + TERM_H as u64 - 1,
             TERM_W as u64,
-            2,
+            1,
             color,
         );
     }

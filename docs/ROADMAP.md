@@ -280,7 +280,7 @@ paths below as permanent architecture decisions.
 
 - [x] Add a compact ASCII-art `Norx` title as the first visible boot output.
 - [x] Emit ordered kernel startup logs for each initialization stage.
-- [x] Use consistent colored status markers in the style of `[   OK   ]`,
+- [x] Use consistent colored status markers in the style of `[  OK  ]`,
   with matching failure and warning states.
 - [x] Separate kernel initialization, hardware discovery, diagnostics, and
   the future operating-system boot stage.
@@ -306,11 +306,11 @@ paths below as permanent architecture decisions.
   syscall entry, paging, VM, scheduler, timer, and completed initialization.
 - [x] Console overflow scrolls the existing log by one line instead of clearing
   the framebuffer, preserving the boot history through serial-debugger startup.
-- [x] Added phase checks with a moving four-star loader inside the fixed-width
-  status marker while the kernel brings up each subsystem.
+- [x] Added phase checks with a moving four-star loader that is replaced by the
+  completed status on the same log line.
 - [x] Deferred OS hand-off is marked as `WARN`; informational diagnostics stay
   white and framebuffer RGB/BGR modes preserve their intended colors.
-- [x] Status labels use fixed-width colored markers with the requested `[   OK   ]`
+- [x] Status labels use fixed-width colored markers with the requested `[  OK  ]`
   style; the final line explicitly reports the future OS bootloader hand-off as
   deferred.
 - [x] Verified both supported target builds, both Clippy runs with `-D warnings`,
@@ -332,9 +332,9 @@ paths below as permanent architecture decisions.
 #### Font outcome (2026-08-07)
 
 - [x] Bundled `assets/fonts/JetBrainsMono-Regular.ttf` and its `OFL.txt` license.
-- [x] Generated Basic Latin glyph bitmaps at 16px with a compact 10px
-  monospace cell, crisp 20px glyph height, and 22px line height to preserve
-  descenders without excess tracking or antialiasing blur.
+- [x] Generated Basic Latin glyph bitmaps at 12px with a compact 8px monospace
+  cell, crisp 16px glyph height, and 17px line height to preserve descenders
+  without excess tracking or antialiasing blur.
 - [x] Removed the Noto dependency and lockfile entries; the kernel now embeds
   only the generated JetBrains Mono bitmap data and needs no runtime font
   parser.
