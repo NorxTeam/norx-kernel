@@ -330,7 +330,7 @@ paths below as permanent architecture decisions.
 
 ### 8. Redesign the kernel panic screen
 
-- [x] Use a dark-gray background with a centered sad face `:(`.
+- [x] Use a black background with a centered sad face `:(`.
 - [x] Display a prominent centered `KERNEL PANIC` heading.
 - [x] Render the detailed error description below it, including error kind,
   architecture, address/register data, ticks/time, boot stage, and relevant
@@ -345,7 +345,7 @@ paths below as permanent architecture decisions.
 #### Panic-screen outcome (2026-08-07)
 
 - [x] Replaced the old exclamation-mark drawing with a centered JetBrains Mono
-  `:(` and prominent `KERNEL PANIC` heading on a `0x20242b` dark-gray canvas.
+  `:(` and prominent `KERNEL PANIC` heading on a `0x000000` black canvas.
 - [x] Added centered kind, title, message, detail, architecture, ticks, code,
   `arg0`, `arg1`, and halted-state information below the heading.
 - [x] Kept the renderer bounded by the framebuffer write guard and allocation-
@@ -356,7 +356,7 @@ paths below as permanent architecture decisions.
 - [x] x86_64 booted through the clean GRUB EFI configuration, printed the Norx
   title and ordered startup log, exposed an `800x600` framebuffer, accepted
   `help`/`crash` through the serial-debugger, and produced a QEMU framebuffer
-  capture with the complete dark-gray panic screen and `SYSTEM HALTED` line.
+  capture with the complete black panic screen and `SYSTEM HALTED` line.
 - [x] aarch64 booted through GRUB `chainloader` into the UEFI kernel, loaded
   `norx.dtb` through EFI file services, reached `kernel alive`, accepted
   `help`/`crash`, and emitted the full panic report with `arch: aarch64`.

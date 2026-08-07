@@ -37,7 +37,7 @@ impl Fb {
     }
 
     pub fn crash(&mut self, error: KernelError) {
-        self.clear(0x20242b);
+        self.clear(0x000000);
         let top = self.height().saturating_sub(430) / 2;
 
         self.text_centered(top, ":(", 2, 0xf4f7fb);
