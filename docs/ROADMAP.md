@@ -354,7 +354,7 @@ paths below as permanent architecture decisions.
 - [x] Kept the renderer bounded by the framebuffer write guard and allocation-
   free; serial `error::report` still prints the full panic record first.
 
-#### Runtime verification outcome (2026-08-06)
+#### Runtime verification outcome (2026-08-07)
 
 - [x] x86_64 booted through the clean GRUB EFI configuration, printed the Norx
   title and ordered startup log, exposed an `800x600` framebuffer, accepted
@@ -366,3 +366,6 @@ paths below as permanent architecture decisions.
 - [x] Added a UEFI GOP fallback so the same framebuffer renderer is used when
   ARM firmware exposes a graphics mode; the tested QEMU `virt` setup exposed
   no GOP and correctly stayed serial-only.
+- [x] Probed the available ARM display variants (`virtio-gpu-pci`,
+  `virtio-gpu-device`, `bochs-display`, and `sbsa-ref`) without treating a
+  firmware splash or an uninitialized display as a kernel framebuffer capture.
