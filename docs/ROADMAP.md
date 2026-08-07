@@ -316,12 +316,12 @@ paths below as permanent architecture decisions.
 - [x] Verify ASCII-art alignment, boot logs, serial-debugger output, and panic
   text at the target resolution.
 
-#### Font outcome (2026-08-06)
+#### Font outcome (2026-08-07)
 
 - [x] Bundled `assets/fonts/JetBrainsMono-Regular.ttf` and its `OFL.txt` license.
-- [x] Generated Basic Latin glyph bitmaps at 20px with a 19px monospace cell;
-  the framebuffer renderer contract remains the same and line height stays
-  22px.
+- [x] Generated Basic Latin glyph bitmaps at 16px with a 13px monospace cell;
+  the framebuffer renderer contract remains the same and line height is
+  18px.
 - [x] Removed the Noto dependency and lockfile entries; the kernel now embeds
   only the generated JetBrains Mono bitmap data and needs no runtime font
   parser.
