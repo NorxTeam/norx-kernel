@@ -19,10 +19,14 @@ arguments, calls the same `syscall::dispatch`, restores the saved registers,
 and returns with `eret`. Unsupported numbers and currently unimplemented
 numbers both return `-ENOSYS` through the common dispatcher.
 
-The first runtime slice now handles `exit`, `wait`, `getpid`, `gettid`,
-`yield`, `sleep`, and `close` against the bounded process table. `read` and
-`write` remain ABI entries but return `-ENOSYS` until process-owned mappings and
-user-buffer pinning are active.
+The first runtime slice now handles `read`, `write`, `exit`, `wait`, `getpid`,
+`gettid`, `yield`, `sleep`, and `close` against the bounded process table.
+Every process starts with nonblocking fd 0 and writable fds 1/2. `read` polls
+serial input and returns `-EAGAIN` when no byte is ready; `write` copies at most
+1024 bytes from the active user address space to the kernel console, which fans
+out to serial and the available graphical console. Neither call falls back to
+host I/O. Filesystem-backed descriptors and blocking device streams remain
+follow-up work.
 
 `Timespec` is explicitly two signed 64-bit fields; user pointers and words are
 64-bit at this stage. `RestartPolicy` is metadata for the blocking boundary.

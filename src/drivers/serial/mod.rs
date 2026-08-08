@@ -57,6 +57,15 @@ pub fn write_str(s: &str) -> bool {
     Serial.write_str(s).is_ok()
 }
 
+pub fn write_bytes(bytes: &[u8]) -> bool {
+    bytes.iter().copied().all(|byte| {
+        if byte == b'\n' && !write_byte(b'\r') {
+            return false;
+        }
+        write_byte(byte)
+    })
+}
+
 pub fn read() -> Option<u8> {
     if FAILED.load(Ordering::Relaxed) {
         return None;

@@ -155,6 +155,32 @@ struct FdEntry {
     writable: bool,
 }
 
+const fn standard_fds() -> [Option<FdEntry>; MAX_FDS] {
+    let mut fds = [None; MAX_FDS];
+    fds[0] = Some(FdEntry {
+        open_file: 0,
+        close_on_exec: false,
+        nonblocking: true,
+        readable: true,
+        writable: false,
+    });
+    fds[1] = Some(FdEntry {
+        open_file: 1,
+        close_on_exec: false,
+        nonblocking: false,
+        readable: false,
+        writable: true,
+    });
+    fds[2] = Some(FdEntry {
+        open_file: 2,
+        close_on_exec: false,
+        nonblocking: false,
+        readable: false,
+        writable: true,
+    });
+    fds
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProcessRecord {
     id: ProcessId,
@@ -179,7 +205,7 @@ impl ProcessRecord {
             pending_signals: 0,
             pending_events: 0,
             threads: [None; MAX_PROCESS_THREADS],
-            fds: [None; MAX_FDS],
+            fds: standard_fds(),
         }
     }
 }
@@ -406,6 +432,16 @@ impl ProcessTable {
             entry.readable,
             entry.writable,
         ))
+    }
+
+    pub fn fd_access(
+        &self,
+        process: ProcessId,
+        fd: FileDescriptor,
+    ) -> Result<(bool, bool, bool), Error> {
+        let slot = fd.slot().ok_or(Error::InvalidFd)?;
+        let entry = self.process(process)?.fds[slot].ok_or(Error::InvalidFd)?;
+        Ok((entry.nonblocking, entry.readable, entry.writable))
     }
 
     pub fn raise_signal(&mut self, process: ProcessId, signal: u8) -> Result<(), Error> {
@@ -776,6 +812,16 @@ pub fn close_current(fd: u32) -> Result<(), Error> {
     })
 }
 
+pub fn current_fd_access(fd: u32) -> Result<(bool, bool, bool), Error> {
+    crate::arch::without_interrupts(|| unsafe {
+        let runtime = &*RUNTIME.0.get();
+        let process = runtime.current_process.ok_or(Error::InvalidState)?;
+        runtime
+            .table
+            .fd_access(process, FileDescriptor::from_raw(fd))
+    })
+}
+
 pub fn yield_current() -> Result<(), Error> {
     crate::arch::without_interrupts(|| unsafe {
         let runtime = &mut *RUNTIME.0.get();
@@ -878,7 +924,7 @@ pub fn contract_self_check() {
         Err(Error::PermissionDenied)
     );
     let fd = table.open_fd(child, 7, true, false).unwrap();
-    assert_eq!(fd.get(), 0);
+    assert_eq!(fd.get(), 3);
     assert_eq!(
         table.fd_info(child, fd).unwrap(),
         (7, false, false, true, false)

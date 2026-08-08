@@ -1,5 +1,6 @@
 pub const ABI_VERSION: u16 = 1;
 pub const MAX_ARGS: usize = 6;
+const MAX_IO: usize = 1024;
 
 pub type UserWord = u64;
 pub type UserPointer = u64;
@@ -132,6 +133,71 @@ pub struct Timespec {
 
 pub fn dispatch(number: UserWord, args: Args) -> UserWord {
     match number {
+        value if value == Number::Read as UserWord => {
+            let fd = match u32::try_from(args.values[0]) {
+                Ok(fd) => fd,
+                Err(_) => return Errno::Ebadf.return_value(),
+            };
+            let address = args.values[1];
+            let length = match usize::try_from(args.values[2]) {
+                Ok(length) => length,
+                Err(_) => return Errno::Eoverflow.return_value(),
+            };
+            if length > MAX_IO {
+                return Errno::Eoverflow.return_value();
+            }
+            if let Err(errno) = require_fd(fd, true) {
+                return errno.return_value();
+            }
+            if length == 0 {
+                return 0;
+            }
+            if crate::usercopy::validate(address, length).is_err() {
+                return Errno::Efault.return_value();
+            }
+            let mut buffer = [0u8; MAX_IO];
+            let mut count = 0;
+            while count < length {
+                let Some(byte) = crate::drivers::serial::read() else {
+                    break;
+                };
+                buffer[count] = byte;
+                count += 1;
+            }
+            if count == 0 {
+                return Errno::Eagain.return_value();
+            }
+            match crate::usercopy::copy_to_user(address, &buffer[..count]) {
+                Ok(copied) => copied as UserWord,
+                Err(_) => Errno::Efault.return_value(),
+            }
+        }
+        value if value == Number::Write as UserWord => {
+            let fd = match u32::try_from(args.values[0]) {
+                Ok(fd) => fd,
+                Err(_) => return Errno::Ebadf.return_value(),
+            };
+            let address = args.values[1];
+            let length = match usize::try_from(args.values[2]) {
+                Ok(length) => length,
+                Err(_) => return Errno::Eoverflow.return_value(),
+            };
+            if length > MAX_IO {
+                return Errno::Eoverflow.return_value();
+            }
+            if let Err(errno) = require_fd(fd, false) {
+                return errno.return_value();
+            }
+            if length == 0 {
+                return 0;
+            }
+            let mut buffer = [0u8; MAX_IO];
+            if crate::usercopy::copy_from_user(address, &mut buffer[..length]).is_err() {
+                return Errno::Efault.return_value();
+            }
+            crate::log::write_bytes(&buffer[..length]);
+            length as UserWord
+        }
         value if value == Number::GetPid as UserWord => crate::process::current_ids()
             .map(|(process, _)| process as UserWord)
             .unwrap_or_else(|| Errno::Enosys.return_value()),
@@ -170,6 +236,19 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
             Err(_) => Errno::Einval.return_value(),
         },
         _ => Errno::Enosys.return_value(),
+    }
+}
+
+fn require_fd(fd: u32, read: bool) -> Result<(), Errno> {
+    let (_, readable, writable) =
+        crate::process::current_fd_access(fd).map_err(|error| match error {
+            crate::process::Error::InvalidFd | crate::process::Error::InvalidId => Errno::Ebadf,
+            _ => Errno::Einval,
+        })?;
+    if (read && readable) || (!read && writable) {
+        Ok(())
+    } else {
+        Err(Errno::Ebadf)
     }
 }
 
@@ -220,7 +299,48 @@ pub fn runtime_contract_self_check() {
         Errno::Echild.return_value()
     );
     assert_eq!(
-        dispatch(Number::Close as UserWord, Args::empty()),
+        dispatch(
+            Number::Close as UserWord,
+            Args {
+                values: [u64::MAX, 0, 0, 0, 0, 0],
+            },
+        ),
         Errno::Ebadf.return_value()
+    );
+    assert_eq!(
+        dispatch(
+            Number::Write as UserWord,
+            Args {
+                values: [1, 0, 0, 0, 0, 0],
+            },
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            Number::Read as UserWord,
+            Args {
+                values: [1, 0, 0, 0, 0, 0],
+            },
+        ),
+        Errno::Ebadf.return_value()
+    );
+    assert_eq!(
+        dispatch(
+            Number::Write as UserWord,
+            Args {
+                values: [1, u64::MAX, 1, 0, 0, 0],
+            },
+        ),
+        Errno::Efault.return_value()
+    );
+    assert_eq!(
+        dispatch(
+            Number::Write as UserWord,
+            Args {
+                values: [1, 0, (MAX_IO + 1) as u64, 0, 0, 0],
+            },
+        ),
+        Errno::Eoverflow.return_value()
     );
 }

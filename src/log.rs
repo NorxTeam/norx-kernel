@@ -75,6 +75,14 @@ pub fn write(args: fmt::Arguments) {
     let _ = Screen.write_fmt(args);
 }
 
+pub fn write_bytes(bytes: &[u8]) {
+    crate::drivers::serial::write_bytes(bytes);
+    let text = core::str::from_utf8(bytes).unwrap_or("�");
+    #[cfg(target_arch = "x86_64")]
+    crate::vga::write(format_args!("{}", text));
+    let _ = Screen.write_str(text);
+}
+
 struct Screen;
 
 impl Write for Screen {

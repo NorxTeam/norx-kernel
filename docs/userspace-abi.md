@@ -20,12 +20,13 @@ exist.
 
 ## First libc surface
 
-The first layer will wrap the runtime slice already defined by the kernel:
-`exit`, `wait`, `getpid`, `gettid`, `yield`, `sleep`, and `close`. `errno`,
-fixed-width types, bounded string/memory helpers, and a small process/fd API
-will be provided as ordinary userspace code. `read` and `write` wrappers stay
-reserved until process-owned mappings and user-buffer pinning are implemented;
-they must not silently fall back to host I/O.
+The first layer wraps the runtime slice already defined by the kernel:
+`read`, `write`, `exit`, `wait`, `getpid`, `gettid`, `yield`, `sleep`, and
+`close`. `read`/`write` initially cover the bounded stdio contract (serial
+input and console output); filesystem-backed descriptors and blocking streams
+are not implied. `errno`, fixed-width types, bounded string/memory helpers, and
+a small process/fd API are provided as ordinary userspace code. No wrapper
+falls back to host I/O.
 
 The initial binaries are static and use the existing bounded native runtime.
 `execve`, `mmap`/heap growth, signals, threads, and dynamic linking are added
