@@ -21,10 +21,15 @@ pub fn init() -> Status {
         current = status();
     }
     if current.enabled && !current.x2apic {
-        unsafe {
-            let base = current.base as *mut u32;
-            let spurious = read(base, 0x0f0) | (1 << 8) | 0xff;
-            write(base, 0x0f0, spurious);
+        let Some(mmio) = (unsafe { crate::io::MmioRegion::new(current.base as usize, 0x400) })
+        else {
+            return current;
+        };
+        let Some(spurious) = mmio.read_u32_le(0x0f0) else {
+            return current;
+        };
+        if !mmio.write_u32_le(0x0f0, spurious | (1 << 8) | 0xff) {
+            return current;
         }
         current = status();
     }
@@ -39,13 +44,55 @@ pub fn status() -> Status {
     let enabled = present && msr & (1 << 11) != 0;
     let base = msr & 0x000f_ffff_ffff_f000;
     let (software_enabled, id, version) = if enabled && !x2apic {
-        unsafe {
-            let mmio = base as *mut u32;
-            let spurious = read(mmio, 0x0f0);
-            let id = read(mmio, 0x020) >> 24;
-            let version = read(mmio, 0x030) & 0xff;
-            (spurious & (1 << 8) != 0, id, version)
-        }
+        let Some(mmio) = (unsafe { crate::io::MmioRegion::new(base as usize, 0x400) }) else {
+            return Status {
+                present,
+                x2apic,
+                enabled,
+                software_enabled: false,
+                base,
+                id: 0,
+                version: 0,
+            };
+        };
+        let Some(spurious) = mmio.read_u32_le(0x0f0) else {
+            return Status {
+                present,
+                x2apic,
+                enabled,
+                software_enabled: false,
+                base,
+                id: 0,
+                version: 0,
+            };
+        };
+        let Some(id_value) = mmio.read_u32_le(0x020) else {
+            return Status {
+                present,
+                x2apic,
+                enabled,
+                software_enabled: false,
+                base,
+                id: 0,
+                version: 0,
+            };
+        };
+        let Some(version_value) = mmio.read_u32_le(0x030) else {
+            return Status {
+                present,
+                x2apic,
+                enabled,
+                software_enabled: false,
+                base,
+                id: 0,
+                version: 0,
+            };
+        };
+        (
+            spurious & (1 << 8) != 0,
+            id_value >> 24,
+            version_value & 0xff,
+        )
     } else {
         (false, 0, 0)
     };
@@ -59,14 +106,6 @@ pub fn status() -> Status {
         id,
         version,
     }
-}
-
-unsafe fn read(base: *mut u32, offset: usize) -> u32 {
-    base.byte_add(offset).read_volatile()
-}
-
-unsafe fn write(base: *mut u32, offset: usize, value: u32) {
-    base.byte_add(offset).write_volatile(value);
 }
 
 #[derive(Clone, Copy)]

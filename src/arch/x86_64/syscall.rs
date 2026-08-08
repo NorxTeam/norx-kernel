@@ -5,10 +5,12 @@ const IA32_STAR: u32 = 0xc000_0081;
 const IA32_LSTAR: u32 = 0xc000_0082;
 const IA32_FMASK: u32 = 0xc000_0084;
 const EFER_SCE: u64 = 1;
-const ENOSYS: u64 = 38;
 
 #[no_mangle]
 static mut KERNEL_STACK_TOP: u64 = 0;
+
+#[no_mangle]
+static mut USER_RETURN_RSP: u64 = 0;
 
 global_asm!(
     r#"
@@ -21,6 +23,7 @@ norx_x86_64_syscall_entry:
     push rcx
     push r11
     sub rsp, 8
+    mov [rsp], r9
     mov r9, r8
     mov r8, r10
     mov rcx, rdx
@@ -28,12 +31,30 @@ norx_x86_64_syscall_entry:
     mov rsi, rdi
     mov rdi, rax
     call norx_x86_64_syscall_rust
+    cmp rax, -2
+    je norx_x86_64_user_exit
     add rsp, 8
     pop r11
     pop rcx
     pop r12
     mov rsp, r12
     sysretq
+
+norx_x86_64_user_exit:
+    mov rsp, qword ptr [rip + USER_RETURN_RSP]
+    mov qword ptr [rip + USER_RETURN_RSP], 0
+    sti
+    ret
+
+    .global norx_x86_64_enter_user
+norx_x86_64_enter_user:
+    mov qword ptr [rip + USER_RETURN_RSP], rsp
+    push 0x1b
+    push rsi
+    push rdx
+    push 0x23
+    push rdi
+    iretq
 "#
 );
 
@@ -41,11 +62,18 @@ extern "C" {
     fn norx_x86_64_syscall_entry();
 }
 
-pub fn init() {
+extern "sysv64" {
+    fn norx_x86_64_enter_user(rip: usize, rsp: usize, flags: u64);
+}
+
+pub fn init() -> bool {
     unsafe {
         KERNEL_STACK_TOP = crate::arch::tables::syscall_stack_top();
+        if KERNEL_STACK_TOP == 0 {
+            return false;
+        }
 
-        let efer = rdmsr(IA32_EFER) | EFER_SCE;
+        let efer = rdmsr(IA32_EFER) | EFER_SCE | (1 << 11);
         wrmsr(IA32_EFER, efer);
 
         let kernel = crate::arch::tables::KERNEL_CODE_SELECTOR as u64;
@@ -57,6 +85,18 @@ pub fn init() {
         );
         wrmsr(IA32_FMASK, 1 << 9);
     }
+    true
+}
+
+pub fn enter_user(registers: crate::elf::InitialRegisters) -> bool {
+    unsafe {
+        norx_x86_64_enter_user(
+            registers.instruction_pointer,
+            registers.stack_pointer,
+            registers.flags,
+        );
+    }
+    true
 }
 
 #[no_mangle]
@@ -69,7 +109,12 @@ extern "sysv64" fn norx_x86_64_syscall_rust(
     _a4: u64,
     _a5: u64,
 ) -> u64 {
-    0u64.wrapping_sub(ENOSYS)
+    crate::syscall::dispatch(
+        _op,
+        crate::syscall::Args {
+            values: [_a0, _a1, _a2, _a3, _a4, _a5],
+        },
+    )
 }
 
 unsafe fn rdmsr(msr: u32) -> u64 {

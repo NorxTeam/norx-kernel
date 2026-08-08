@@ -1,6 +1,7 @@
 use crate::boot::{BootInfo, MemoryRegion};
 
 const MAX_RANGES: usize = 64;
+const MAX_RETURNED_FRAMES: usize = 128;
 const PAGE_SIZE: u64 = 4096;
 const MIN_FRAME: u64 = 0x100000;
 
@@ -11,6 +12,8 @@ static mut NEXT_FRAME: u64 = 0;
 static mut USABLE_PAGES: u64 = 0;
 static mut ALLOCATED_FRAMES: u64 = 0;
 static mut SKIPPED_RANGES: usize = 0;
+static mut RETURNED_FRAMES: [u64; MAX_RETURNED_FRAMES] = [0; MAX_RETURNED_FRAMES];
+static mut RETURNED_COUNT: usize = 0;
 
 #[derive(Clone, Copy)]
 struct Range {
@@ -51,6 +54,7 @@ pub fn init(info: BootInfo) -> Summary {
         USABLE_PAGES = 0;
         ALLOCATED_FRAMES = 0;
         SKIPPED_RANGES = 0;
+        RETURNED_COUNT = 0;
     }
 
     for (index, region) in info
@@ -76,6 +80,10 @@ pub fn init(info: BootInfo) -> Summary {
 
 pub fn alloc_frame() -> Option<u64> {
     unsafe {
+        if RETURNED_COUNT != 0 {
+            RETURNED_COUNT -= 1;
+            return Some(RETURNED_FRAMES[RETURNED_COUNT]);
+        }
         while NEXT_RANGE < RANGE_COUNT {
             let range = RANGES[NEXT_RANGE];
             if NEXT_FRAME == 0 || NEXT_FRAME < range.start {
@@ -91,6 +99,22 @@ pub fn alloc_frame() -> Option<u64> {
         }
     }
     None
+}
+
+pub fn free_frame(frame: u64) -> bool {
+    if frame < MIN_FRAME || !frame.is_multiple_of(PAGE_SIZE) {
+        return false;
+    }
+    unsafe {
+        if RETURNED_COUNT == MAX_RETURNED_FRAMES
+            || RETURNED_FRAMES[..RETURNED_COUNT].contains(&frame)
+        {
+            return false;
+        }
+        RETURNED_FRAMES[RETURNED_COUNT] = frame;
+        RETURNED_COUNT += 1;
+    }
+    true
 }
 
 pub fn stats() -> Stats {

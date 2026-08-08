@@ -30,10 +30,11 @@ norx_multiboot2_header:
 
     .short 1
     .short 0
-    .long 20
+    .long 24
     .long 6
     .long 8
     .long 1
+    .long 12
     .align 8
 
     .short 5
@@ -78,8 +79,28 @@ _start:
     .section .bss,"aw",@nobits
     .align 16
 norx_boot_stack:
-    .skip 16384
+    .skip 131072
 norx_boot_stack_top:
+"#
+);
+
+#[cfg(all(target_arch = "aarch64", target_os = "uefi"))]
+core::arch::global_asm!(
+    r#"
+    .section .bss,"aw"
+    .align 12
+norx_efi_stack:
+    .skip 131072
+norx_efi_stack_top:
+
+    .text
+    .align 2
+    .global efi_main
+efi_main:
+    adrp x16, norx_efi_stack_top
+    add x16, x16, :lo12:norx_efi_stack_top
+    mov sp, x16
+    b norx_efi_main
 "#
 );
 
@@ -102,7 +123,7 @@ impl Architecture {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
     Rgb,
     Bgr,
@@ -145,6 +166,13 @@ pub struct BootInfo {
     pub cmdline: [u8; CMDLINE_MAX],
     pub cmdline_len: usize,
     pub handoff_address: u64,
+    pub efi_system_table: u64,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub efi_runtime_el: u8,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub efi_runtime_vbar: u64,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub efi_runtime_sp_el0: u64,
 }
 
 impl BootInfo {
@@ -161,6 +189,10 @@ impl BootInfo {
             cmdline: [0; CMDLINE_MAX],
             cmdline_len: 0,
             handoff_address: 0,
+            efi_system_table: 0,
+            efi_runtime_el: 0,
+            efi_runtime_vbar: 0,
+            efi_runtime_sp_el0: 0,
         }
     }
 
@@ -180,6 +212,78 @@ pub fn info() -> BootInfo {
     unsafe { INFO }
 }
 
+pub fn efi_system_table() -> u64 {
+    info().efi_system_table
+}
+
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub fn efi_runtime_context() -> (u8, u64, u64) {
+    let boot = info();
+    (
+        boot.efi_runtime_el,
+        boot.efi_runtime_vbar,
+        boot.efi_runtime_sp_el0,
+    )
+}
+
+pub fn contract_self_check() {
+    assert!(framebuffer(0, 12, 4, 1, 24, PixelFormat::Rgb).is_none());
+    assert!(framebuffer(0x1000, 0, 4, 1, 24, PixelFormat::Rgb).is_none());
+    assert!(framebuffer(0x1000, 11, 4, 1, 24, PixelFormat::Rgb).is_none());
+    assert!(framebuffer(0x1000, 12, 4, 1, 24, PixelFormat::Rgb).is_some());
+    assert!(framebuffer(0x1000, u64::MAX, u64::MAX, 1, 32, PixelFormat::Rgb).is_none());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut malformed = [0u8; 32];
+        malformed[..4].copy_from_slice(&8u32.to_le_bytes());
+        assert!(unsafe { parse_multiboot2(malformed.as_ptr() as usize) }.is_none());
+
+        malformed[..4].copy_from_slice(&16u32.to_le_bytes());
+        malformed[8..12].copy_from_slice(&1u32.to_le_bytes());
+        malformed[12..16].copy_from_slice(&4u32.to_le_bytes());
+        assert!(unsafe { parse_multiboot2(malformed.as_ptr() as usize) }.is_none());
+
+        malformed[..4].copy_from_slice(&32u32.to_le_bytes());
+        malformed[12..16].copy_from_slice(&40u32.to_le_bytes());
+        assert!(unsafe { parse_multiboot2(malformed.as_ptr() as usize) }.is_none());
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut malformed = [0u8; 64];
+        malformed[..4].copy_from_slice(&0u32.to_be_bytes());
+        assert!(unsafe { parse_fdt(malformed.as_ptr() as usize) }.is_none());
+
+        malformed[..4].copy_from_slice(&0xd00d_feed_u32.to_be_bytes());
+        malformed[4..8].copy_from_slice(&39u32.to_be_bytes());
+        assert!(unsafe { parse_fdt(malformed.as_ptr() as usize) }.is_none());
+
+        malformed[4..8].copy_from_slice(&40u32.to_be_bytes());
+        malformed[8..12].copy_from_slice(&64u32.to_be_bytes());
+        assert!(unsafe { parse_fdt(malformed.as_ptr() as usize) }.is_none());
+        assert!(unsafe { read_cells(malformed.as_ptr() as usize, 8, 0) }.is_none());
+        assert!(unsafe { align4(usize::MAX) }.is_none());
+    }
+}
+
+#[cfg(target_os = "uefi")]
+pub fn set_efi_system_table(system_table: u64) {
+    unsafe {
+        (*core::ptr::addr_of_mut!(INFO)).efi_system_table = system_table;
+    }
+}
+
+#[cfg(target_os = "uefi")]
+pub fn set_efi_runtime_context(el: u8, vbar: u64, sp_el0: u64) {
+    unsafe {
+        let info = &mut *core::ptr::addr_of_mut!(INFO);
+        info.efi_runtime_el = el;
+        info.efi_runtime_vbar = vbar;
+        info.efi_runtime_sp_el0 = sp_el0;
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn norx_multiboot2_entry(magic: u32, info_address: u64) -> ! {
@@ -196,7 +300,7 @@ pub extern "C" fn norx_multiboot2_entry(magic: u32, info_address: u64) -> ! {
 
 #[cfg(target_os = "uefi")]
 #[no_mangle]
-pub extern "efiapi" fn efi_main(_image_handle: u64, system_table: u64) -> ! {
+pub extern "efiapi" fn norx_efi_main(_image_handle: u64, system_table: u64) -> ! {
     crate::arch::init();
     let Some(fdt_address) =
         (unsafe { efi_fdt(system_table).or_else(|| efi_file_fdt(_image_handle, system_table)) })
@@ -208,6 +312,10 @@ pub extern "efiapi" fn efi_main(_image_handle: u64, system_table: u64) -> ! {
         crate::drivers::serial::write_str("Norx: invalid EFI DTB hand-off\r\n");
         crate::arch::halt();
     }
+    set_efi_system_table(system_table);
+    let (efi_runtime_el, efi_runtime_vbar, efi_runtime_sp_el0) =
+        crate::arch::firmware_runtime_context();
+    set_efi_runtime_context(efi_runtime_el, efi_runtime_vbar, efi_runtime_sp_el0);
     if let Some((base, size)) = unsafe { efi_image_region(_image_handle, system_table) } {
         unsafe { add_reserved(&mut *core::ptr::addr_of_mut!(INFO), base, size) };
     }
@@ -395,6 +503,7 @@ unsafe fn parse_multiboot2(address: usize) -> Option<BootInfo> {
     }
     info.framebuffer = framebuffer_info;
     info.handoff_address = address as u64;
+    info.efi_system_table = efi_system_table;
     add_reserved(&mut info, address as u64, total_size as u64);
     #[cfg(not(target_os = "uefi"))]
     reserve_kernel(&mut info);

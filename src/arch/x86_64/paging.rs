@@ -7,6 +7,9 @@ pub const DIRECT_MAP_BASE: usize = 0xffff_8000_0000_0000;
 
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
+const PTE_USER: u64 = 1 << 2;
+const PTE_NX: u64 = 1 << 63;
+const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 
 #[repr(align(4096))]
 #[allow(dead_code)]
@@ -75,6 +78,18 @@ pub fn direct_map_ptr(physical: u64) -> Option<*mut u8> {
     Some((DIRECT_MAP_BASE + physical as usize) as *mut u8)
 }
 
+pub fn physical_from_direct_map(virtual_address: usize) -> Option<u64> {
+    unsafe {
+        if !DIRECT_MAP_READY
+            || virtual_address < DIRECT_MAP_BASE
+            || virtual_address - DIRECT_MAP_BASE >= DIRECT_MAP_BYTES
+        {
+            return None;
+        }
+    }
+    Some((virtual_address - DIRECT_MAP_BASE) as u64)
+}
+
 pub fn stats() -> Stats {
     unsafe {
         Stats {
@@ -88,6 +103,181 @@ pub fn stats() -> Stats {
             norx_cr3: NORX_CR3,
         }
     }
+}
+
+pub fn current_cr3_value() -> u64 {
+    unsafe { current_cr3() }
+}
+
+pub fn switch_cr3(value: u64) {
+    unsafe { asm!("mov cr3, {}", in(reg) value, options(nostack, preserves_flags)) };
+}
+
+pub fn user_space_prepare(root: crate::address::PhysAddr) -> bool {
+    unsafe {
+        let Some(destination) = direct_map_ptr(root.value()).map(|ptr| ptr.cast::<u64>()) else {
+            return false;
+        };
+        let source = (current_cr3() & ADDRESS_MASK) as *const u64;
+        for index in 0..512 {
+            destination
+                .add(index)
+                .write_volatile(source.add(index).read_volatile());
+        }
+    }
+    true
+}
+
+pub fn user_space_map(
+    root: crate::address::PhysAddr,
+    mapping: crate::address_space::MappingInfo,
+    tables: &mut [Option<crate::address::PhysAddr>],
+) -> bool {
+    if !mapping.virtual_address.is_multiple_of(4096)
+        || !mapping.physical_frame.value().is_multiple_of(4096)
+    {
+        return false;
+    }
+    unsafe {
+        let Some(mut table) = direct_map_ptr(root.value()).map(|ptr| ptr.cast::<u64>()) else {
+            return false;
+        };
+        let indices = [
+            (mapping.virtual_address >> 39) & 0x1ff,
+            (mapping.virtual_address >> 30) & 0x1ff,
+            (mapping.virtual_address >> 21) & 0x1ff,
+            (mapping.virtual_address >> 12) & 0x1ff,
+        ];
+        for index in indices[..3].iter().copied() {
+            let entry = table.add(index);
+            let value = entry.read_volatile();
+            if value & PTE_PRESENT == 0 {
+                let Some(frame) = allocate_user_table(tables) else {
+                    return false;
+                };
+                entry.write_volatile(frame.value() | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+                table = match direct_map_ptr(frame.value()).map(|ptr| ptr.cast::<u64>()) {
+                    Some(table) => table,
+                    None => return false,
+                };
+            } else {
+                if value & PTE_USER == 0 || value & (1 << 7) != 0 {
+                    return false;
+                }
+                table = match direct_map_ptr((value & ADDRESS_MASK) as usize as u64)
+                    .map(|ptr| ptr.cast::<u64>())
+                {
+                    Some(table) => table,
+                    None => return false,
+                };
+            }
+        }
+        let leaf = table.add(indices[3]);
+        if leaf.read_volatile() & PTE_PRESENT != 0 {
+            return false;
+        }
+        let mut flags = PTE_PRESENT | PTE_USER;
+        if mapping.flags.writable {
+            flags |= PTE_WRITABLE;
+        }
+        if !mapping.flags.executable {
+            flags |= PTE_NX;
+        }
+        leaf.write_volatile(mapping.physical_frame.value() | flags);
+        asm!("invlpg [{}]", in(reg) mapping.virtual_address, options(nostack, preserves_flags));
+    }
+    true
+}
+
+pub fn user_space_unmap(root: crate::address::PhysAddr, virtual_address: usize) -> bool {
+    unsafe {
+        let Some(mut table) = direct_map_ptr(root.value()).map(|ptr| ptr.cast::<u64>()) else {
+            return false;
+        };
+        let indices = [
+            (virtual_address >> 39) & 0x1ff,
+            (virtual_address >> 30) & 0x1ff,
+            (virtual_address >> 21) & 0x1ff,
+            (virtual_address >> 12) & 0x1ff,
+        ];
+        for index in indices[..3].iter().copied() {
+            let value = table.add(index).read_volatile();
+            if value & PTE_PRESENT == 0 || value & (1 << 7) != 0 {
+                return false;
+            }
+            table = match direct_map_ptr((value & ADDRESS_MASK) as usize as u64)
+                .map(|ptr| ptr.cast::<u64>())
+            {
+                Some(table) => table,
+                None => return false,
+            };
+        }
+        let leaf = table.add(indices[3]);
+        if leaf.read_volatile() & PTE_PRESENT == 0 {
+            return false;
+        }
+        leaf.write_volatile(0);
+        asm!("invlpg [{}]", in(reg) virtual_address, options(nostack, preserves_flags));
+    }
+    true
+}
+
+pub fn user_space_reset(root: crate::address::PhysAddr) {
+    unsafe {
+        if let Some(table) = direct_map_ptr(root.value()).map(|ptr| ptr.cast::<u64>()) {
+            for index in 0..512 {
+                table.add(index).write_volatile(0);
+            }
+        }
+    }
+}
+
+pub fn switch_to_user(root: crate::address::PhysAddr) -> bool {
+    if !stats().norx_cr3_ready || direct_map_ptr(root.value()).is_none() {
+        return false;
+    }
+    unsafe { asm!("mov cr3, {}", in(reg) root.value(), options(nostack, preserves_flags)) };
+    true
+}
+
+pub fn restore_kernel() {
+    unsafe {
+        if NORX_CR3 != 0 {
+            asm!("mov cr3, {}", in(reg) NORX_CR3, options(nostack, preserves_flags));
+        }
+    }
+}
+
+pub fn write_physical(physical: crate::address::PhysAddr, offset: usize, bytes: &[u8]) -> bool {
+    if offset >= 4096 || bytes.len() > 4096 - offset {
+        return false;
+    }
+    let Some(pointer) = direct_map_ptr(physical.value().saturating_add(offset as u64)) else {
+        return false;
+    };
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len()) };
+    true
+}
+
+pub fn zero_physical_page(physical: crate::address::PhysAddr) -> bool {
+    let Some(pointer) = direct_map_ptr(physical.value()) else {
+        return false;
+    };
+    unsafe { core::ptr::write_bytes(pointer, 0, 4096) };
+    true
+}
+
+unsafe fn allocate_user_table(
+    tables: &mut [Option<crate::address::PhysAddr>],
+) -> Option<crate::address::PhysAddr> {
+    let frame = crate::memory::alloc_frame().map(crate::address::PhysAddr::new)?;
+    if !zero_physical_page(frame) {
+        let _ = crate::memory::free_frame(frame.value());
+        return None;
+    }
+    let slot = tables.iter().position(Option::is_none)?;
+    tables[slot] = Some(frame);
+    Some(frame)
 }
 
 pub fn init_norx_cr3() -> bool {
@@ -247,7 +437,7 @@ unsafe fn lazy_frame(index: usize) -> Option<u64> {
         return None;
     }
     let frame = crate::memory::alloc_frame()?;
-    zero_physical_page(frame)?;
+    zero_physical_frame(frame)?;
     Some(frame)
 }
 
@@ -258,7 +448,7 @@ unsafe fn zero_page(virtual_address: u64) {
     }
 }
 
-unsafe fn zero_physical_page(frame: u64) -> Option<()> {
+unsafe fn zero_physical_frame(frame: u64) -> Option<()> {
     let ptr = direct_map_ptr(frame)?.cast::<u64>();
     for i in 0..512 {
         ptr.add(i).write_volatile(0);

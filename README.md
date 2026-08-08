@@ -22,13 +22,18 @@ boot path is GRUB-based:
   keyboard shell.
 - Basic memory, paging, timer, scheduler, interrupt, VFS, and driver
   infrastructure.
-- Architecture-local syscall entry stubs reserved for a future userspace ABI;
-  no cross-architecture syscall contract is defined yet.
+- A versioned cross-architecture syscall boundary with Linux-shaped numbers,
+  six-word arguments, negative errno returns, and x86_64/aarch64 entry
+  wrappers; user processes and process-owned user pages are not implemented.
+- The fixed-capacity process/thread/FD/credentials/exit-wait model is documented
+  in `docs/process-model.md`; runtime process creation is still deferred.
 
-The current VFS is only a smoke layer backed by an in-kernel RAM block device
-and contains `/hello.txt`. Norx is not production-ready. See the
+The current VFS is a bounded mount-tree smoke layer backed by an in-kernel RAM
+filesystem and contains `/hello.txt`. Norx is not production-ready. See the
 [shared roadmap](../ROADMAP.md) for the current implementation status and
-future system work.
+future system work. The current ownership, failure, ABI, hardware, and
+unsupported-case release gates are indexed in
+[`docs/stability-contracts.md`](docs/stability-contracts.md).
 
 ## Requirements
 

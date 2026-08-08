@@ -2,8 +2,12 @@ use core::fmt::{self, Write};
 
 const WIDTH: usize = 80;
 const HEIGHT: usize = 25;
-const MEMORY: *mut u8 = 0xb8000 as *mut u8;
+const MEMORY_SIZE: usize = WIDTH * HEIGHT * 2;
 const ATTRIBUTE: u8 = 0x07;
+
+fn memory() -> Option<crate::io::MmioRegion> {
+    unsafe { crate::io::MmioRegion::new(0xb8000, MEMORY_SIZE) }
+}
 
 struct Vga {
     col: usize,
@@ -84,10 +88,11 @@ fn put(state: &mut Vga, value: u8) {
     }
 
     let offset = (state.row * WIDTH + state.col) * 2;
-    unsafe {
-        core::ptr::write_volatile(MEMORY.add(offset), value);
-        core::ptr::write_volatile(MEMORY.add(offset + 1), ATTRIBUTE);
-    }
+    let Some(memory) = memory() else {
+        return;
+    };
+    let _ = memory.write_u8(offset, value);
+    let _ = memory.write_u8(offset + 1, ATTRIBUTE);
     state.col += 1;
 }
 
@@ -97,12 +102,13 @@ fn next_line(state: &mut Vga) {
 }
 
 fn clear() {
+    let Some(memory) = memory() else {
+        return;
+    };
     for cell in 0..WIDTH * HEIGHT {
         let offset = cell * 2;
-        unsafe {
-            core::ptr::write_volatile(MEMORY.add(offset), b' ');
-            core::ptr::write_volatile(MEMORY.add(offset + 1), ATTRIBUTE);
-        }
+        let _ = memory.write_u8(offset, b' ');
+        let _ = memory.write_u8(offset + 1, ATTRIBUTE);
     }
 }
 
@@ -110,25 +116,32 @@ fn clear_row(state: &Vga) {
     if state.row >= HEIGHT {
         return;
     }
+    let Some(memory) = memory() else {
+        return;
+    };
     for col in state.col..WIDTH {
         let offset = (state.row * WIDTH + col) * 2;
-        unsafe {
-            core::ptr::write_volatile(MEMORY.add(offset), b' ');
-            core::ptr::write_volatile(MEMORY.add(offset + 1), ATTRIBUTE);
-        }
+        let _ = memory.write_u8(offset, b' ');
+        let _ = memory.write_u8(offset + 1, ATTRIBUTE);
     }
 }
 
 fn scroll() {
     let row_bytes = WIDTH * 2;
-    unsafe {
-        core::ptr::copy(MEMORY.add(row_bytes), MEMORY, (HEIGHT - 1) * row_bytes);
+    let Some(memory) = memory() else {
+        return;
+    };
+    for row in 1..HEIGHT {
+        for byte in 0..row_bytes {
+            let Some(value) = memory.read_u8(row * row_bytes + byte) else {
+                return;
+            };
+            let _ = memory.write_u8((row - 1) * row_bytes + byte, value);
+        }
     }
     for cell in (HEIGHT - 1) * WIDTH..HEIGHT * WIDTH {
         let offset = cell * 2;
-        unsafe {
-            core::ptr::write_volatile(MEMORY.add(offset), b' ');
-            core::ptr::write_volatile(MEMORY.add(offset + 1), ATTRIBUTE);
-        }
+        let _ = memory.write_u8(offset, b' ');
+        let _ = memory.write_u8(offset + 1, ATTRIBUTE);
     }
 }

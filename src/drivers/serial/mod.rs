@@ -1,48 +1,80 @@
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(any(target_arch = "riscv64", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub mod ns16550;
 #[cfg(target_arch = "aarch64")]
 pub mod pl011;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FlowControl {
+    None,
+    RtsCts,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SerialConfig {
+    pub clock_hz: u32,
+    pub baud: u32,
+    pub fifo: bool,
+    pub flow_control: FlowControl,
+}
+
+impl SerialConfig {
+    pub const fn new(clock_hz: u32, baud: u32, fifo: bool, flow_control: FlowControl) -> Self {
+        Self {
+            clock_hz,
+            baud,
+            fifo,
+            flow_control,
+        }
+    }
+}
+
+static FAILED: AtomicBool = AtomicBool::new(false);
 
 pub struct Serial;
 
 impl Write for Serial {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for byte in s.bytes() {
-            if byte == b'\n' {
-                write_byte(b'\r');
+            if byte == b'\n' && !write_byte(b'\r') {
+                return Err(fmt::Error);
             }
-            write_byte(byte);
+            if !write_byte(byte) {
+                return Err(fmt::Error);
+            }
         }
         Ok(())
     }
 }
 
-pub fn write(args: fmt::Arguments) {
-    let _ = Serial.write_fmt(args);
+pub fn write(args: fmt::Arguments) -> bool {
+    Serial.write_fmt(args).is_ok()
 }
 
-pub fn write_str(s: &str) {
-    let _ = Serial.write_str(s);
+pub fn write_str(s: &str) -> bool {
+    Serial.write_str(s).is_ok()
 }
 
 pub fn read() -> Option<u8> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        ns16550::read_port_io(0x3f8)
+    if FAILED.load(Ordering::Relaxed) {
+        return None;
     }
-    #[cfg(target_arch = "aarch64")]
-    {
-        pl011::read(0x0900_0000)
-    }
+    crate::arch::early_serial_read()
 }
 
-fn write_byte(byte: u8) {
-    #[cfg(target_arch = "x86_64")]
-    ns16550::write_port_io(0x3f8, byte);
-    #[cfg(target_arch = "riscv64")]
-    ns16550::write_mmio(0x1000_0000, byte);
-    #[cfg(target_arch = "aarch64")]
-    pl011::write(0x0900_0000, byte);
+fn write_byte(byte: u8) -> bool {
+    if FAILED.load(Ordering::Relaxed) {
+        return false;
+    }
+    let ok = crate::arch::early_serial_write(byte);
+    if !ok {
+        FAILED.store(true, Ordering::Relaxed);
+    }
+    ok
+}
+
+pub(crate) fn mark_failed() {
+    FAILED.store(true, Ordering::Relaxed);
 }

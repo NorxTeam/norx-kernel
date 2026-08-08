@@ -1,78 +1,114 @@
-#[cfg(target_arch = "x86_64")]
+use super::{FlowControl, SerialConfig};
+
 const RBR_THR: usize = 0;
-#[cfg(target_arch = "x86_64")]
 const IER: usize = 1;
-#[cfg(target_arch = "x86_64")]
 const FCR: usize = 2;
-#[cfg(target_arch = "x86_64")]
 const LCR: usize = 3;
-#[cfg(target_arch = "x86_64")]
 const MCR: usize = 4;
 const LSR: usize = 5;
-#[cfg(target_arch = "x86_64")]
 const DLL: usize = 0;
-#[cfg(target_arch = "x86_64")]
 const DLM: usize = 1;
+const TX_POLL_LIMIT: usize = 1_000_000;
+const UART_CLOCK_HZ: u32 = 1_843_200;
+const DEFAULT_BAUD: u32 = 115_200;
 
-#[cfg(target_arch = "x86_64")]
-pub fn init_port_io(base: u16) {
-    unsafe {
-        crate::arch::outb(base + IER as u16, 0x00);
-        crate::arch::outb(base + LCR as u16, 0x80);
-        crate::arch::outb(base + DLL as u16, 0x03);
-        crate::arch::outb(base + DLM as u16, 0x00);
-        crate::arch::outb(base + LCR as u16, 0x03);
-        crate::arch::outb(base + FCR as u16, 0xc7);
-        crate::arch::outb(base + MCR as u16, 0x0b);
-    }
+const DEFAULT_CONFIG: SerialConfig =
+    SerialConfig::new(UART_CLOCK_HZ, DEFAULT_BAUD, true, FlowControl::None);
+
+pub struct Port {
+    io: crate::io::PioRegion,
+    config: SerialConfig,
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn write_port_io(base: u16, byte: u8) {
-    unsafe {
-        while crate::arch::inb(base + LSR as u16) & 0x20 == 0 {}
-        crate::arch::outb(base + RBR_THR as u16, byte);
+impl Port {
+    pub fn new(base: u16, config: SerialConfig) -> Option<Self> {
+        Some(Self {
+            io: crate::io::PioRegion::new(base, 8)?,
+            config,
+        })
     }
-}
 
-#[cfg(target_arch = "x86_64")]
-pub fn read_port_io(base: u16) -> Option<u8> {
-    unsafe {
-        if crate::arch::inb(base + LSR as u16) & 1 == 0 {
+    pub fn init(&self) -> bool {
+        let Some(divisor) = divisor(self.config) else {
+            return false;
+        };
+        let (mcr, fcr) = control_values(self.config);
+        self.io.write_u8(IER, 0x00)
+            && self.io.write_u8(LCR, 0x80)
+            && self.io.write_u8(DLL, divisor as u8)
+            && self.io.write_u8(DLM, (divisor >> 8) as u8)
+            && self.io.write_u8(LCR, 0x03)
+            && self.io.write_u8(FCR, fcr)
+            && self.io.write_u8(MCR, mcr)
+    }
+
+    pub fn write(&self, byte: u8) -> bool {
+        for _ in 0..TX_POLL_LIMIT {
+            if self.io.read_u8(LSR).unwrap_or(0) & 0x20 != 0 {
+                return self.io.write_u8(RBR_THR, byte);
+            }
+        }
+        false
+    }
+
+    pub fn read(&self) -> Option<u8> {
+        if self.io.read_u8(LSR)? & 1 == 0 {
             None
         } else {
-            Some(crate::arch::inb(base + RBR_THR as u16))
+            self.io.read_u8(RBR_THR)
         }
     }
 }
 
-#[cfg(target_arch = "riscv64")]
-pub fn init_mmio(base: usize) {
-    unsafe {
-        write_reg(base, 1, 0x00);
-        write_reg(base, 3, 0x80);
-        write_reg(base, 0, 0x03);
-        write_reg(base, 1, 0x00);
-        write_reg(base, 3, 0x03);
-        write_reg(base, 2, 0xc7);
-        write_reg(base, 4, 0x0b);
+fn control_values(config: SerialConfig) -> (u8, u8) {
+    let mcr = match config.flow_control {
+        FlowControl::None => 0x0b,
+        FlowControl::RtsCts => 0x2b,
+    };
+    let fcr = if config.fifo { 0xc7 } else { 0 };
+    (mcr, fcr)
+}
+
+fn divisor(config: SerialConfig) -> Option<u16> {
+    if config.clock_hz == 0 || config.baud == 0 {
+        return None;
+    }
+    let denominator = config.baud.checked_mul(16)?;
+    let divisor = config.clock_hz.checked_add(denominator / 2)? / denominator;
+    if divisor == 0 || divisor > u16::MAX as u32 {
+        None
+    } else {
+        Some(divisor as u16)
     }
 }
 
-#[cfg(target_arch = "riscv64")]
-pub fn write_mmio(base: usize, byte: u8) {
-    unsafe {
-        while read_reg(base, LSR) & 0x20 == 0 {}
-        write_reg(base, 0, byte);
-    }
+pub fn init_port_io(base: u16) -> bool {
+    Port::new(base, DEFAULT_CONFIG)
+        .map(|port| port.init())
+        .unwrap_or(false)
 }
 
-#[cfg(target_arch = "riscv64")]
-unsafe fn read_reg(base: usize, reg: usize) -> u8 {
-    ((base + reg) as *const u8).read_volatile()
+pub fn write_port_io(base: u16, byte: u8) -> bool {
+    Port::new(base, DEFAULT_CONFIG)
+        .map(|port| port.write(byte))
+        .unwrap_or(false)
 }
 
-#[cfg(target_arch = "riscv64")]
-unsafe fn write_reg(base: usize, reg: usize, value: u8) {
-    ((base + reg) as *mut u8).write_volatile(value);
+pub fn read_port_io(base: u16) -> Option<u8> {
+    Port::new(base, DEFAULT_CONFIG)?.read()
+}
+
+pub fn contract_self_check() {
+    assert_eq!(divisor(DEFAULT_CONFIG), Some(1));
+    assert!(divisor(SerialConfig::new(0, DEFAULT_BAUD, true, FlowControl::None)).is_none());
+    assert_eq!(control_values(DEFAULT_CONFIG), (0x0b, 0xc7));
+    assert_eq!(
+        control_values(SerialConfig::new(
+            UART_CLOCK_HZ,
+            DEFAULT_BAUD,
+            false,
+            FlowControl::RtsCts,
+        )),
+        (0x2b, 0)
+    );
 }

@@ -89,7 +89,7 @@ impl KernelError {
 
 pub fn report(error: KernelError) {
     crate::kprintln!();
-    crate::kprintln!(":( {}", error.title());
+    crate::kprintln!("\x1b[91m:( {}\x1b[0m", error.title());
     crate::kprintln!("  kind: {}", error.kind_name());
     crate::kprintln!("  code: 0x{:016x}", error.code);
     crate::kprintln!("  message: {}", error.message);

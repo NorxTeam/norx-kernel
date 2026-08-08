@@ -4,6 +4,7 @@ set -eu
 arch="${1:-x86_64}"
 profile="${PROFILE:-dev}"
 mode="${MODE:-run}"
+qemu_display="${QEMU_DISPLAY:-gtk}"
 
 case "$arch" in
     x86_64)
@@ -13,8 +14,11 @@ case "$arch" in
         kernel_name="norx.elf"
         qemu="qemu-system-x86_64"
         machine="q35"
+        cpu="max"
         firmware="edk2-x86_64-code.fd"
         vars="edk2-i386-vars.fd"
+        usb_args="-device qemu-xhci,id=xhci"
+        network_args="-netdev user,id=net0 -device virtio-net-pci,netdev=net0,disable-modern=on"
         modules="normal configfile multiboot2 fat part_msdos efi_gop all_video gfxterm"
         ;;
     aarch64)
@@ -24,8 +28,11 @@ case "$arch" in
         kernel_name="norx.efi"
         qemu="qemu-system-aarch64"
         machine="virt"
+        cpu="cortex-a57"
         firmware="edk2-aarch64-code.fd"
         vars="edk2-arm-vars.fd"
+        usb_args=""
+        network_args=""
         modules="normal configfile chain fat part_msdos efi_gop all_video gfxterm"
         ;;
     *)
@@ -41,10 +48,18 @@ command -v grub-mkstandalone >/dev/null 2>&1 || {
 
 if [ "$profile" = release ]; then
     cargo build --release --target "$target"
-    kernel="target/$target/release/norx_kernel"
+    if [ "$arch" = aarch64 ]; then
+        kernel="target/$target/release/norx_kernel.efi"
+    else
+        kernel="target/$target/release/norx_kernel"
+    fi
 else
     cargo build --target "$target"
-    kernel="target/$target/debug/norx_kernel"
+    if [ "$arch" = aarch64 ]; then
+        kernel="target/$target/debug/norx_kernel.efi"
+    else
+        kernel="target/$target/debug/norx_kernel"
+    fi
 fi
 
 root="build/$arch"
@@ -84,8 +99,10 @@ qemu_share="${QEMU_SHARE:-$(dirname "$(dirname "$(realpath "$qemu_bin")")")/shar
 if [ "$arch" = aarch64 ] && [ ! -f "$esp/boot/norx.dtb" ]; then
     "$qemu_bin" \
         -machine "$machine,dumpdtb=$esp/boot/norx.dtb" \
+        -cpu "$cpu" \
         -m 256M \
-        -display none \
+        -display gtk \
+        -device ramfb \
         -S \
         -no-reboot \
         -no-shutdown &
@@ -94,20 +111,31 @@ if [ "$arch" = aarch64 ] && [ ! -f "$esp/boot/norx.dtb" ]; then
     kill "$dtb_pid" 2>/dev/null || true
     wait "$dtb_pid" 2>/dev/null || true
 fi
-vars_copy="$root/$vars"
-cp "$qemu_share/$vars" "$vars_copy"
+vars_copy="${QEMU_VARS:-$root/$vars}"
+if [ ! -f "$vars_copy" ]; then
+    cp "$qemu_share/$vars" "$vars_copy"
+fi
+
+qmp_args=""
+if [ -n "${QEMU_MONITOR:-}" ]; then
+    qmp_args="-qmp unix:${QEMU_MONITOR},server=on,wait=off"
+fi
 
 if [ "$arch" = x86_64 ]; then
     qemu_video_args="-vga none -device virtio-vga,edid=on,xres=1200,yres=800"
 else
-    qemu_video_args=""
+    qemu_video_args="-device ramfb"
 fi
 
 exec "$qemu" \
     -M "${QEMU_MACHINE:-$machine}" \
+    -cpu "$cpu" \
     -m 256M \
-    -display none \
+    -display "$qemu_display" \
+    $qmp_args \
     $qemu_video_args \
+    $usb_args \
+    $network_args \
     -serial stdio \
     -no-reboot \
     -no-shutdown \

@@ -15,8 +15,48 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install GRUB image tools
-        run: sudo apt-get update && sudo apt-get install -y grub-common grub-efi-amd64-bin grub-efi-arm64-bin
+      - name: Install GRUB, QEMU, and UEFI image tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            grub-common grub-efi-amd64-bin grub-efi-arm64-bin \
+            qemu-system-x86 qemu-system-arm ovmf qemu-efi-aarch64
+
+      - name: Prepare QEMU firmware names
+        run: |
+          set -euo pipefail
+          share="$RUNNER_TEMP/norx-qemu-share"
+          mkdir -p "$share"
+
+          pick() {
+            for candidate in "$@"; do
+              if [ -f "$candidate" ]; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          x86_code="$(pick \
+            /usr/share/OVMF/OVMF_CODE_4M.fd \
+            /usr/share/OVMF/OVMF_CODE.fd)"
+          x86_vars="$(pick \
+            /usr/share/OVMF/OVMF_VARS_4M.fd \
+            /usr/share/OVMF/OVMF_VARS.fd)"
+          arm_code="$(pick \
+            /usr/share/AAVMF/AAVMF_CODE.fd \
+            /usr/share/edk2/aarch64/QEMU_CODE.fd \
+            /usr/share/qemu-efi-aarch64/QEMU_EFI.fd)"
+          arm_vars="$(pick \
+            /usr/share/AAVMF/AAVMF_VARS.fd \
+            /usr/share/edk2/aarch64/QEMU_VARS.fd \
+            /usr/share/qemu-efi-aarch64/QEMU_VARS.fd)"
+
+          cp "$x86_code" "$share/edk2-x86_64-code.fd"
+          cp "$x86_vars" "$share/edk2-i386-vars.fd"
+          cp "$arm_code" "$share/edk2-aarch64-code.fd"
+          cp "$arm_vars" "$share/edk2-arm-vars.fd"
 
       - name: Check formatting
         run: cargo fmt --check
@@ -38,3 +78,100 @@ jobs:
 
       - name: Build aarch64 GRUB image
         run: MODE=build ./scripts/run.sh aarch64
+
+      - name: QEMU smoke tests
+        run: |
+          set -euo pipefail
+
+          smoke() {
+            arch="$1"
+            marker="$2"
+            display="$3"
+            log="$RUNNER_TEMP/norx-$arch.serial.log"
+            stable_log="$RUNNER_TEMP/norx-$arch.stable.log"
+            screenshot="$RUNNER_TEMP/norx-$arch.ppm"
+            vars="$RUNNER_TEMP/norx-$arch-vars.fd"
+            qmp="$RUNNER_TEMP/norx-$arch.qmp"
+
+            rm -f "$log" "$stable_log" "$screenshot" "$qmp"
+            env QEMU_SHARE="$RUNNER_TEMP/norx-qemu-share" \
+              QEMU_DISPLAY="$display" QEMU_MONITOR="$qmp" \
+              QEMU_VARS="$vars" MODE=run \
+              ./scripts/run.sh "$arch" >"$log" 2>&1 &
+            qemu_pid=$!
+
+            deadline=$((SECONDS + 45))
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              if grep -F "$marker" "$log" >/dev/null 2>&1; then
+                break
+              fi
+              if ! kill -0 "$qemu_pid" 2>/dev/null; then
+                echo "QEMU $arch exited before the smoke marker"
+                cat "$log"
+                return 1
+              fi
+              sleep 1
+            done
+            grep -F "$marker" "$log"
+
+            python3 - "$qmp" "$screenshot" <<'PY'
+          import json
+          import socket
+          import sys
+
+          qmp_path, screenshot_path = sys.argv[1:]
+          sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+          sock.settimeout(10)
+          sock.connect(qmp_path)
+          sock.recv(4096)
+
+          def command(name, arguments=None):
+              request = {"execute": name}
+              if arguments is not None:
+                  request["arguments"] = arguments
+              sock.sendall((json.dumps(request) + "\r\n").encode())
+              response = b""
+              while b'"return"' not in response and b'"error"' not in response:
+                  response += sock.recv(4096)
+              if b'"error"' in response:
+                  raise RuntimeError(response.decode(errors="replace"))
+
+          command("qmp_capabilities")
+          command("screendump", {"filename": screenshot_path})
+          sock.close()
+          PY
+
+            python3 - "$log" "$stable_log" <<'PY'
+          import re
+          import sys
+
+          source, destination = sys.argv[1:]
+          ansi = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\a]*(?:\a|\x1b\\))")
+          text = open(source, encoding="utf-8", errors="replace").read()
+          lines = []
+          for line in ansi.sub("", text).replace("\r", "\n").splitlines():
+              line = line.replace("\b", "").strip()
+              if line and (not lines or line != lines[-1]):
+                  lines.append(line)
+          open(destination, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+          PY
+
+            grep -F "$marker" "$stable_log"
+            kill "$qemu_pid" 2>/dev/null || true
+            wait "$qemu_pid" 2>/dev/null || true
+          }
+
+          smoke x86_64 "persistent warm-reboot log initialized" "vnc=127.0.0.1:0"
+          smoke aarch64 "persistent warm-reboot status committed" "vnc=127.0.0.1:1"
+          grep -F "NORX_SERIAL_DEBUGGER_READY v=1" "$RUNNER_TEMP/norx-aarch64.stable.log"
+
+      - name: Upload QEMU smoke logs and framebuffer screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-smoke-artifacts
+          path: |
+            ${{ runner.temp }}/norx-*.serial.log
+            ${{ runner.temp }}/norx-*.stable.log
+            ${{ runner.temp }}/norx-*.ppm
+          if-no-files-found: ignore

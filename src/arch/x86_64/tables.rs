@@ -1,4 +1,30 @@
-use core::{arch::asm, ptr};
+use core::{
+    arch::{asm, global_asm},
+    ptr,
+};
+
+global_asm!(
+    r#"
+    .global norx_page_fault_entry
+norx_page_fault_entry:
+    sub rsp, 8
+    mov rdi, qword ptr [rsp + 16]
+    mov rsi, qword ptr [rsp + 8]
+    call norx_page_fault_dispatch
+    test rax, rax
+    jz 1f
+    mov qword ptr [rsp + 16], rax
+    add rsp, 8
+    add rsp, 8
+    iretq
+1:
+    ud2
+"#
+);
+
+extern "C" {
+    fn norx_page_fault_entry();
+}
 
 #[repr(C, packed)]
 struct Pointer {
@@ -106,11 +132,20 @@ static mut TSS: TaskStateSegment = TaskStateSegment::empty();
 static mut TSS_READY: bool = false;
 static mut IDT: [IdtEntry; 256] = [IdtEntry::missing(); 256];
 
-pub fn init() {
+pub fn init() -> bool {
     unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) };
     load_gdt();
     load_idt();
     unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) };
+    let timer = crate::irq::register(
+        crate::drivers::framework::IrqKind::Legacy,
+        0,
+        32,
+        timer_hard,
+        Some(timer_deferred),
+    )
+    .is_ok();
+    timer && crate::drivers::ps2::register_irqs()
 }
 
 fn load_gdt() {
@@ -143,7 +178,7 @@ fn load_gdt() {
 }
 
 pub fn syscall_stack_top() -> u64 {
-    unsafe { ptr::addr_of!(TSS.rsp).cast::<u64>().read_unaligned() }
+    kernel_stack_top()
 }
 
 fn init_tss() {
@@ -191,8 +226,23 @@ fn load_idt() {
         (*idt.add(6)).set(invalid_opcode);
         (*idt.add(8)).set_err(double_fault);
         (*idt.add(13)).set_err(general_protection);
-        (*idt.add(14)).set_err(page_fault);
+        (*idt.add(14)).set_addr(norx_page_fault_entry as *const () as u64);
         (*idt.add(32)).set(timer_interrupt);
+        (*idt.add(33)).set(keyboard_interrupt);
+        (*idt.add(34)).set(legacy_irq_2_interrupt);
+        (*idt.add(35)).set(legacy_irq_3_interrupt);
+        (*idt.add(36)).set(legacy_irq_4_interrupt);
+        (*idt.add(37)).set(legacy_irq_5_interrupt);
+        (*idt.add(38)).set(legacy_irq_6_interrupt);
+        (*idt.add(39)).set(legacy_irq_7_interrupt);
+        (*idt.add(40)).set(legacy_irq_8_interrupt);
+        (*idt.add(41)).set(legacy_irq_9_interrupt);
+        (*idt.add(42)).set(legacy_irq_10_interrupt);
+        (*idt.add(43)).set(legacy_irq_11_interrupt);
+        (*idt.add(44)).set(mouse_interrupt);
+        (*idt.add(45)).set(legacy_irq_13_interrupt);
+        (*idt.add(46)).set(legacy_irq_14_interrupt);
+        (*idt.add(47)).set(legacy_irq_15_interrupt);
         let ptr = Pointer {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
             base: (&raw const IDT) as u64,
@@ -215,9 +265,50 @@ extern "x86-interrupt" fn spurious(_stack: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn timer_interrupt(_stack: InterruptStackFrame) {
-    crate::irq::timer();
-    crate::sched::on_timer_tick();
+    crate::irq::dispatch(32);
     super::end_timer_interrupt();
+}
+
+extern "x86-interrupt" fn keyboard_interrupt(_stack: InterruptStackFrame) {
+    crate::irq::dispatch(33);
+    super::end_legacy_interrupt(1);
+}
+
+extern "x86-interrupt" fn mouse_interrupt(_stack: InterruptStackFrame) {
+    crate::irq::dispatch(44);
+    super::end_legacy_interrupt(12);
+}
+
+macro_rules! legacy_irq_interrupt {
+    ($name:ident, $vector:literal, $line:literal) => {
+        extern "x86-interrupt" fn $name(_stack: InterruptStackFrame) {
+            crate::irq::dispatch($vector);
+            super::end_legacy_interrupt($line);
+        }
+    };
+}
+
+legacy_irq_interrupt!(legacy_irq_2_interrupt, 34, 2);
+legacy_irq_interrupt!(legacy_irq_3_interrupt, 35, 3);
+legacy_irq_interrupt!(legacy_irq_4_interrupt, 36, 4);
+legacy_irq_interrupt!(legacy_irq_5_interrupt, 37, 5);
+legacy_irq_interrupt!(legacy_irq_6_interrupt, 38, 6);
+legacy_irq_interrupt!(legacy_irq_7_interrupt, 39, 7);
+legacy_irq_interrupt!(legacy_irq_8_interrupt, 40, 8);
+legacy_irq_interrupt!(legacy_irq_9_interrupt, 41, 9);
+legacy_irq_interrupt!(legacy_irq_10_interrupt, 42, 10);
+legacy_irq_interrupt!(legacy_irq_11_interrupt, 43, 11);
+legacy_irq_interrupt!(legacy_irq_13_interrupt, 45, 13);
+legacy_irq_interrupt!(legacy_irq_14_interrupt, 46, 14);
+legacy_irq_interrupt!(legacy_irq_15_interrupt, 47, 15);
+
+fn timer_hard() -> bool {
+    crate::irq::timer();
+    true
+}
+
+fn timer_deferred() {
+    crate::sched::on_timer_tick();
 }
 
 extern "x86-interrupt" fn divide_error(_stack: InterruptStackFrame) {
@@ -268,19 +359,17 @@ extern "x86-interrupt" fn general_protection(_stack: InterruptStackFrame, code: 
     ));
 }
 
-extern "x86-interrupt" fn page_fault(stack: InterruptStackFrame, code: u64) {
+#[no_mangle]
+extern "C" fn norx_page_fault_dispatch(rip: u64, code: u64) -> u64 {
     let address = super::fault_address();
+    if crate::usercopy::handles_fault(rip) {
+        return crate::usercopy::recovery_address();
+    }
     if crate::vm::handle_page_fault(address, code) {
-        return;
+        return rip;
     }
     crate::irq::exception();
-    crate::kprintln!(
-        "  frame: rip=0x{:016x} rsp=0x{:016x} cs=0x{:016x} ss=0x{:016x}",
-        stack.instruction_pointer,
-        stack.stack_pointer,
-        stack.code_segment,
-        stack.stack_segment
-    );
+    crate::kprintln!("  frame: rip=0x{:016x}", rip);
     if let Some(flags) = super::paging::pte_flags(address) {
         crate::kprintln!("  pte: 0x{:016x}", flags);
     } else {
