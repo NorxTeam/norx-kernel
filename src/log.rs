@@ -256,6 +256,7 @@ fn reset_screen(console: &mut Console) {
     crate::bootlog::redraw_quickinit_overlay();
 }
 
+#[allow(dead_code)]
 pub fn redraw_console() {
     unsafe {
         let Some(console) = (&raw mut CONSOLE).as_mut().and_then(Option::as_mut) else {

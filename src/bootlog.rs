@@ -140,7 +140,6 @@ pub fn quickinit_overlay_finish(success: bool) {
 }
 
 pub fn quickinit_overlay_complete(success: bool) {
-    let redraw;
     unsafe {
         QUICKINIT_STAGE = if success {
             "system ready"
@@ -148,6 +147,25 @@ pub fn quickinit_overlay_complete(success: bool) {
             "recovery ready"
         };
         QUICKINIT_PERCENT = 100;
+    }
+    redraw_quickinit_overlay();
+}
+
+pub fn quickinit_overlay_crash(stage: &'static str) {
+    unsafe {
+        if !QUICKINIT_ACTIVE {
+            return;
+        }
+        QUICKINIT_STAGE = stage;
+        QUICKINIT_PERCENT = 100;
+    }
+    redraw_quickinit_overlay();
+}
+
+#[allow(dead_code)]
+pub fn quickinit_overlay_shell() {
+    let redraw;
+    unsafe {
         redraw = core::ptr::read(core::ptr::addr_of!(QUICKINIT_FRAMEBUFFER)).is_some();
         QUICKINIT_ACTIVE = false;
         QUICKINIT_DRAWN = false;

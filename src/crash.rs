@@ -173,6 +173,7 @@ pub fn mark_checkpoint() -> bool {
 }
 
 pub fn fatal(error: KernelError) -> ! {
+    crate::bootlog::quickinit_overlay_crash(error.title());
     let first_panic = unsafe {
         if PANIC_ACTIVE {
             false
