@@ -72,7 +72,9 @@ pub fn write(args: fmt::Arguments) {
     crate::drivers::serial::write(args);
     #[cfg(target_arch = "x86_64")]
     crate::vga::write(args);
+    crate::bootlog::clear_quickinit_overlay();
     let _ = Screen.write_fmt(args);
+    crate::bootlog::redraw_quickinit_overlay();
 }
 
 pub fn write_bytes(bytes: &[u8]) {
@@ -80,7 +82,9 @@ pub fn write_bytes(bytes: &[u8]) {
     let text = core::str::from_utf8(bytes).unwrap_or("�");
     #[cfg(target_arch = "x86_64")]
     crate::vga::write(format_args!("{}", text));
+    crate::bootlog::clear_quickinit_overlay();
     let _ = Screen.write_str(text);
+    crate::bootlog::redraw_quickinit_overlay();
 }
 
 struct Screen;

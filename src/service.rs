@@ -742,28 +742,40 @@ const USER_SERVICE_BASE: usize = 0x0000_0100_0000_0000;
 pub fn user_entry_self_check() -> bool {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
-        run_user_fixture(
+        crate::bootlog::quickinit_overlay_begin(crate::boot::info().framebuffer);
+        let quickinit_ok = run_user_fixture(
             crate::elf::quickinit_image(),
             "quickinit-bootstrap",
             option_env!("NORDIX_QUICKINIT_FIXTURE") == Some("external"),
-        ) && run_user_fixture(
-            crate::elf::representative_image(),
-            "nordix-rust-smoke",
-            option_env!("NORDIX_RUST_FIXTURE") == Some("external"),
-        ) && run_user_fixture(
-            crate::elf::representative_c_image(),
-            "nordix-c-runtime",
-            option_env!("NORDIX_C_FIXTURE") == Some("external"),
-        ) && run_user_fixture(
-            crate::elf::representative_cxx_image(),
-            "nordix-cxx-runtime",
-            option_env!("NORDIX_CXX_FIXTURE") == Some("external"),
-        )
+        );
+        crate::bootlog::quickinit_overlay_finish(quickinit_ok);
+        let fixtures_ok = quickinit_ok
+            && run_user_fixture(
+                crate::elf::representative_image(),
+                "nordix-rust-smoke",
+                option_env!("NORDIX_RUST_FIXTURE") == Some("external"),
+            )
+            && run_user_fixture(
+                crate::elf::representative_c_image(),
+                "nordix-c-runtime",
+                option_env!("NORDIX_C_FIXTURE") == Some("external"),
+            )
+            && run_user_fixture(
+                crate::elf::representative_cxx_image(),
+                "nordix-cxx-runtime",
+                option_env!("NORDIX_CXX_FIXTURE") == Some("external"),
+            );
+        let ok = quickinit_ok && fixtures_ok;
+        ok
     }
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn run_user_fixture(image: &[u8], label: &'static str, external: bool) -> bool {
+    let quickinit = label == "quickinit-bootstrap";
+    if quickinit {
+        crate::bootlog::quickinit_overlay_stage("creating process", 12);
+    }
     let credentials = Credentials {
         capabilities: 0,
         ..Credentials::BOOTSTRAP
@@ -779,6 +791,9 @@ fn run_user_fixture(image: &[u8], label: &'static str, external: bool) -> bool {
         }
     };
     let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE);
+    if quickinit {
+        crate::bootlog::quickinit_overlay_stage("validating ELF", 28);
+    }
     let plan = match crate::elf::parse(image, crate::elf::Machine::current(), load_bias) {
         Ok(plan) => plan,
         Err(error) => {
@@ -805,12 +820,21 @@ fn run_user_fixture(image: &[u8], label: &'static str, external: bool) -> bool {
             return false;
         }
     };
+    if quickinit {
+        crate::bootlog::quickinit_overlay_stage("preparing address space", 48);
+    }
     crate::process::switch_to_user(process, thread).unwrap();
+    if quickinit {
+        crate::bootlog::quickinit_overlay_stage("entering userspace", 68);
+    }
     runtime.start().unwrap();
     runtime.enter_user().unwrap();
     assert!(runtime.is_exited());
     assert_eq!(crate::process::current_ids(), None);
     crate::process::restore_init().unwrap();
+    if quickinit {
+        crate::bootlog::quickinit_overlay_stage("reaping child", 88);
+    }
     let expected_status = if external { 0 } else { 42 };
     let result = crate::process::wait_current(Some(process.get())).unwrap();
     if result != (process.get(), expected_status) {
