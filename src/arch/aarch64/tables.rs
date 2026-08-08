@@ -1,10 +1,13 @@
 use core::arch::{asm, global_asm};
 
 #[repr(C, align(16))]
-struct KernelStack([u8; 131_072]);
+struct KernelStack([u8; 512 * 1024]);
 
 #[no_mangle]
-static mut norx_aarch64_kernel_stack: KernelStack = KernelStack([0; 131_072]);
+static mut norx_aarch64_kernel_stack: KernelStack = KernelStack([0; 512 * 1024]);
+
+#[no_mangle]
+static mut norx_aarch64_vector_saved_x16: u64 = 0;
 
 global_asm!(
     r#"
@@ -50,7 +53,7 @@ norx_aarch64_exception_entry:
     msr spsel, x17
     adrp x17, norx_aarch64_kernel_stack
     add x17, x17, :lo12:norx_aarch64_kernel_stack
-    mov x18, #2
+    mov x18, #8
     lsl x18, x18, #16
     add x17, x17, x18
     mov sp, x17
@@ -61,14 +64,32 @@ norx_aarch64_sync_exception:
     mrs x17, spsr_el1
     and x17, x17, #0xf
     cbnz x17, 1f
+    adrp x18, norx_aarch64_user_depth
+    add x18, x18, :lo12:norx_aarch64_user_depth
+    ldr x17, [x18]
+    cmp x17, #1
+    b.lo norx_aarch64_user_stack_fault
+    cmp x17, #4
+    b.hs norx_aarch64_user_stack_fault
+    adrp x18, norx_aarch64_vector_saved_x16
+    add x18, x18, :lo12:norx_aarch64_vector_saved_x16
+    str x16, [x18]
     mov x17, #1
     msr spsel, x17
     adrp x17, norx_aarch64_kernel_stack
     add x17, x17, :lo12:norx_aarch64_kernel_stack
-    mov x18, #2
-    lsl x18, x18, #16
-    add x17, x17, x18
+    adrp x18, norx_aarch64_user_depth
+    add x18, x18, :lo12:norx_aarch64_user_depth
+    ldr x18, [x18]
+    lsl x18, x18, #17
+    mov x16, #8
+    lsl x16, x16, #16
+    add x17, x17, x16
+    sub x17, x17, x18
     mov sp, x17
+    adrp x17, norx_aarch64_vector_saved_x16
+    add x17, x17, :lo12:norx_aarch64_vector_saved_x16
+    ldr x16, [x17]
 1:
     sub sp, sp, #160
     stp x1, x2, [sp, #0]
@@ -162,23 +183,60 @@ norx_aarch64_sync_exception:
     add sp, sp, #160
     eret
 8:
-    ldp x1, x2, [sp, #0]
-    ldp x3, x4, [sp, #16]
-    ldp x5, x6, [sp, #32]
-    ldp x7, x8, [sp, #48]
-    ldp x9, x10, [sp, #64]
-    ldp x11, x12, [sp, #80]
-    ldp x13, x14, [sp, #96]
-    ldp x29, x30, [sp, #112]
-    ldp x15, x16, [sp, #128]
-    adrp x9, norx_aarch64_user_return_sp
-    add x9, x9, :lo12:norx_aarch64_user_return_sp
+    adrp x9, norx_aarch64_user_depth
+    add x9, x9, :lo12:norx_aarch64_user_depth
     ldr x10, [x9]
-    str xzr, [x9]
-    adrp x9, norx_aarch64_user_return_pc
-    add x9, x9, :lo12:norx_aarch64_user_return_pc
-    ldr x11, [x9]
-    str xzr, [x9]
+    cbz x10, norx_aarch64_user_stack_fault
+    sub x10, x10, #1
+    str x10, [x9]
+    lsl x12, x10, #3
+    adrp x9, norx_aarch64_user_return_sp_stack
+    add x9, x9, :lo12:norx_aarch64_user_return_sp_stack
+    ldr x10, [x9, x12]
+    adrp x9, norx_aarch64_user_return_pc_stack
+    add x9, x9, :lo12:norx_aarch64_user_return_pc_stack
+    ldr x11, [x9, x12]
+    adrp x9, norx_aarch64_kernel_return_x19_stack
+    add x9, x9, :lo12:norx_aarch64_kernel_return_x19_stack
+    ldr x19, [x9, x12]
+    adrp x9, norx_aarch64_kernel_return_x20_stack
+    add x9, x9, :lo12:norx_aarch64_kernel_return_x20_stack
+    ldr x20, [x9, x12]
+    adrp x9, norx_aarch64_kernel_return_x21_stack
+    add x9, x9, :lo12:norx_aarch64_kernel_return_x21_stack
+    ldr x21, [x9, x12]
+    adrp x9, norx_aarch64_kernel_return_x22_stack
+    add x9, x9, :lo12:norx_aarch64_kernel_return_x22_stack
+    ldr x22, [x9, x12]
+    adrp x9, norx_aarch64_kernel_return_x23_stack
+    add x9, x9, :lo12:norx_aarch64_kernel_return_x23_stack
+    ldr x23, [x9, x12]
+    adrp x9, norx_aarch64_kernel_return_x24_stack
+    add x9, x9, :lo12:norx_aarch64_kernel_return_x24_stack
+    ldr x24, [x9, x12]
+    adrp x9, norx_aarch64_kernel_return_x25_stack
+    add x9, x9, :lo12:norx_aarch64_kernel_return_x25_stack
+    ldr x25, [x9, x12]
+    adrp x9, norx_aarch64_kernel_return_x26_stack
+    add x9, x9, :lo12:norx_aarch64_kernel_return_x26_stack
+    ldr x26, [x9, x12]
+    adrp x9, norx_aarch64_kernel_return_x27_stack
+    add x9, x9, :lo12:norx_aarch64_kernel_return_x27_stack
+    ldr x27, [x9, x12]
+    adrp x9, norx_aarch64_kernel_return_x28_stack
+    add x9, x9, :lo12:norx_aarch64_kernel_return_x28_stack
+    ldr x28, [x9, x12]
+    adrp x9, norx_aarch64_kernel_return_x29_stack
+    add x9, x9, :lo12:norx_aarch64_kernel_return_x29_stack
+    ldr x29, [x9, x12]
+    adrp x9, norx_aarch64_user_return_elr_stack
+    add x9, x9, :lo12:norx_aarch64_user_return_elr_stack
+    ldr x13, [x9, x12]
+    adrp x9, norx_aarch64_user_return_spsr_stack
+    add x9, x9, :lo12:norx_aarch64_user_return_spsr_stack
+    ldr x14, [x9, x12]
+    msr elr_el1, x13
+    msr spsr_el1, x14
     mov x30, x11
     mov sp, x10
     ret
@@ -208,7 +266,7 @@ extern "C" {
 pub fn init() -> bool {
     let current_el: u64;
     let vectors = unsafe { &norx_exception_vectors as *const u8 as u64 };
-    crate::bootlog::info_fmt(format_args!("aarch64 exception vectors=0x{:x}", vectors));
+    crate::bootlog::ok_fmt(format_args!("aarch64 exception vectors=0x{:x}", vectors));
 
     unsafe {
         asm!(

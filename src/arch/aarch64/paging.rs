@@ -89,14 +89,21 @@ pub fn virtual_to_physical(address: crate::address::VirtAddr) -> Option<crate::a
 
 pub fn user_space_prepare(root: crate::address::PhysAddr) -> bool {
     let current = read_ttbr0() & ADDRESS_MASK;
-    if current == 0 || root.value() == 0 || root.value() == current {
+    let kernel = unsafe {
+        if KERNEL_TTBR0 == 0 {
+            current
+        } else {
+            KERNEL_TTBR0
+        }
+    };
+    if kernel == 0 || root.value() == 0 || root.value() == kernel {
         return false;
     }
-    if !copy_table(current, root.value()) {
+    if !copy_table(kernel, root.value()) {
         return false;
     }
     unsafe {
-        KERNEL_TTBR0 = current;
+        KERNEL_TTBR0 = kernel;
         TABLES_USED = 0;
     }
     true

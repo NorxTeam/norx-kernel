@@ -121,7 +121,7 @@ pub fn init(raw: Option<RawFramebuffer>) -> InitResult {
     let Some(raw) = raw else {
         unsafe { core::ptr::addr_of_mut!(STATE).write(None) };
         crate::bootlog::start(3, "discovering display framebuffer");
-        crate::bootlog::info("display framebuffer unavailable; serial remains active");
+        crate::bootlog::warn("display framebuffer unavailable; serial remains active");
         return InitResult::Unsupported;
     };
     let Some(mode) = mode_from_raw(raw) else {

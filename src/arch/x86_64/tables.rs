@@ -5,6 +5,7 @@ use core::{
 
 global_asm!(
     r#"
+    .section .text,"ax"
     .global norx_page_fault_entry
 norx_page_fault_entry:
     sub rsp, 8
@@ -87,7 +88,7 @@ pub const USER_CODE_SELECTOR: u16 = 0x20 | 3;
 pub const TSS_SELECTOR: u16 = 0x28;
 
 const TSS_GDT_INDEX: usize = 5;
-const KERNEL_STACK_SIZE: usize = 16 * 1024;
+const KERNEL_STACK_SIZE: usize = 512 * 1024;
 
 #[repr(C, align(16))]
 struct KernelStack([u8; KERNEL_STACK_SIZE]);

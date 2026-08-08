@@ -118,7 +118,9 @@ pub fn user_space_prepare(root: crate::address::PhysAddr) -> bool {
         let Some(destination) = direct_map_ptr(root.value()).map(|ptr| ptr.cast::<u64>()) else {
             return false;
         };
-        let source = (current_cr3() & ADDRESS_MASK) as *const u64;
+        let Some(source) = direct_map_ptr(NORX_CR3).map(|ptr| ptr.cast::<u64>()) else {
+            return false;
+        };
         for index in 0..512 {
             destination
                 .add(index)

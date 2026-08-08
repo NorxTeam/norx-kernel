@@ -9,6 +9,7 @@ static COPY_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     r#"
+    .section .text,"ax"
     .global norx_x86_copy_from_user
 norx_x86_copy_from_user:
     mov rcx, rdx

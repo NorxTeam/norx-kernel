@@ -403,7 +403,7 @@ fn probe() -> InitResult {
         crate::bootlog::warn_fmt(format_args!("xHCI controller reset failed: {:?}", error));
         return InitResult::Failed(error);
     }
-    crate::bootlog::info("xHCI controller reset complete");
+    crate::bootlog::ok("xHCI controller reset complete");
     let mut runtime = match Runtime::new(controller) {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -415,7 +415,7 @@ fn probe() -> InitResult {
         crate::bootlog::warn_fmt(format_args!("xHCI runtime start failed: {:?}", error));
         return InitResult::Failed(error);
     }
-    crate::bootlog::info("xHCI command and event rings active");
+    crate::bootlog::ok("xHCI command and event rings active");
     match runtime.enumerate_first() {
         Ok(_) => {}
         Err(error) => {
@@ -1121,7 +1121,7 @@ impl Runtime {
             self.hid = None;
             self.ep0.reset();
         } else if connected > self.connected_ports && self.first_device.is_none() {
-            crate::bootlog::info("xHCI USB connection detected; enumerating device");
+            crate::bootlog::ok("xHCI USB connection detected; enumerating device");
             match self.enumerate_first() {
                 Ok(Some(_)) => crate::bootlog::ok("xHCI USB device re-enumerated"),
                 Ok(None) => crate::bootlog::warn("xHCI connection disappeared during enumeration"),
@@ -1314,25 +1314,25 @@ impl Runtime {
                 .port_status(port)
                 .is_some_and(|value| value & PORTSC_CONNECTED != 0)
             {
-                crate::bootlog::info("xHCI resetting connected USB port");
+                crate::bootlog::ok("xHCI resetting connected USB port");
                 let speed = self.controller.reset_port(port)?;
-                crate::bootlog::info_fmt(format_args!(
+                crate::bootlog::ok_fmt(format_args!(
                     "xHCI USB port reset complete speed={}",
                     speed.name()
                 ));
                 self.port = port;
                 self.speed = speed;
-                crate::bootlog::info("xHCI enabling USB slot");
+                crate::bootlog::ok("xHCI enabling USB slot");
                 let slot = self.enable_slot()?;
                 self.slot = slot;
-                crate::bootlog::info_fmt(format_args!("xHCI USB slot {} enabled", slot));
+                crate::bootlog::ok_fmt(format_args!("xHCI USB slot {} enabled", slot));
                 self.address_device(slot, port, speed)?;
-                crate::bootlog::info_fmt(format_args!("xHCI USB slot {} addressed", slot));
-                crate::bootlog::info("xHCI reading USB device descriptor");
+                crate::bootlog::ok_fmt(format_args!("xHCI USB slot {} addressed", slot));
+                crate::bootlog::ok("xHCI reading USB device descriptor");
 
                 let device_length =
                     self.control_transfer(SetupPacket::get_descriptor(0x0100, 18), 18)?;
-                crate::bootlog::info("xHCI USB device descriptor received");
+                crate::bootlog::ok("xHCI USB device descriptor received");
                 if device_length < 12 || self.data.read_u8(1) != 1 {
                     return Err(HostError::Protocol);
                 }
@@ -1343,7 +1343,7 @@ impl Runtime {
 
                 let config_header_length =
                     self.control_transfer(SetupPacket::get_descriptor(0x0200, 9), 9)?;
-                crate::bootlog::info("xHCI USB configuration header received");
+                crate::bootlog::ok("xHCI USB configuration header received");
                 if config_header_length < 9 || self.data.read_u8(1) != 2 {
                     return Err(HostError::Protocol);
                 }
@@ -1353,7 +1353,7 @@ impl Runtime {
                     return Err(HostError::Protocol);
                 }
                 if total_length > config_header_length {
-                    crate::bootlog::info_fmt(format_args!(
+                    crate::bootlog::ok_fmt(format_args!(
                         "xHCI reading USB configuration descriptor length={}",
                         total_length
                     ));
@@ -1369,7 +1369,7 @@ impl Runtime {
                     vendor_id,
                     product_id,
                 )?;
-                crate::bootlog::info_fmt(format_args!(
+                crate::bootlog::ok_fmt(format_args!(
                     "xHCI USB device class={} hub={} serial={} storage={} serial-protocol={}",
                     device_class,
                     configuration.hub,
@@ -1379,14 +1379,14 @@ impl Runtime {
                         .serial_protocol
                         .map_or("none", SerialProtocol::name)
                 ));
-                crate::bootlog::info_fmt(format_args!(
+                crate::bootlog::ok_fmt(format_args!(
                     "xHCI setting USB configuration {}",
                     configuration.value
                 ));
                 self.control_transfer(SetupPacket::set_configuration(configuration.value), 0)?;
                 let hub_ports = if configuration.hub {
                     let ports = self.read_hub_descriptor()?;
-                    crate::bootlog::info_fmt(format_args!(
+                    crate::bootlog::ok_fmt(format_args!(
                         "xHCI USB hub descriptor reports {} downstream ports",
                         ports
                     ));
@@ -1413,7 +1413,7 @@ impl Runtime {
                     }
                     let device = hid::Device::from_descriptor(&descriptor[..descriptor_length])
                         .map_err(|_| HostError::Protocol)?;
-                    crate::bootlog::info_fmt(format_args!(
+                    crate::bootlog::ok_fmt(format_args!(
                         "xHCI USB HID {} report-bytes={}",
                         device.kind().name(),
                         device.report_bytes()
@@ -1422,7 +1422,7 @@ impl Runtime {
                 } else {
                     None
                 };
-                crate::bootlog::info_fmt(format_args!(
+                crate::bootlog::ok_fmt(format_args!(
                     "xHCI configuring USB endpoints interrupt-in={} bulk-in={} bulk-out={}",
                     configuration.interrupt_in.map_or(0, |endpoint| endpoint.id),
                     configuration.bulk_in.map_or(0, |endpoint| endpoint.id),
@@ -1430,7 +1430,7 @@ impl Runtime {
                 ));
                 self.configure_endpoints(configuration)?;
                 if configuration.serial {
-                    crate::bootlog::info_fmt(format_args!(
+                    crate::bootlog::ok_fmt(format_args!(
                         "xHCI configuring USB serial control requests protocol={}",
                         configuration
                             .serial_protocol
@@ -1442,7 +1442,7 @@ impl Runtime {
                     )?;
                 }
                 if configuration.storage {
-                    crate::bootlog::info("xHCI probing USB mass-storage BOT");
+                    crate::bootlog::ok("xHCI probing USB mass-storage BOT");
                     self.probe_storage()?;
                 }
                 let hid_kind = hid_device
@@ -1667,7 +1667,7 @@ impl Runtime {
                 self.control_transfer(SetupPacket::ftdi_modem_control(interface), 0)?;
             }
         }
-        crate::bootlog::info_fmt(format_args!(
+        crate::bootlog::ok_fmt(format_args!(
             "xHCI USB serial configured protocol={} baud=115200 data=8n1",
             protocol.map_or("unknown", SerialProtocol::name)
         ));
@@ -1786,7 +1786,7 @@ impl Runtime {
         if inquiry_length < 36 {
             return Err(HostError::Protocol);
         }
-        crate::bootlog::info_fmt(format_args!(
+        crate::bootlog::ok_fmt(format_args!(
             "xHCI USB mass-storage inquiry ok bytes={}",
             inquiry_length
         ));

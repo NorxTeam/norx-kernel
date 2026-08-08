@@ -502,7 +502,7 @@ pub fn risky_driver_handoff() -> bool {
         return true;
     }
     let Some(_) = crate::drivers::usb::xhci::status() else {
-        crate::bootlog::info("xHCI service handoff deferred: controller unavailable");
+        crate::bootlog::warn("xHCI service handoff deferred: controller unavailable");
         return true;
     };
     let driver = crate::drivers::usb::xhci::service_driver();
@@ -578,14 +578,14 @@ pub fn risky_driver_handoff() -> bool {
             return false;
         }
     };
-    crate::bootlog::info("xHCI risky driver service registered with MMIO and DMA ownership");
+    crate::bootlog::ok("xHCI risky driver service registered with MMIO and DMA ownership");
     if let Err(error) = crate::process::with_process_table(|processes| {
         supervisor.start(handle, &device, driver, processes)
     }) {
         crate::bootlog::warn_fmt(format_args!("xHCI service start failed: {:?}", error));
         return false;
     }
-    crate::bootlog::info("xHCI risky driver service started; endpoint active");
+    crate::bootlog::ok("xHCI risky driver service started; endpoint active");
 
     if crate::process::switch_to_user(process, thread).is_err()
         || runtime.start().is_err()
@@ -605,14 +605,14 @@ pub fn risky_driver_handoff() -> bool {
         crate::bootlog::warn_fmt(format_args!("xHCI service quiesce failed: {:?}", error));
         return false;
     }
-    crate::bootlog::info("xHCI risky driver service quiesced; endpoint revoked");
+    crate::bootlog::ok("xHCI risky driver service quiesced; endpoint revoked");
     if let Err(error) = crate::process::with_process_table(|processes| {
         supervisor.stop(handle, &mut device, driver, processes)
     }) {
         crate::bootlog::warn_fmt(format_args!("xHCI service stop failed: {:?}", error));
         return false;
     }
-    crate::bootlog::info("xHCI risky driver service stopped; resources revoked");
+    crate::bootlog::ok("xHCI risky driver service stopped; resources revoked");
 
     let (replacement_process, replacement_thread) =
         match crate::process::spawn_child_current(credentials) {
@@ -647,7 +647,7 @@ pub fn risky_driver_handoff() -> bool {
         ));
         return false;
     }
-    crate::bootlog::info("xHCI risky driver service restarted after clean stop");
+    crate::bootlog::ok("xHCI risky driver service restarted after clean stop");
 
     if crate::process::with_process_table(|processes| processes.exit(replacement_process, -9))
         .is_err()
@@ -662,7 +662,7 @@ pub fn risky_driver_handoff() -> bool {
         crate::bootlog::warn("xHCI service crash recovery failed");
         return false;
     }
-    crate::bootlog::info("xHCI risky driver crash recovered; endpoint and DMA resources revoked");
+    crate::bootlog::ok("xHCI risky driver crash recovered; endpoint and DMA resources revoked");
 
     let (final_process, final_thread) = match crate::process::spawn_child_current(credentials) {
         Ok(ids) => ids,
@@ -721,7 +721,7 @@ pub fn risky_driver_handoff() -> bool {
         let active = (*core::ptr::addr_of!(ACTIVE_RISKY_DRIVER))
             .as_ref()
             .unwrap();
-        crate::bootlog::info_fmt(format_args!(
+        crate::bootlog::ok_fmt(format_args!(
             "xHCI service runtime retained bus={} device={} driver={} state={:?} entry=0x{:x}",
             active.bus.id,
             active.device.id,
@@ -746,28 +746,120 @@ pub fn user_entry_self_check() -> bool {
         let quickinit_ok = run_user_fixture(
             crate::elf::quickinit_image(),
             "quickinit-bootstrap",
-            option_env!("NORDIX_QUICKINIT_FIXTURE") == Some("external"),
+            option_env!("QUICKINIT_FIXTURE") == Some("external"),
         );
         crate::bootlog::quickinit_overlay_finish(quickinit_ok);
         let fixtures_ok = quickinit_ok
             && run_user_fixture(
                 crate::elf::representative_image(),
-                "nordix-rust-smoke",
-                option_env!("NORDIX_RUST_FIXTURE") == Some("external"),
+                "rust-smoke",
+                option_env!("RUST_FIXTURE") == Some("external"),
             )
             && run_user_fixture(
                 crate::elf::representative_c_image(),
-                "nordix-c-runtime",
-                option_env!("NORDIX_C_FIXTURE") == Some("external"),
+                "c-runtime",
+                option_env!("C_FIXTURE") == Some("external"),
             )
             && run_user_fixture(
                 crate::elf::representative_cxx_image(),
-                "nordix-cxx-runtime",
-                option_env!("NORDIX_CXX_FIXTURE") == Some("external"),
+                "cxx-runtime",
+                option_env!("CXX_FIXTURE") == Some("external"),
             );
         let ok = quickinit_ok && fixtures_ok;
         ok
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpawnError {
+    InvalidPath,
+    NotFound,
+    Capacity,
+    InvalidState,
+    Elf,
+    Runtime,
+}
+
+pub fn spawn_user_path(path: &str) -> Result<u32, SpawnError> {
+    let (image, label) = match path {
+        "/bin/rust-smoke" | "/bin/userspace-smoke" => {
+            (crate::elf::representative_image(), "rust-smoke")
+        }
+        "/bin/c-runtime" => (crate::elf::representative_c_image(), "c-runtime"),
+        "/bin/cxx-runtime" => (crate::elf::representative_cxx_image(), "cxx-runtime"),
+        _ => return Err(SpawnError::NotFound),
+    };
+    if path.as_bytes().contains(&0) {
+        return Err(SpawnError::InvalidPath);
+    }
+
+    let parent = crate::process::current_process_id().ok_or(SpawnError::InvalidState)?;
+    let parent_root = crate::process::address_space_root(parent)
+        .map_err(|_| SpawnError::InvalidState)?
+        .ok_or(SpawnError::InvalidState)?;
+    crate::arch::restore_kernel_address_space();
+    let credentials = Credentials {
+        capabilities: 0,
+        ..Credentials::BOOTSTRAP
+    };
+    let (child, thread) =
+        crate::process::spawn_child_current(credentials).map_err(|error| match error {
+            crate::process::Error::ProcessCapacity | crate::process::Error::ThreadCapacity => {
+                SpawnError::Capacity
+            }
+            _ => SpawnError::InvalidState,
+        })?;
+    let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE);
+    let plan = match crate::elf::parse(image, crate::elf::Machine::current(), load_bias) {
+        Ok(plan) => plan,
+        Err(_) => {
+            let _ = crate::process::discard_child(parent, child);
+            return Err(SpawnError::Elf);
+        }
+    };
+    let arguments = [label.as_bytes()];
+    let environment: [&[u8]; 0] = [];
+    let mut runtime = match crate::user_runtime::NativeRuntime::prepare_image(
+        child,
+        image,
+        &plan,
+        crate::address_space::AslrHook::new(53),
+        &arguments,
+        &environment,
+    ) {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            let _ = crate::process::discard_child(parent, child);
+            return Err(SpawnError::Runtime);
+        }
+    };
+    let Some(root) = runtime.root_frame() else {
+        let _ = runtime.discard();
+        let _ = crate::process::discard_child(parent, child);
+        return Err(SpawnError::Runtime);
+    };
+    if crate::process::attach_address_space(child, root).is_err()
+        || crate::process::switch_to_user(child, thread).is_err()
+    {
+        let _ = runtime.discard();
+        let _ = crate::process::discard_child(parent, child);
+        return Err(SpawnError::Runtime);
+    }
+    let start_failed = runtime.start().is_err();
+    let enter_failed = !start_failed && runtime.enter_user_quiet().is_err();
+    if start_failed || enter_failed || !runtime.is_exited() {
+        let _ = crate::process::clear_address_space(child);
+        let _ = crate::process::discard_child(parent, child);
+        let _ = crate::process::restore_process(parent);
+        let _ = crate::arch::switch_to_user(parent_root);
+        return Err(SpawnError::Runtime);
+    }
+    let _ = crate::process::clear_address_space(child);
+    if crate::process::restore_process(parent).is_err() || !crate::arch::switch_to_user(parent_root)
+    {
+        return Err(SpawnError::InvalidState);
+    }
+    Ok(child.get())
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -820,6 +912,11 @@ fn run_user_fixture(image: &[u8], label: &'static str, external: bool) -> bool {
             return false;
         }
     };
+    if let Some(root) = runtime.root_frame() {
+        crate::process::attach_address_space(process, root).unwrap();
+    } else {
+        return false;
+    }
     if quickinit {
         crate::bootlog::quickinit_overlay_stage("preparing address space", 48);
     }

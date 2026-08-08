@@ -5,8 +5,8 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-changed=linker/x86_64.ld");
     println!("cargo:rerun-if-changed=linker/aarch64.ld");
-    println!("cargo:rerun-if-env-changed=NORDIX_ROOTFS");
-    println!("cargo:rerun-if-env-changed=NORDIX_REQUIRE_USERSPACE_FIXTURE");
+    println!("cargo:rerun-if-env-changed=ROOTFS_PATH");
+    println!("cargo:rerun-if-env-changed=REQUIRE_USERSPACE_FIXTURE");
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
@@ -28,10 +28,10 @@ fn main() {
         ),
         other => panic!("unsupported userspace fixture architecture: {other}"),
     };
-    let rootfs = env::var_os("NORDIX_ROOTFS")
+    let rootfs = env::var_os("ROOTFS_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|| manifest_dir.join("..").join("norx-rootfs"));
-    let require_fixture = env::var_os("NORDIX_REQUIRE_USERSPACE_FIXTURE").is_some();
+        .unwrap_or_else(|| manifest_dir.join("..").join("test-rootfs"));
+    let require_fixture = env::var_os("REQUIRE_USERSPACE_FIXTURE").is_some();
 
     let fixtures = [
         (
@@ -40,8 +40,8 @@ fn main() {
                 .join("tests")
                 .join("quickinit")
                 .join(triple)
-                .join("nordix-quickinit.elf"),
-            "nordix-quickinit.elf",
+                .join("quickinit.elf"),
+            "quickinit.elf",
         ),
         (
             "rust",
@@ -49,8 +49,8 @@ fn main() {
                 .join("tests")
                 .join("rust")
                 .join(triple)
-                .join("nordix-userspace-smoke.elf"),
-            "nordix-userspace-smoke.elf",
+                .join("userspace-smoke.elf"),
+            "userspace-smoke.elf",
         ),
         (
             "c",
@@ -59,7 +59,7 @@ fn main() {
                 .join("runtime")
                 .join(triple)
                 .join("runtime-c.elf"),
-            "nordix-userspace-c.elf",
+            "userspace-c.elf",
         ),
         (
             "cxx",
@@ -68,13 +68,13 @@ fn main() {
                 .join("runtime")
                 .join(triple)
                 .join("runtime-cxx.elf"),
-            "nordix-userspace-cxx.elf",
+            "userspace-cxx.elf",
         ),
     ];
 
     for (name, source, destination_name) in fixtures {
         let destination = output.join(destination_name);
-        let variable = format!("NORDIX_{}_FIXTURE", name.to_uppercase());
+        let variable = format!("{}_FIXTURE", name.to_uppercase());
         println!("cargo:rerun-if-changed={}", source.display());
         if source.is_file() {
             fs::copy(&source, &destination).unwrap_or_else(|error| {
@@ -83,14 +83,14 @@ fn main() {
             println!("cargo:rustc-env={variable}=external");
         } else if require_fixture {
             panic!(
-                "required Nordix userspace fixture is missing: {}",
+                "required userspace fixture is missing: {}",
                 source.display()
             );
         } else {
             fs::write(&destination, fallback_image(machine, &code)).unwrap();
             println!("cargo:rustc-env={variable}=fallback");
             println!(
-                "cargo:warning=Nordix {name} userspace fixture missing; embedding the bounded fallback exit image"
+                "cargo:warning={name} userspace fixture missing; embedding the bounded fallback exit image"
             );
         }
     }

@@ -2,6 +2,28 @@ use core::fmt::{self, Write};
 
 use crate::{boot::RawFramebuffer, framebuffer};
 
+const MAX_CONSOLE_COLS: usize = 160;
+const MAX_CONSOLE_ROWS: usize = 64;
+
+#[derive(Clone, Copy)]
+struct Cell {
+    codepoint: u32,
+    fg: u32,
+    bg: u32,
+    bold: bool,
+}
+
+impl Cell {
+    const fn blank(bg: u32) -> Self {
+        Self {
+            codepoint: b' ' as u32,
+            fg: 0xd8dee9,
+            bg,
+            bold: false,
+        }
+    }
+}
+
 struct Console {
     raw: RawFramebuffer,
     col: usize,
@@ -19,6 +41,8 @@ struct Console {
 }
 
 static mut CONSOLE: Option<Console> = None;
+static mut CELLS: [Cell; MAX_CONSOLE_COLS * MAX_CONSOLE_ROWS] =
+    [Cell::blank(0x000000); MAX_CONSOLE_COLS * MAX_CONSOLE_ROWS];
 
 #[macro_export]
 macro_rules! kprint {
@@ -50,6 +74,7 @@ pub fn init_framebuffer(raw: RawFramebuffer) {
     crate::vga::disable();
     unsafe {
         framebuffer::init(raw).clear(0x000000);
+        clear_cells(0x000000);
         CONSOLE = Some(Console {
             raw,
             col: 2,
@@ -72,9 +97,7 @@ pub fn write(args: fmt::Arguments) {
     crate::drivers::serial::write(args);
     #[cfg(target_arch = "x86_64")]
     crate::vga::write(args);
-    crate::bootlog::clear_quickinit_overlay();
     let _ = Screen.write_fmt(args);
-    crate::bootlog::redraw_quickinit_overlay();
 }
 
 pub fn write_bytes(bytes: &[u8]) {
@@ -82,9 +105,7 @@ pub fn write_bytes(bytes: &[u8]) {
     let text = core::str::from_utf8(bytes).unwrap_or("�");
     #[cfg(target_arch = "x86_64")]
     crate::vga::write(format_args!("{}", text));
-    crate::bootlog::clear_quickinit_overlay();
     let _ = Screen.write_str(text);
-    crate::bootlog::redraw_quickinit_overlay();
 }
 
 struct Screen;
@@ -139,15 +160,8 @@ fn screen_byte(byte: u8) {
             8 => {
                 if console.col > 2 {
                     console.col -= 1;
-                    let mut fb = framebuffer::init(console.raw);
-                    fb.term_char(
-                        console.col * framebuffer::TERM_W,
-                        console.row * framebuffer::TERM_H,
-                        b' ',
-                        console.fg,
-                        console.bg,
-                        console.bold,
-                    );
+                    set_cell(console.col, console.row, Cell::blank(console.bg));
+                    render_cell(console, console.col, console.row);
                 }
             }
             0xc2..=0xdf => {
@@ -166,10 +180,10 @@ fn screen_byte(byte: u8) {
         }
 
         if console.row >= console.rows {
-            let mut fb = framebuffer::init(console.raw);
-            fb.scroll_text(2, console.rows, console.bg);
+            scroll_console(console);
             console.col = 2;
             console.row = console.rows.saturating_sub(1);
+            crate::bootlog::redraw_quickinit_overlay();
         }
 
         draw_cursor(console, true);
@@ -229,6 +243,7 @@ fn handle_ansi(console: &mut Console, byte: u8) {
 fn reset_screen(console: &mut Console) {
     let mut fb = framebuffer::init(console.raw);
     fb.clear(0x000000);
+    clear_cells(0x000000);
     console.col = 2;
     console.row = 2;
     console.ansi = 0;
@@ -238,6 +253,23 @@ fn reset_screen(console: &mut Console) {
     console.bold = false;
     console.utf8_codepoint = 0;
     console.utf8_remaining = 0;
+    crate::bootlog::redraw_quickinit_overlay();
+}
+
+pub fn redraw_console() {
+    unsafe {
+        let Some(console) = (&raw mut CONSOLE).as_mut().and_then(Option::as_mut) else {
+            return;
+        };
+        let rows = console.rows.min(MAX_CONSOLE_ROWS);
+        let cols = console.cols.min(MAX_CONSOLE_COLS);
+        for row in 0..rows {
+            for column in 0..cols {
+                render_cell(console, column, row);
+            }
+        }
+        crate::bootlog::redraw_quickinit_overlay();
+    }
 }
 
 fn apply_sgr(console: &mut Console) {
@@ -281,15 +313,17 @@ fn apply_sgr_value(console: &mut Console, value: u8) {
 }
 
 fn put_codepoint(console: &mut Console, codepoint: u32) {
-    let mut fb = framebuffer::init(console.raw);
-    fb.term_codepoint(
-        console.col * framebuffer::TERM_W,
-        console.row * framebuffer::TERM_H,
-        codepoint,
-        console.fg,
-        console.bg,
-        console.bold,
+    set_cell(
+        console.col,
+        console.row,
+        Cell {
+            codepoint,
+            fg: console.fg,
+            bg: console.bg,
+            bold: console.bold,
+        },
     );
+    render_cell(console, console.col, console.row);
     console.col += 1;
     if console.col >= console.cols {
         console.col = 2;
@@ -312,20 +346,91 @@ fn ansi_color(index: u8, bright: bool) -> u32 {
 }
 
 fn erase_line(console: &mut Console) {
-    let mut fb = framebuffer::init(console.raw);
     for col in console.col..console.cols {
-        fb.term_char(
-            col * framebuffer::TERM_W,
-            console.row * framebuffer::TERM_H,
-            b' ',
-            console.fg,
-            console.bg,
-            console.bold,
-        );
+        set_cell(col, console.row, Cell::blank(console.bg));
+        render_cell(console, col, console.row);
+    }
+}
+
+fn clear_cells(bg: u32) {
+    unsafe {
+        let cells = core::ptr::addr_of_mut!(CELLS).cast::<Cell>();
+        for index in 0..MAX_CONSOLE_COLS * MAX_CONSOLE_ROWS {
+            cells.add(index).write(Cell::blank(bg));
+        }
+    }
+}
+
+fn set_cell(column: usize, row: usize, cell: Cell) {
+    if column >= MAX_CONSOLE_COLS || row >= MAX_CONSOLE_ROWS {
+        return;
+    }
+    unsafe {
+        core::ptr::addr_of_mut!(CELLS)
+            .cast::<Cell>()
+            .add(row * MAX_CONSOLE_COLS + column)
+            .write(cell);
+    }
+}
+
+fn cell(console: &Console, column: usize, row: usize) -> Cell {
+    if column >= MAX_CONSOLE_COLS || row >= MAX_CONSOLE_ROWS {
+        return Cell::blank(console.bg);
+    }
+    unsafe {
+        core::ptr::addr_of!(CELLS)
+            .cast::<Cell>()
+            .add(row * MAX_CONSOLE_COLS + column)
+            .read()
+    }
+}
+
+fn render_cell(console: &Console, column: usize, row: usize) {
+    if column >= console.cols
+        || row >= console.rows
+        || crate::bootlog::quickinit_overlay_contains(column, row)
+    {
+        return;
+    }
+    let value = cell(console, column, row);
+    let mut fb = framebuffer::init(console.raw);
+    fb.term_codepoint(
+        column * framebuffer::TERM_W,
+        row * framebuffer::TERM_H,
+        value.codepoint,
+        value.fg,
+        value.bg,
+        value.bold,
+    );
+}
+
+fn scroll_console(console: &mut Console) {
+    let top = 2;
+    let bottom = console.rows.min(MAX_CONSOLE_ROWS);
+    let columns = console.cols.min(MAX_CONSOLE_COLS);
+    if bottom <= top + 1 {
+        return;
+    }
+    for row in top..bottom - 1 {
+        for column in 0..columns {
+            let value = cell(console, column, row + 1);
+            set_cell(column, row, value);
+        }
+    }
+    for column in 0..columns {
+        set_cell(column, bottom - 1, Cell::blank(console.bg));
+    }
+    for row in top..bottom {
+        for column in 0..columns {
+            render_cell(console, column, row);
+        }
     }
 }
 
 fn draw_cursor(console: &Console, on: bool) {
+    if crate::bootlog::quickinit_overlay_contains(console.col, console.row) {
+        return;
+    }
     let mut fb = framebuffer::init(console.raw);
     fb.term_cursor(
         console.col * framebuffer::TERM_W,

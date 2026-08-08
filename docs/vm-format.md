@@ -41,7 +41,7 @@ off-target.
   Function imports are the complete link surface and must match an exact
   versioned signature.
 - An optional `norx.deps` custom section contains at most eight basename
-  dependencies, each validated by the same `/lib`/`/lib64` VFS-only policy as
+  dependencies, each validated by the same `/lib` VFS-only policy as
   native libraries. The kernel does not inspect `LD_LIBRARY_PATH`, RPATH, or
   host paths.
 - An optional `norx.debug` custom section contains bounded function names and

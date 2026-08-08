@@ -156,7 +156,7 @@ pub fn init() -> bool {
         geometry.read_only,
         cache_mode().name(),
     ));
-    crate::bootlog::info("ramdisk completion, read-only, partition, and cache checks passed");
+    crate::bootlog::ok("ramdisk completion, read-only, partition, and cache checks passed");
     true
 }
 

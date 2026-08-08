@@ -1,5 +1,7 @@
 use core::cell::UnsafeCell;
 
+use crate::address::PhysAddr;
+
 const MAX_PROCESSES: usize = 32;
 const MAX_THREADS: usize = 64;
 const MAX_PROCESS_THREADS: usize = 4;
@@ -190,6 +192,7 @@ struct ProcessRecord {
     exit_status: Option<i32>,
     pending_signals: u64,
     pending_events: u64,
+    address_space_root: Option<PhysAddr>,
     threads: [Option<ThreadId>; MAX_PROCESS_THREADS],
     fds: [Option<FdEntry>; MAX_FDS],
 }
@@ -204,6 +207,7 @@ impl ProcessRecord {
             exit_status: None,
             pending_signals: 0,
             pending_events: 0,
+            address_space_root: None,
             threads: [None; MAX_PROCESS_THREADS],
             fds: standard_fds(),
         }
@@ -475,6 +479,37 @@ impl ProcessTable {
         Ok(self.process(process)?.state)
     }
 
+    pub fn attach_address_space(
+        &mut self,
+        process: ProcessId,
+        root: PhysAddr,
+    ) -> Result<(), Error> {
+        let record = self.process_mut(process)?;
+        if record.state != ProcessState::Running {
+            return Err(Error::InvalidState);
+        }
+        record.address_space_root = Some(root);
+        Ok(())
+    }
+
+    pub fn address_space_root(&self, process: ProcessId) -> Result<Option<PhysAddr>, Error> {
+        Ok(self.process(process)?.address_space_root)
+    }
+
+    pub fn clear_address_space(&mut self, process: ProcessId) -> Result<(), Error> {
+        self.process_mut(process)?.address_space_root = None;
+        Ok(())
+    }
+
+    fn process_thread(&self, process: ProcessId) -> Result<ThreadId, Error> {
+        self.process(process)?
+            .threads
+            .into_iter()
+            .flatten()
+            .next()
+            .ok_or(Error::InvalidState)
+    }
+
     pub fn authorize(&self, process: ProcessId, capability: Capability) -> Result<(), Error> {
         self.credentials(process)?.authorize(capability)
     }
@@ -736,6 +771,53 @@ pub fn spawn_child_current(credentials: Credentials) -> Result<(ProcessId, Threa
     })
 }
 
+pub fn current_process_id() -> Option<ProcessId> {
+    crate::arch::without_interrupts(|| unsafe { (&*RUNTIME.0.get()).current_process })
+}
+
+pub fn attach_address_space(process: ProcessId, root: PhysAddr) -> Result<(), Error> {
+    crate::arch::without_interrupts(|| unsafe {
+        (&mut *RUNTIME.0.get())
+            .table
+            .attach_address_space(process, root)
+    })
+}
+
+pub fn address_space_root(process: ProcessId) -> Result<Option<PhysAddr>, Error> {
+    crate::arch::without_interrupts(|| unsafe {
+        (&*RUNTIME.0.get()).table.address_space_root(process)
+    })
+}
+
+pub fn clear_address_space(process: ProcessId) -> Result<(), Error> {
+    crate::arch::without_interrupts(|| unsafe {
+        (&mut *RUNTIME.0.get()).table.clear_address_space(process)
+    })
+}
+
+pub fn restore_process(process: ProcessId) -> Result<ThreadId, Error> {
+    crate::arch::without_interrupts(|| unsafe {
+        let runtime = &mut *RUNTIME.0.get();
+        if runtime.current_thread.is_some() || runtime.current_process.is_some() {
+            return Err(Error::InvalidState);
+        }
+        let thread = runtime.table.process_thread(process)?;
+        runtime.table.switch_to(None, thread)?;
+        runtime.current_thread = Some(thread);
+        runtime.current_process = Some(process);
+        Ok(thread)
+    })
+}
+
+pub fn discard_child(parent: ProcessId, child: ProcessId) -> Result<(), Error> {
+    crate::arch::without_interrupts(|| unsafe {
+        let runtime = &mut *RUNTIME.0.get();
+        runtime.table.exit(child, -127)?;
+        let _ = runtime.table.wait(parent, Some(child))?;
+        Ok(())
+    })
+}
+
 #[allow(dead_code)]
 pub fn switch_to_user(process: ProcessId, thread: ThreadId) -> Result<(), Error> {
     crate::arch::without_interrupts(|| unsafe {
@@ -784,7 +866,11 @@ pub fn exit_current(status: i32) -> Result<(), Error> {
         if process == ProcessId::INIT {
             runtime.table.thread_mut(thread)?.state = ThreadState::Exited;
         } else {
-            runtime.table.exit(process, status)?;
+            if let Err(error) = runtime.table.exit(process, status) {
+                if runtime.table.process_state(process) != Ok(ProcessState::Zombie) {
+                    return Err(error);
+                }
+            }
         }
         runtime.current_process = None;
         runtime.current_thread = None;
@@ -825,16 +911,15 @@ pub fn current_fd_access(fd: u32) -> Result<(bool, bool, bool), Error> {
 pub fn yield_current() -> Result<(), Error> {
     crate::arch::without_interrupts(|| unsafe {
         let runtime = &mut *RUNTIME.0.get();
+        if runtime.current_process != Some(ProcessId::INIT) {
+            // Native EL0 smoke runs synchronously. There is no scheduler
+            // continuation to resume while the syscall returns to that frame.
+            return Ok(());
+        }
         let current = runtime.current_thread.ok_or(Error::InvalidState)?;
         let Some(next) = runtime.table.pick_ready() else {
             return Ok(());
         };
-        if runtime.current_process != Some(ProcessId::INIT) && runtime.init_thread == Some(next) {
-            // Native EL0 smoke runs synchronously and has no scheduler continuation
-            // to resume after switching to init. Keep the logical current process
-            // aligned with the context that will return from the syscall.
-            return Ok(());
-        }
         runtime.table.switch_to(Some(current), next)?;
         runtime.set_current(next)
     })

@@ -130,29 +130,44 @@ impl NativeRuntime {
             return Err(Error::InvalidState);
         }
         self.started = true;
-        crate::bootlog::info_fmt(format_args!(
+        crate::bootlog::ok_fmt(format_args!(
             "native init start entry=0x{:x} stack=0x{:x}",
             self.registers.instruction_pointer, self.registers.stack_pointer
         ));
         Ok(self.registers)
     }
 
-    #[allow(dead_code)]
     pub fn enter_user(&mut self) -> Result<(), Error> {
+        self.enter_user_inner(true)
+    }
+
+    pub fn enter_user_quiet(&mut self) -> Result<(), Error> {
+        self.enter_user_inner(false)
+    }
+
+    fn enter_user_inner(&mut self, log: bool) -> Result<(), Error> {
         if !self.started || self.exited || self.address_space.is_active() {
             return Err(Error::InvalidState);
         }
         let root = self.address_space.root_frame().ok_or(Error::InvalidState)?;
-        crate::bootlog::info("native user entry: activating address space");
-        self.address_space.activate().map_err(Error::AddressSpace)?;
-        crate::bootlog::info("native user entry: address space active");
-        crate::bootlog::info("native user entry: switching TTBR0");
-        if !crate::arch::switch_to_user(root) {
+        if log {
+            crate::bootlog::ok("native user entry: activating address space");
+        }
+        let activated = self.address_space.activate();
+        activated.map_err(Error::AddressSpace)?;
+        if log {
+            crate::bootlog::ok("native user entry: address space active");
+            crate::bootlog::ok("native user entry: switching TTBR0");
+        }
+        let switched = crate::arch::switch_to_user(root);
+        if !switched {
             crate::arch::restore_kernel_address_space();
             let _ = self.address_space.destroy();
             return Err(Error::UserEntryUnavailable);
         }
-        crate::bootlog::info("native user entry: TTBR0 active, entering EL0");
+        if log {
+            crate::bootlog::ok("native user entry: TTBR0 active, entering EL0");
+        }
         if !crate::arch::enter_user(self.registers) {
             crate::arch::restore_kernel_address_space();
             let _ = self.address_space.destroy();
@@ -170,6 +185,10 @@ impl NativeRuntime {
 
     pub fn registers(&self) -> InitialRegisters {
         self.registers
+    }
+
+    pub fn root_frame(&self) -> Option<crate::address::PhysAddr> {
+        self.address_space.root_frame()
     }
 
     pub fn alloc(&mut self, bytes: usize) -> Result<usize, Error> {
@@ -211,7 +230,7 @@ impl NativeRuntime {
         if bytes.len() > MAX_WRITE {
             return Err(Error::OutputTooLong);
         }
-        crate::bootlog::info_fmt(format_args!(
+        crate::bootlog::ok_fmt(format_args!(
             "native init serial write bytes={}",
             bytes.len()
         ));
@@ -224,7 +243,16 @@ impl NativeRuntime {
         }
         self.address_space.destroy().map_err(Error::AddressSpace)?;
         self.exited = true;
-        crate::bootlog::info_fmt(format_args!("native init exited status={}", status));
+        crate::bootlog::ok_fmt(format_args!("native init exited status={}", status));
+        Ok(())
+    }
+
+    pub fn discard(&mut self) -> Result<(), Error> {
+        if self.exited {
+            return Ok(());
+        }
+        self.address_space.destroy().map_err(Error::AddressSpace)?;
+        self.exited = true;
         Ok(())
     }
 

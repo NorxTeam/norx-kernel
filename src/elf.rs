@@ -631,19 +631,19 @@ pub(crate) fn service_image(machine: Machine) -> [u8; PAGE_SIZE + 16] {
 }
 
 pub(crate) fn representative_image() -> &'static [u8] {
-    include_bytes!(concat!(env!("OUT_DIR"), "/nordix-userspace-smoke.elf"))
+    include_bytes!(concat!(env!("OUT_DIR"), "/userspace-smoke.elf"))
 }
 
 pub(crate) fn quickinit_image() -> &'static [u8] {
-    include_bytes!(concat!(env!("OUT_DIR"), "/nordix-quickinit.elf"))
+    include_bytes!(concat!(env!("OUT_DIR"), "/quickinit.elf"))
 }
 
 pub(crate) fn representative_c_image() -> &'static [u8] {
-    include_bytes!(concat!(env!("OUT_DIR"), "/nordix-userspace-c.elf"))
+    include_bytes!(concat!(env!("OUT_DIR"), "/userspace-c.elf"))
 }
 
 pub(crate) fn representative_cxx_image() -> &'static [u8] {
-    include_bytes!(concat!(env!("OUT_DIR"), "/nordix-userspace-cxx.elf"))
+    include_bytes!(concat!(env!("OUT_DIR"), "/userspace-cxx.elf"))
 }
 
 pub(crate) fn load_bias_for_image(image: &[u8], dynamic_bias: usize) -> usize {

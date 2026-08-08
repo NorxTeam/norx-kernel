@@ -129,11 +129,11 @@ pub fn init_timer_interrupts() -> bool {
     let input_ok = crate::drivers::ps2::enable_interrupts();
     let ps2 = crate::drivers::ps2::status();
     if input_ok && ps2.controller {
-        crate::bootlog::info("ps/2 IRQ1/IRQ12 routing enabled");
+        crate::bootlog::ok("ps/2 IRQ1/IRQ12 routing enabled");
     } else if !input_ok && ps2.controller {
         crate::bootlog::warn("ps/2 interrupt routing unavailable; input remains polled");
     } else {
-        crate::bootlog::info("ps/2 IRQ routing skipped; controller unavailable");
+        crate::bootlog::warn("ps/2 IRQ routing skipped; controller unavailable");
     }
     unsafe { asm!("sti", options(nomem, nostack, preserves_flags)) };
     true

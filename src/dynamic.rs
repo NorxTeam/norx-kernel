@@ -73,7 +73,7 @@ pub enum Error {
     MissingDependency,
 }
 
-pub const LIBRARY_SEARCH_ROOTS: [&[u8]; 2] = [b"/lib", b"/lib64"];
+pub const LIBRARY_SEARCH_ROOTS: [&[u8]; 1] = [b"/lib"];
 
 pub fn validate_library_name(name: &[u8]) -> Result<(), Error> {
     if name.is_empty()
@@ -1056,7 +1056,7 @@ pub fn contract_self_check() {
     assert_eq!(dynamic.relocation(0).unwrap().address, 0x500600);
     assert_eq!(dynamic.relative_value(0).unwrap(), 0x100010);
     assert_eq!(dynamic.tls.unwrap().memory_size, 8);
-    assert_eq!(LIBRARY_SEARCH_ROOTS, [&b"/lib"[..], &b"/lib64"[..]]);
+    assert_eq!(LIBRARY_SEARCH_ROOTS, [&b"/lib"[..]]);
     validate_library_name(b"libdep.so").unwrap();
     assert_eq!(
         validate_library_name(b"../host.so"),

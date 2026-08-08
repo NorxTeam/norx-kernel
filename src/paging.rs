@@ -39,7 +39,7 @@ pub fn init() {
     #[cfg(target_arch = "aarch64")]
     {
         let status = crate::arch::paging::status();
-        crate::bootlog::info_fmt(format_args!(
+        crate::bootlog::ok_fmt(format_args!(
             "aarch64 paging ttbr0=0x{:x} ttbr1=0x{:x} tcr=0x{:x} mair=0x{:x} sctlr=0x{:x}",
             status.ttbr0, status.ttbr1, status.tcr, status.mair, status.sctlr
         ));

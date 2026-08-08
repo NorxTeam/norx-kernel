@@ -539,11 +539,11 @@ impl Runtime {
         let link_up = link & LINK_UP != 0;
         if link_up != self.link_up {
             self.link_up = link_up;
-            crate::bootlog::info(if link_up {
-                "virtio-net link up"
+            if link_up {
+                crate::bootlog::ok("virtio-net link up");
             } else {
-                "virtio-net link down"
-            });
+                crate::bootlog::warn("virtio-net link down");
+            }
         }
         if self.tx.memory.sync_for_cpu().is_err() {
             if !self.tx_error_logged {

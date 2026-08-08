@@ -423,13 +423,13 @@ pub fn init() -> bool {
         stats().files,
         stats().bytes,
     ));
-    crate::bootlog::info(
+    crate::bootlog::ok(
         "ramfs mount, offsets, permissions, rename, unlink, and unmount checks passed",
     );
-    crate::bootlog::info(
+    crate::bootlog::ok(
         "VFS mount tree, namespace, dentry lifetime, flags, propagation, and unmount checks passed",
     );
-    crate::bootlog::info("VFS library roots mounted read-only: /lib, /lib64");
+    crate::bootlog::ok("VFS library root mounted read-only: /lib");
     true
 }
 
@@ -438,9 +438,9 @@ fn mount_ramfs() -> Result<(), Error> {
         if MOUNTED {
             return Err(Error::AlreadyMounted);
         }
-        crate::bootlog::info("ramfs resetting static inode table");
+        crate::bootlog::ok("ramfs resetting static inode table");
         (&mut *core::ptr::addr_of_mut!(FILE_SYSTEM)).reset();
-        crate::bootlog::info("ramfs inode table reset");
+        crate::bootlog::ok("ramfs inode table reset");
         MOUNTED = true;
         let mounts = &mut *core::ptr::addr_of_mut!(MOUNTS);
         mounts.fill(MountNode::EMPTY);
@@ -1046,29 +1046,19 @@ fn mount_tree_self_check() -> Result<(), Error> {
 
 fn mount_library_roots() -> Result<(), Error> {
     mkdir("/lib")?;
-    mkdir("/lib64")?;
     if !write("/lib/libdep.so", b"Norx staged shared object\n") {
         return Err(Error::NoSpace);
     }
     let lib = mount(MountSource::Ramfs, "/lib", MountFlags::library())?;
-    let lib64 = match mount(MountSource::Ramfs, "/lib64", MountFlags::library()) {
-        Ok(mount) => mount,
-        Err(error) => {
-            let _ = unmount_mount(lib);
-            return Err(error);
-        }
-    };
-    for (path, expected) in [("/lib", lib), ("/lib64", lib64)] {
-        if mount_info(expected)?.flags != MountFlags::library() {
-            return Err(Error::InvalidMountTarget);
-        }
-        let dentry = lookup(path)?;
-        if dentry.dentry().mount != expected {
-            let _ = release_dentry(dentry);
-            return Err(Error::InvalidMountTarget);
-        }
-        release_dentry(dentry)?;
+    if mount_info(lib)?.flags != MountFlags::library() {
+        return Err(Error::InvalidMountTarget);
     }
+    let dentry = lookup("/lib")?;
+    if dentry.dentry().mount != lib {
+        let _ = release_dentry(dentry);
+        return Err(Error::InvalidMountTarget);
+    }
+    release_dentry(dentry)?;
     Ok(())
 }
 

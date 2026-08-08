@@ -238,7 +238,7 @@ pub fn init_interrupt_controller() {
 }
 
 pub fn init_syscalls() -> bool {
-    crate::bootlog::info_fmt(format_args!(
+    crate::bootlog::ok_fmt(format_args!(
         "aarch64 current exception level EL{}",
         tables::current_el()
     ));

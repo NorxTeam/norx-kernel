@@ -10,51 +10,167 @@ const EFER_SCE: u64 = 1;
 static mut KERNEL_STACK_TOP: u64 = 0;
 
 #[no_mangle]
-static mut USER_RETURN_RSP: u64 = 0;
+static mut USER_RETURN_RSP_STACK: [u64; 4] = [0; 4];
+
+#[no_mangle]
+static mut USER_RETURN_DEPTH: u64 = 0;
+
+#[no_mangle]
+static mut KERNEL_RETURN_R12_STACK: [u64; 4] = [0; 4];
+
+#[no_mangle]
+static mut KERNEL_RETURN_R13_STACK: [u64; 4] = [0; 4];
+
+#[no_mangle]
+static mut KERNEL_RETURN_R14_STACK: [u64; 4] = [0; 4];
+
+#[no_mangle]
+static mut KERNEL_RETURN_R15_STACK: [u64; 4] = [0; 4];
+
+#[no_mangle]
+static mut KERNEL_RETURN_RBX_STACK: [u64; 4] = [0; 4];
+
+#[no_mangle]
+static mut KERNEL_RETURN_RBP_STACK: [u64; 4] = [0; 4];
+
+#[no_mangle]
+static mut SYSCALL_OP: u64 = 0;
+
+#[no_mangle]
+static mut SYSCALL_ARG2: u64 = 0;
+
+#[no_mangle]
+static mut SYSCALL_ARG3: u64 = 0;
+
+#[no_mangle]
+static mut SYSCALL_USER_RSP: u64 = 0;
 
 global_asm!(
     r#"
+    .section .text,"ax"
     .global norx_x86_64_syscall_entry
 norx_x86_64_syscall_entry:
-    mov r12, rsp
-    mov rsp, qword ptr [rip + KERNEL_STACK_TOP]
+    mov qword ptr [rip + SYSCALL_OP], rax
+    mov qword ptr [rip + SYSCALL_ARG2], rdx
+    mov qword ptr [rip + SYSCALL_ARG3], r10
+    mov qword ptr [rip + SYSCALL_USER_RSP], rsp
+    mov r10, rsp
+    mov rax, qword ptr [rip + USER_RETURN_DEPTH]
+    test rax, rax
+    jz norx_x86_64_user_return_underflow
+    cmp rax, 4
+    jae norx_x86_64_kernel_stack_overflow
+    dec rax
+    shl rax, 17
+    mov rdx, qword ptr [rip + KERNEL_STACK_TOP]
+    sub rdx, rax
+    mov rsp, rdx
     and rsp, -16
+    push r9
+    push r8
+    push qword ptr [rip + SYSCALL_ARG2]
+    push rsi
+    push rdi
+    push r15
+    push r14
+    push r13
     push r12
+    push rbp
+    push rbx
     push rcx
     push r11
     sub rsp, 8
-    mov [rsp], r9
+    mov qword ptr [rsp], r9
     mov r9, r8
-    mov r8, r10
-    mov rcx, rdx
+    mov r8, qword ptr [rip + SYSCALL_ARG3]
+    mov rcx, qword ptr [rip + SYSCALL_ARG2]
     mov rdx, rsi
     mov rsi, rdi
-    mov rdi, rax
+    mov rdi, qword ptr [rip + SYSCALL_OP]
     call norx_x86_64_syscall_rust
     cmp rax, -2
     je norx_x86_64_user_exit
     add rsp, 8
     pop r11
     pop rcx
+    pop rbx
+    pop rbp
     pop r12
-    mov rsp, r12
+    pop r13
+    pop r14
+    pop r15
+    pop rdi
+    pop rsi
+    pop rdx
+    pop r8
+    pop r9
+    mov rsp, qword ptr [rip + SYSCALL_USER_RSP]
+    mov r10, qword ptr [rip + SYSCALL_ARG3]
     sysretq
 
 norx_x86_64_user_exit:
-    mov rsp, qword ptr [rip + USER_RETURN_RSP]
-    mov qword ptr [rip + USER_RETURN_RSP], 0
+    mov rax, qword ptr [rip + USER_RETURN_DEPTH]
+    test rax, rax
+    jz norx_x86_64_user_return_underflow
+    dec rax
+    mov qword ptr [rip + USER_RETURN_DEPTH], rax
+    lea rdx, [rip + KERNEL_RETURN_RBX_STACK]
+    mov rbx, qword ptr [rdx + rax*8]
+    lea rdx, [rip + KERNEL_RETURN_RBP_STACK]
+    mov rbp, qword ptr [rdx + rax*8]
+    lea rdx, [rip + KERNEL_RETURN_R12_STACK]
+    mov r12, qword ptr [rdx + rax*8]
+    lea rdx, [rip + KERNEL_RETURN_R13_STACK]
+    mov r13, qword ptr [rdx + rax*8]
+    lea rdx, [rip + KERNEL_RETURN_R14_STACK]
+    mov r14, qword ptr [rdx + rax*8]
+    lea rdx, [rip + KERNEL_RETURN_R15_STACK]
+    mov r15, qword ptr [rdx + rax*8]
+    lea rdx, [rip + USER_RETURN_RSP_STACK]
+    mov rsp, qword ptr [rdx + rax*8]
     sti
     ret
 
+norx_x86_64_user_return_underflow:
+    cli
+    hlt
+
+norx_x86_64_kernel_stack_overflow:
+    cli
+    hlt
+
     .global norx_x86_64_enter_user
 norx_x86_64_enter_user:
-    mov qword ptr [rip + USER_RETURN_RSP], rsp
+    mov r8, rdx
+    mov rax, qword ptr [rip + USER_RETURN_DEPTH]
+    cmp rax, 4
+    jae norx_x86_64_user_return_overflow
+    lea rdx, [rip + KERNEL_RETURN_RBX_STACK]
+    mov qword ptr [rdx + rax*8], rbx
+    lea rdx, [rip + KERNEL_RETURN_RBP_STACK]
+    mov qword ptr [rdx + rax*8], rbp
+    lea rdx, [rip + KERNEL_RETURN_R12_STACK]
+    mov qword ptr [rdx + rax*8], r12
+    lea rdx, [rip + KERNEL_RETURN_R13_STACK]
+    mov qword ptr [rdx + rax*8], r13
+    lea rdx, [rip + KERNEL_RETURN_R14_STACK]
+    mov qword ptr [rdx + rax*8], r14
+    lea rdx, [rip + KERNEL_RETURN_R15_STACK]
+    mov qword ptr [rdx + rax*8], r15
+    lea rdx, [rip + USER_RETURN_RSP_STACK]
+    mov qword ptr [rdx + rax*8], rsp
+    inc rax
+    mov qword ptr [rip + USER_RETURN_DEPTH], rax
     push 0x1b
     push rsi
-    push rdx
+    push r8
     push 0x23
     push rdi
     iretq
+
+norx_x86_64_user_return_overflow:
+    cli
+    hlt
 "#
 );
 
@@ -69,6 +185,7 @@ extern "sysv64" {
 pub fn init() -> bool {
     unsafe {
         KERNEL_STACK_TOP = crate::arch::tables::syscall_stack_top();
+        USER_RETURN_DEPTH = 0;
         if KERNEL_STACK_TOP == 0 {
             return false;
         }

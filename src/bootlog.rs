@@ -7,7 +7,6 @@ pub enum Status {
     Ok,
     Fail,
     Warn,
-    Info,
     Spin(u8),
 }
 
@@ -17,6 +16,10 @@ static mut QUICKINIT_FRAMEBUFFER: Option<RawFramebuffer> = None;
 static mut QUICKINIT_STAGE: &'static str = "starting quickinit";
 static mut QUICKINIT_PERCENT: u8 = 0;
 static mut QUICKINIT_ACTIVE: bool = false;
+static mut QUICKINIT_DRAWN: bool = false;
+static mut QUICKINIT_RENDERED_STAGE: &'static str = "";
+static mut QUICKINIT_RENDERED_PERCENT: u8 = 0;
+static mut QUICKINIT_RENDERED_PROGRESS: bool = false;
 
 const QUICKINIT_WIDTH: usize = 54;
 const QUICKINIT_HEIGHT: usize = 9;
@@ -27,7 +30,6 @@ impl Status {
             Status::Ok => "  OK  ",
             Status::Fail => "FAILED",
             Status::Warn => " WARN ",
-            Status::Info => " INFO ",
             Status::Spin(frame) => match frame & 7 {
                 0 => "  >   ",
                 1 => "   >  ",
@@ -46,7 +48,6 @@ impl Status {
             Status::Ok => "\x1b[92m",
             Status::Fail => "\x1b[91m",
             Status::Warn => "\x1b[93m",
-            Status::Info => "\x1b[97m",
             Status::Spin(_) => "\x1b[97m",
         }
     }
@@ -104,21 +105,16 @@ pub fn warn_fmt(args: fmt::Arguments) {
     status_fmt(Status::Warn, args);
 }
 
-pub fn info(message: &str) {
-    status(Status::Info, message);
-}
-
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-pub fn info_fmt(args: fmt::Arguments) {
-    status_fmt(Status::Info, args);
-}
-
 pub fn quickinit_overlay_begin(raw: Option<RawFramebuffer>) {
     unsafe {
         QUICKINIT_FRAMEBUFFER = raw;
         QUICKINIT_STAGE = "starting quickinit";
         QUICKINIT_PERCENT = 0;
         QUICKINIT_ACTIVE = raw.is_some();
+        QUICKINIT_DRAWN = false;
+        QUICKINIT_RENDERED_STAGE = "";
+        QUICKINIT_RENDERED_PERCENT = 0;
+        QUICKINIT_RENDERED_PROGRESS = false;
     }
     redraw_quickinit_overlay();
 }
@@ -134,15 +130,31 @@ pub fn quickinit_overlay_stage(stage: &'static str, percent: u8) {
 pub fn quickinit_overlay_finish(success: bool) {
     unsafe {
         QUICKINIT_STAGE = if success {
-            "handoff verified"
+            "starting system services"
         } else {
-            "boot failure"
+            "recovery path"
         };
-        if success {
-            QUICKINIT_PERCENT = 100;
-        }
+        QUICKINIT_PERCENT = if success { 92 } else { 88 };
     }
     redraw_quickinit_overlay();
+}
+
+pub fn quickinit_overlay_complete(success: bool) {
+    let redraw;
+    unsafe {
+        QUICKINIT_STAGE = if success {
+            "system ready"
+        } else {
+            "recovery ready"
+        };
+        QUICKINIT_PERCENT = 100;
+        redraw = core::ptr::read(core::ptr::addr_of!(QUICKINIT_FRAMEBUFFER)).is_some();
+        QUICKINIT_ACTIVE = false;
+        QUICKINIT_DRAWN = false;
+    }
+    if redraw {
+        crate::log::redraw_console();
+    }
 }
 
 pub fn redraw_quickinit_overlay() {
@@ -157,23 +169,17 @@ pub fn redraw_quickinit_overlay() {
     }
 }
 
-pub fn clear_quickinit_overlay() {
+pub fn quickinit_overlay_contains(column: usize, row: usize) -> bool {
     unsafe {
-        if !QUICKINIT_ACTIVE {
-            return;
-        }
-        let Some(raw) = QUICKINIT_FRAMEBUFFER else {
-            return;
-        };
-        let Some((left, top)) = quickinit_overlay_geometry(raw) else {
-            return;
-        };
-        let mut fb = framebuffer::init(raw);
-        for row in 0..QUICKINIT_HEIGHT {
-            for column in 0..QUICKINIT_WIDTH {
-                put_overlay_char(&mut fb, left + column, top + row, b' ', 0xd8dee9);
-            }
-        }
+        QUICKINIT_ACTIVE
+            && QUICKINIT_FRAMEBUFFER
+                .and_then(quickinit_overlay_geometry)
+                .is_some_and(|(left, top)| {
+                    column >= left
+                        && column < left + QUICKINIT_WIDTH
+                        && row >= top
+                        && row < top + QUICKINIT_HEIGHT
+                })
     }
 }
 
@@ -225,7 +231,7 @@ fn prefix(status: Status) {
     );
 }
 
-fn draw_quickinit_overlay(raw: RawFramebuffer, stage: &str, percent: u8) {
+fn draw_quickinit_overlay(raw: RawFramebuffer, stage: &'static str, percent: u8) {
     let Some((left, top)) = quickinit_overlay_geometry(raw) else {
         return;
     };
@@ -236,79 +242,92 @@ fn draw_quickinit_overlay(raw: RawFramebuffer, stage: &str, percent: u8) {
     let progress = 0x7ee787;
     let percent_color = 0xffd580;
 
-    for row in 1..QUICKINIT_HEIGHT - 1 {
-        for column in 1..QUICKINIT_WIDTH - 1 {
-            put_overlay_char(&mut fb, left + column, top + row, b' ', text);
+    let first_draw = unsafe { !QUICKINIT_DRAWN };
+    if first_draw {
+        for row in 1..QUICKINIT_HEIGHT - 1 {
+            for column in 1..QUICKINIT_WIDTH - 1 {
+                put_overlay_char(&mut fb, left + column, top + row, b' ', text);
+            }
         }
-    }
-    for column in 0..QUICKINIT_WIDTH {
-        put_overlay_char(&mut fb, left + column, top, b'-', border);
-        put_overlay_char(
+        for column in 0..QUICKINIT_WIDTH {
+            put_overlay_symbol(&mut fb, left + column, top, '─', border);
+            put_overlay_symbol(
+                &mut fb,
+                left + column,
+                top + QUICKINIT_HEIGHT - 1,
+                '─',
+                border,
+            );
+        }
+        for row in 1..QUICKINIT_HEIGHT - 1 {
+            put_overlay_symbol(&mut fb, left, top + row, '│', border);
+            put_overlay_symbol(&mut fb, left + QUICKINIT_WIDTH - 1, top + row, '│', border);
+        }
+        put_overlay_symbol(&mut fb, left, top, '┌', border);
+        put_overlay_symbol(&mut fb, left + QUICKINIT_WIDTH - 1, top, '┐', border);
+        put_overlay_symbol(&mut fb, left, top + QUICKINIT_HEIGHT - 1, '└', border);
+        put_overlay_symbol(
             &mut fb,
-            left + column,
+            left + QUICKINIT_WIDTH - 1,
             top + QUICKINIT_HEIGHT - 1,
-            b'-',
+            '┘',
             border,
         );
+        put_overlay_text(
+            &mut fb,
+            left + 3,
+            top + 1,
+            "QUICKINIT",
+            title,
+            true,
+            left + QUICKINIT_WIDTH - 1,
+        );
+        unsafe { QUICKINIT_DRAWN = true };
     }
-    for row in 1..QUICKINIT_HEIGHT - 1 {
-        put_overlay_char(&mut fb, left, top + row, b'|', border);
-        put_overlay_char(&mut fb, left + QUICKINIT_WIDTH - 1, top + row, b'|', border);
-    }
-    put_overlay_char(&mut fb, left, top, b'+', border);
-    put_overlay_char(&mut fb, left + QUICKINIT_WIDTH - 1, top, b'+', border);
-    put_overlay_char(&mut fb, left, top + QUICKINIT_HEIGHT - 1, b'+', border);
-    put_overlay_char(
-        &mut fb,
-        left + QUICKINIT_WIDTH - 1,
-        top + QUICKINIT_HEIGHT - 1,
-        b'+',
-        border,
-    );
 
     let right = left + QUICKINIT_WIDTH - 1;
-    put_overlay_text(&mut fb, left + 3, top + 1, "QUICKINIT", title, true, right);
-    put_overlay_text(&mut fb, left + 3, top + 3, "stage: ", text, false, right);
-    put_overlay_text(&mut fb, left + 10, top + 3, stage, text, false, right);
+    let stage_changed = unsafe { QUICKINIT_RENDERED_STAGE != stage };
+    if first_draw || stage_changed {
+        put_overlay_text_padded(&mut fb, left + 3, top + 3, stage, text, right);
+        unsafe { QUICKINIT_RENDERED_STAGE = stage };
+    }
 
     let bar_width = QUICKINIT_WIDTH - 16;
     let filled = bar_width * percent as usize / 100;
-    put_overlay_char(&mut fb, left + 3, top + 5, b'[', border);
-    for index in 0..bar_width {
-        put_overlay_char(
-            &mut fb,
-            left + 4 + index,
-            top + 5,
-            if index < filled { b'#' } else { b'.' },
-            if index < filled { progress } else { 0x68707c },
-        );
+    let old_percent = unsafe { QUICKINIT_RENDERED_PERCENT };
+    let old_filled = bar_width * old_percent as usize / 100;
+    if first_draw || unsafe { !QUICKINIT_RENDERED_PROGRESS } {
+        put_overlay_symbol(&mut fb, left + 3, top + 5, '│', border);
+        put_overlay_symbol(&mut fb, left + 4 + bar_width, top + 5, '│', border);
     }
-    put_overlay_char(&mut fb, left + 4 + bar_width, top + 5, b']', border);
-    put_overlay_text(
-        &mut fb,
-        left + 7 + bar_width,
-        top + 5,
-        " ",
-        percent_color,
-        false,
-        right,
-    );
-    put_overlay_percent(
-        &mut fb,
-        left + 8 + bar_width,
-        top + 5,
-        percent,
-        percent_color,
-    );
-    put_overlay_text(
-        &mut fb,
-        left + 3,
-        top + 7,
-        "kernel -> userspace handoff",
-        0x8b949e,
-        false,
-        right,
-    );
+    for index in 0..bar_width {
+        if first_draw || (index < filled) != (index < old_filled) {
+            put_overlay_symbol(
+                &mut fb,
+                left + 4 + index,
+                top + 5,
+                if index < filled { '■' } else { '□' },
+                if index < filled { progress } else { 0x68707c },
+            );
+        }
+    }
+    let new_percent = percent_cells(percent);
+    let old_percent = percent_cells(old_percent);
+    for (offset, (&new, &old)) in new_percent.iter().zip(old_percent.iter()).enumerate() {
+        if first_draw || new != old {
+            put_overlay_char(
+                &mut fb,
+                left + 8 + bar_width + offset,
+                top + 5,
+                new,
+                percent_color,
+            );
+        }
+    }
+    unsafe {
+        QUICKINIT_RENDERED_PERCENT = percent;
+        QUICKINIT_RENDERED_PROGRESS = true;
+    }
 }
 
 fn quickinit_overlay_geometry(raw: RawFramebuffer) -> Option<(usize, usize)> {
@@ -344,25 +363,30 @@ fn put_overlay_text(
     }
 }
 
-fn put_overlay_percent(
+fn put_overlay_text_padded(
     fb: &mut framebuffer::Fb,
     column: usize,
     row: usize,
-    percent: u8,
+    text: &str,
     color: u32,
+    right: usize,
 ) {
+    let width = right.saturating_sub(column);
+    for offset in 0..width {
+        let byte = text.as_bytes().get(offset).copied().unwrap_or(b' ');
+        put_overlay_char(fb, column + offset, row, byte, color);
+    }
+}
+
+fn percent_cells(percent: u8) -> [u8; 4] {
     let percent = percent.min(100);
     if percent == 100 {
-        put_overlay_char(fb, column, row, b'1', color);
-        put_overlay_char(fb, column + 1, row, b'0', color);
-        put_overlay_char(fb, column + 2, row, b'0', color);
+        [b'1', b'0', b'0', b'%']
     } else if percent >= 10 {
-        put_overlay_char(fb, column, row, b'0' + percent / 10, color);
-        put_overlay_char(fb, column + 1, row, b'0' + percent % 10, color);
+        [b' ', b'0' + percent / 10, b'0' + percent % 10, b'%']
     } else {
-        put_overlay_char(fb, column, row, b'0' + percent, color);
+        [b' ', b' ', b'0' + percent, b'%']
     }
-    put_overlay_char(fb, column + 3, row, b'%', color);
 }
 
 fn put_overlay_char(fb: &mut framebuffer::Fb, column: usize, row: usize, byte: u8, color: u32) {
@@ -370,6 +394,23 @@ fn put_overlay_char(fb: &mut framebuffer::Fb, column: usize, row: usize, byte: u
         column * framebuffer::TERM_W,
         row * framebuffer::TERM_H,
         byte,
+        color,
+        0x000000,
+        false,
+    );
+}
+
+fn put_overlay_symbol(
+    fb: &mut framebuffer::Fb,
+    column: usize,
+    row: usize,
+    symbol: char,
+    color: u32,
+) {
+    fb.term_codepoint(
+        column * framebuffer::TERM_W,
+        row * framebuffer::TERM_H,
+        symbol as u32,
         color,
         0x000000,
         false,

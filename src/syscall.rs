@@ -1,6 +1,7 @@
 pub const ABI_VERSION: u16 = 1;
 pub const MAX_ARGS: usize = 6;
 const MAX_IO: usize = 1024;
+const MAX_PATH: usize = 256;
 
 pub type UserWord = u64;
 pub type UserPointer = u64;
@@ -18,6 +19,7 @@ pub enum Number {
     GetTid = 186,
     Yield = 24,
     Sleep = 35,
+    Spawn = 400,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -34,7 +36,7 @@ pub struct Metadata {
     pub restart: RestartPolicy,
 }
 
-pub const TABLE: [Metadata; 9] = [
+pub const TABLE: [Metadata; 10] = [
     Metadata {
         number: Number::Read,
         name: "read",
@@ -89,6 +91,12 @@ pub const TABLE: [Metadata; 9] = [
         arguments: 1,
         restart: RestartPolicy::Restartable,
     },
+    Metadata {
+        number: Number::Spawn,
+        name: "spawn",
+        arguments: 2,
+        restart: RestartPolicy::Restartable,
+    },
 ];
 
 #[repr(C)]
@@ -108,6 +116,7 @@ impl Args {
 #[repr(u64)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Errno {
+    Enoent = 2,
     Ebadf = 9,
     Echild = 10,
     Eintr = 4,
@@ -235,6 +244,27 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
             Ok(()) => 0,
             Err(_) => Errno::Einval.return_value(),
         },
+        value if value == Number::Spawn as UserWord => {
+            let address = args.values[0];
+            let length = match usize::try_from(args.values[1]) {
+                Ok(length) if length != 0 && length <= MAX_PATH => length,
+                _ => return Errno::Einval.return_value(),
+            };
+            let mut path = [0u8; MAX_PATH];
+            if crate::usercopy::copy_from_user(address, &mut path[..length]).is_err() {
+                return Errno::Efault.return_value();
+            }
+            let path = match core::str::from_utf8(&path[..length]) {
+                Ok(path) if !path.as_bytes().contains(&0) => path,
+                _ => return Errno::Einval.return_value(),
+            };
+            match crate::service::spawn_user_path(path) {
+                Ok(process) => process as UserWord,
+                Err(crate::service::SpawnError::NotFound) => Errno::Enoent.return_value(),
+                Err(crate::service::SpawnError::Capacity) => Errno::Eagain.return_value(),
+                Err(_) => Errno::Einval.return_value(),
+            }
+        }
         _ => Errno::Enosys.return_value(),
     }
 }
@@ -258,7 +288,7 @@ pub const fn is_error(value: UserWord) -> bool {
 
 pub fn contract_self_check() {
     assert_eq!(ABI_VERSION, 1);
-    assert_eq!(TABLE.len(), 9);
+    assert_eq!(TABLE.len(), 10);
     assert!(TABLE.iter().all(|entry| entry.arguments <= MAX_ARGS as u8));
     assert_eq!(TABLE[0].number as UserWord, Number::Read as UserWord);
     assert!(TABLE.iter().all(|entry| !entry.name.is_empty()));
@@ -275,6 +305,7 @@ pub fn contract_self_check() {
     );
     let _pointer: UserPointer = 0;
     let _errno_values = [
+        Errno::Enoent,
         Errno::Ebadf,
         Errno::Echild,
         Errno::Eintr,
