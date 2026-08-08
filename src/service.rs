@@ -743,6 +743,10 @@ pub fn user_entry_self_check() -> bool {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         run_user_fixture(
+            crate::elf::quickinit_image(),
+            "quickinit-bootstrap",
+            option_env!("NORDIX_QUICKINIT_FIXTURE") == Some("external"),
+        ) && run_user_fixture(
             crate::elf::representative_image(),
             "nordix-rust-smoke",
             option_env!("NORDIX_RUST_FIXTURE") == Some("external"),

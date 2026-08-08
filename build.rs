@@ -35,6 +35,15 @@ fn main() {
 
     let fixtures = [
         (
+            "quickinit",
+            rootfs
+                .join("tests")
+                .join("quickinit")
+                .join(triple)
+                .join("nordix-quickinit.elf"),
+            "nordix-quickinit.elf",
+        ),
+        (
             "rust",
             rootfs
                 .join("tests")

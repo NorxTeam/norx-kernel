@@ -634,6 +634,10 @@ pub(crate) fn representative_image() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/nordix-userspace-smoke.elf"))
 }
 
+pub(crate) fn quickinit_image() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/nordix-quickinit.elf"))
+}
+
 pub(crate) fn representative_c_image() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/nordix-userspace-c.elf"))
 }
