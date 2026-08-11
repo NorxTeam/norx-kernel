@@ -73,6 +73,10 @@ pub fn read() -> Option<u8> {
     crate::arch::early_serial_read()
 }
 
+pub fn available() -> bool {
+    !FAILED.load(Ordering::Relaxed)
+}
+
 fn write_byte(byte: u8) -> bool {
     if FAILED.load(Ordering::Relaxed) {
         return false;

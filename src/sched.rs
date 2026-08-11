@@ -161,6 +161,7 @@ pub fn on_timer_tick() {
     crate::arch::without_interrupts(|| unsafe {
         let runtime = &mut *RUNTIME.0.get();
         TIMER_TICKS = TIMER_TICKS.saturating_add(1);
+        crate::process::wake_sleepers(crate::time::ticks());
         if let Some(id) = CURRENT {
             runtime.charge(id, 1, false);
         }

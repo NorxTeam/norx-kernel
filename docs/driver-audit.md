@@ -581,7 +581,9 @@ before unmount. Mount nodes carry source, parent, flags, and propagation
 metadata. Read-only mounts reject all mutating operations, and unmount rejects
 the root, child mounts, open handles, and live dentries. Namespace creation
 gets an independent root mount over the same validated ramfs backend; the
-fixed-capacity model is deliberate until process-visible file tables exist.
+fixed-capacity model is deliberate. Process-visible tables now hold bounded
+local VFS/pipe descriptors, while descriptor inheritance across concurrent
+processes remains part of the scheduler/spawn2 follow-up.
 
 The serial debugger exposes `vfs` inspection plus `vfs mount <target>`,
 `vfs umount <id>`, `vfs lookup <path>`, and `vfs namespace`. Thus mount sources

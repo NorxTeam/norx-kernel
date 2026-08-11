@@ -26,7 +26,8 @@ boot path is GRUB-based:
   six-word arguments, negative errno returns, and x86_64/aarch64 entry
   wrappers; user processes and process-owned user pages are not implemented.
 - The fixed-capacity process/thread/FD/credentials/exit-wait model is documented
-  in `docs/process-model.md`; runtime process creation is still deferred.
+  in `docs/process-model.md`; the embedded quickinit bootstrap runs as PID 1
+  during the ordered userspace hand-off and returns to the kernel recovery path.
 
 The current VFS is a bounded mount-tree smoke layer backed by an in-kernel RAM
 filesystem and contains `/hello.txt`. Norx is not production-ready. See the
@@ -77,6 +78,41 @@ For aarch64, set `NORX_DTB` to use a board-provided DTB. If it is unset, the
 script generates a QEMU `virt` DTB. `QEMU_MACHINE` can override the default
 QEMU machine, and `QEMU_SHARE` can point to the directory containing the EDK2
 firmware and variable files.
+
+On Windows, use the compact PowerShell wrapper when an ESP and UEFI vars file
+already exist:
+
+```powershell
+.\scripts\qemu-boot.ps1 x86_64 -TimeoutSeconds 60 -SerialLog build\qemu-x86.log
+.\scripts\qemu-boot.ps1 aarch64 -TimeoutSeconds 60 -SerialLog build\qemu-arm.log
+.\scripts\qemu-boot.ps1 x86_64 -Interactive
+```
+
+Pass `-Esp`, `-Vars`, or `-Marker 'kernel initialization complete'` when using
+another fixture. A timeout returns code `124` and preserves the serial log.
+
+### `nsh` interactive smoke
+
+After building the pinned Rust userspace fixtures, build the kernel with
+`RUN_NSH_SMOKE=1 REQUIRE_USERSPACE_FIXTURE=1`, refresh both ESP kernel images,
+and run the prompt-driven shell harness:
+
+```sh
+python3 ../toolchain/scripts/build-rust-userspace.py
+RUN_NSH_SMOKE=1 REQUIRE_USERSPACE_FIXTURE=1 PROFILE=release MODE=build ./scripts/run.sh x86_64
+RUN_NSH_SMOKE=1 REQUIRE_USERSPACE_FIXTURE=1 PROFILE=release MODE=build ./scripts/run.sh aarch64
+./scripts/nsh-smoke.sh x86_64
+./scripts/nsh-smoke.sh aarch64
+```
+
+The harness waits for every prompt and checks quoting, partial-line Ctrl-C
+interruption, parser errors, command lookup, pipeline, redirection,
+assignment, background-job, `source`, `exec`, and the explicit clean-exit
+marker. It stops when the shell reports that clean exit; the kernel's later
+service-supervisor checks are outside this shell-specific scenario.
+`QEMU_MEMORY`, `QEMU_ACCEL`, and `QEMU_MINIMAL_DEVICES` are optional
+environment overrides for constrained hosts; the default device and memory
+profile remains the normal graphical QEMU smoke profile.
 
 ## Serial debugger
 

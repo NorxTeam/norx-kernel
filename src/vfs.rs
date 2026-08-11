@@ -2,7 +2,7 @@ use core::ptr;
 
 const MAX_INODES: usize = 32;
 const MAX_CHILDREN: usize = 16;
-const MAX_OPEN_HANDLES: usize = 16;
+const MAX_OPEN_HANDLES: usize = 32;
 const MAX_MOUNTS: usize = 8;
 const MAX_NAMESPACES: usize = 4;
 const MAX_DENTRIES: usize = 16;
@@ -43,10 +43,32 @@ pub enum NodeType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStat {
+    pub inode: u32,
+    pub kind: NodeType,
+    pub mode: u16,
+    pub size: usize,
+    pub links: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    pub kind: NodeType,
+    pub mode: u16,
+    pub size: usize,
+    pub links: u32,
+    pub name: [u8; NAME_MAX],
+    pub name_length: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenOptions {
     pub read: bool,
     pub write: bool,
     pub create: bool,
+    pub truncate: bool,
+    pub append: bool,
+    pub mode: u16,
 }
 
 impl OpenOptions {
@@ -55,6 +77,9 @@ impl OpenOptions {
             read: true,
             write: false,
             create: false,
+            truncate: false,
+            append: false,
+            mode: 0o644,
         }
     }
 
@@ -63,6 +88,9 @@ impl OpenOptions {
             read: false,
             write: true,
             create: true,
+            truncate: false,
+            append: false,
+            mode: 0o644,
         }
     }
 
@@ -71,6 +99,31 @@ impl OpenOptions {
             read: true,
             write: true,
             create: true,
+            truncate: false,
+            append: false,
+            mode: 0o644,
+        }
+    }
+
+    pub const fn write_truncate() -> Self {
+        Self {
+            read: false,
+            write: true,
+            create: false,
+            truncate: true,
+            append: false,
+            mode: 0o644,
+        }
+    }
+
+    pub const fn write_append() -> Self {
+        Self {
+            read: false,
+            write: true,
+            create: false,
+            truncate: false,
+            append: true,
+            mode: 0o644,
         }
     }
 }
@@ -186,14 +239,28 @@ impl DentryHandle {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileHandle {
-    inode: u16,
-    mount: MountId,
     slot: u8,
-    offset: usize,
-    readable: bool,
-    writable: bool,
+    generation: u16,
+}
+
+impl FileHandle {
+    const TAG: u32 = 1 << 31;
+
+    pub const fn raw(self) -> u32 {
+        Self::TAG | ((self.generation as u32) << 8) | self.slot as u32
+    }
+
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        if raw & Self::TAG == 0 {
+            return None;
+        }
+        Some(Self {
+            slot: (raw & 0xff) as u8,
+            generation: ((raw >> 8) & 0x7fff_ffff) as u16,
+        })
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -264,6 +331,12 @@ struct HandleSlot {
     used: bool,
     mount: MountId,
     inode: u16,
+    generation: u16,
+    references: u16,
+    offset: usize,
+    readable: bool,
+    writable: bool,
+    append: bool,
 }
 
 impl HandleSlot {
@@ -271,6 +344,12 @@ impl HandleSlot {
         used: false,
         mount: MountId::ROOT,
         inode: 0,
+        generation: 0,
+        references: 0,
+        offset: 0,
+        readable: false,
+        writable: false,
+        append: false,
     };
 }
 
@@ -405,6 +484,11 @@ pub fn init() -> bool {
     if !write("/hello.txt", HELLO_TEXT) {
         let _ = unmount_ramfs();
         crate::bootlog::fail("ramfs initial file write failed");
+        return false;
+    }
+    if mkdir("/tmp").is_err() {
+        let _ = unmount_ramfs();
+        crate::bootlog::fail("ramfs temporary directory creation failed");
         return false;
     }
     if mount_tree_self_check().is_err() {
@@ -714,7 +798,7 @@ pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
                 }
                 (
                     mount,
-                    create_node_at(fs, parent, name, NodeType::Regular, 0o644)?,
+                    create_node_at(fs, parent, name, NodeType::Regular, options.mode & 0o777)?,
                 )
             }
             Err(error) => return Err(error),
@@ -732,6 +816,9 @@ pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
         if options.write && node.mode & 0o222 == 0 {
             return Err(Error::PermissionDenied);
         }
+        if options.truncate {
+            fs.inodes[inode as usize].size = 0;
+        }
         let Some((slot, handle)) = fs
             .handles
             .iter_mut()
@@ -743,14 +830,19 @@ pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
         handle.used = true;
         handle.mount = mount;
         handle.inode = inode;
+        handle.generation = (handle.generation.wrapping_add(1)) & 0x7fff;
+        if handle.generation == 0 {
+            handle.generation = 1;
+        }
+        handle.references = 1;
+        handle.offset = 0;
+        handle.readable = options.read;
+        handle.writable = options.write;
+        handle.append = options.append;
         fs.open_count += 1;
         Ok(FileHandle {
-            inode,
-            mount,
             slot: slot as u8,
-            offset: 0,
-            readable: options.read,
-            writable: options.write,
+            generation: handle.generation,
         })
     })
 }
@@ -758,83 +850,119 @@ pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
 pub fn close(handle: FileHandle) -> Result<(), Error> {
     with_fs(|fs| {
         let slot = validate_handle(fs, &handle)?;
-        fs.handles[slot] = HandleSlot::EMPTY;
-        fs.open_count = fs.open_count.saturating_sub(1);
+        let description = &mut fs.handles[slot];
+        description.references = description.references.saturating_sub(1);
+        if description.references == 0 {
+            fs.handles[slot] = HandleSlot::EMPTY;
+            fs.open_count = fs.open_count.saturating_sub(1);
+        }
         Ok(())
     })
 }
 
-pub fn read_handle(handle: &mut FileHandle, output: &mut [u8]) -> Result<usize, Error> {
+pub fn duplicate(handle: FileHandle) -> Result<FileHandle, Error> {
     with_fs(|fs| {
-        validate_handle(fs, handle)?;
-        if !handle.readable {
+        let slot = validate_handle(fs, &handle)?;
+        fs.handles[slot].references = fs.handles[slot]
+            .references
+            .checked_add(1)
+            .ok_or(Error::NoSpace)?;
+        Ok(handle)
+    })
+}
+
+pub fn read_handle(handle: FileHandle, output: &mut [u8]) -> Result<usize, Error> {
+    with_fs(|fs| {
+        let slot = validate_handle(fs, &handle)?;
+        if !fs.handles[slot].readable {
             return Err(Error::PermissionDenied);
         }
-        let inode = &fs.inodes[handle.inode as usize];
-        let available = inode.size.saturating_sub(handle.offset);
+        let inode_id = fs.handles[slot].inode;
+        let offset = fs.handles[slot].offset;
+        let inode = &fs.inodes[inode_id as usize];
+        let available = inode.size.saturating_sub(offset);
         let length = available.min(output.len());
         unsafe {
-            ptr::copy_nonoverlapping(
-                inode.data.as_ptr().add(handle.offset),
-                output.as_mut_ptr(),
-                length,
-            );
+            ptr::copy_nonoverlapping(inode.data.as_ptr().add(offset), output.as_mut_ptr(), length);
         }
-        handle.offset += length;
+        fs.handles[slot].offset += length;
         Ok(length)
     })
 }
 
-pub fn write_handle(handle: &mut FileHandle, input: &[u8]) -> Result<usize, Error> {
+pub fn write_handle(handle: FileHandle, input: &[u8]) -> Result<usize, Error> {
     with_fs(|fs| {
-        validate_handle(fs, handle)?;
-        if mount_flags(handle.mount)?.read_only {
+        let slot = validate_handle(fs, &handle)?;
+        let mount = fs.handles[slot].mount;
+        if mount_flags(mount)?.read_only {
             return Err(Error::ReadOnly);
         }
-        if !handle.writable {
+        if !fs.handles[slot].writable {
             return Err(Error::PermissionDenied);
         }
-        let inode = &mut fs.inodes[handle.inode as usize];
-        let end = handle
-            .offset
-            .checked_add(input.len())
-            .ok_or(Error::NoSpace)?;
+        let inode_id = fs.handles[slot].inode;
+        let append = fs.handles[slot].append;
+        let current_offset = fs.handles[slot].offset;
+        let inode = &mut fs.inodes[inode_id as usize];
+        let offset = if append { inode.size } else { current_offset };
+        let end = offset.checked_add(input.len()).ok_or(Error::NoSpace)?;
         if end > FILE_MAX {
             return Err(Error::NoSpace);
         }
         unsafe {
             ptr::copy_nonoverlapping(
                 input.as_ptr(),
-                inode.data.as_mut_ptr().add(handle.offset),
+                inode.data.as_mut_ptr().add(offset),
                 input.len(),
             );
         }
-        handle.offset = end;
+        fs.handles[slot].offset = end;
         inode.size = inode.size.max(end);
         Ok(input.len())
     })
 }
 
-pub fn seek(handle: &mut FileHandle, offset: isize) -> Result<usize, Error> {
+pub fn seek(handle: FileHandle, offset: isize) -> Result<usize, Error> {
     with_fs(|fs| {
-        validate_handle(fs, handle)?;
+        let slot = validate_handle(fs, &handle)?;
+        let current_offset = fs.handles[slot].offset;
         let next = if offset.is_negative() {
-            handle
-                .offset
+            current_offset
                 .checked_sub(offset.unsigned_abs())
                 .ok_or(Error::OffsetOutOfRange)?
         } else {
-            handle
-                .offset
+            current_offset
                 .checked_add(offset as usize)
                 .ok_or(Error::OffsetOutOfRange)?
         };
         if next > FILE_MAX {
             return Err(Error::OffsetOutOfRange);
         }
-        handle.offset = next;
+        fs.handles[slot].offset = next;
         Ok(next)
     })
+}
+
+pub fn close_raw(raw: u32) -> Result<(), Error> {
+    close(FileHandle::from_raw(raw).ok_or(Error::InvalidHandle)?)
+}
+
+pub fn duplicate_raw(raw: u32) -> Result<u32, Error> {
+    Ok(duplicate(FileHandle::from_raw(raw).ok_or(Error::InvalidHandle)?)?.raw())
+}
+
+pub fn read_raw(raw: u32, output: &mut [u8]) -> Result<usize, Error> {
+    read_handle(
+        FileHandle::from_raw(raw).ok_or(Error::InvalidHandle)?,
+        output,
+    )
+}
+
+pub fn write_raw(raw: u32, input: &[u8]) -> Result<usize, Error> {
+    write_handle(
+        FileHandle::from_raw(raw).ok_or(Error::InvalidHandle)?,
+        input,
+    )
 }
 
 pub fn chmod(path: &str, mode: u16) -> Result<(), Error> {
@@ -849,12 +977,16 @@ pub fn chmod(path: &str, mode: u16) -> Result<(), Error> {
 }
 
 pub fn mkdir(path: &str) -> Result<(), Error> {
+    mkdir_with_mode(path, 0o755)
+}
+
+pub fn mkdir_with_mode(path: &str, mode: u16) -> Result<(), Error> {
     with_fs(|fs| {
         let (mount, parent, name) = parent_and_name_mount(fs, path, NamespaceId::ROOT)?;
         if mount_flags(mount)?.read_only {
             return Err(Error::ReadOnly);
         }
-        create_node_at(fs, parent, name, NodeType::Directory, 0o755).map(|_| ())
+        create_node_at(fs, parent, name, NodeType::Directory, mode & 0o777).map(|_| ())
     })
 }
 
@@ -936,6 +1068,74 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), Error> {
     })
 }
 
+pub fn link(old_path: &str, new_path: &str) -> Result<(), Error> {
+    with_fs(|fs| {
+        let (old_mount, old_inode) = resolve_mount(fs, old_path, NamespaceId::ROOT)?;
+        if fs.inodes[old_inode as usize].kind == NodeType::Directory {
+            return Err(Error::IsDirectory);
+        }
+        let (new_mount, new_parent, new_name) =
+            parent_and_name_mount(fs, new_path, NamespaceId::ROOT)?;
+        if old_mount != new_mount {
+            return Err(Error::InvalidPath);
+        }
+        if mount_flags(new_mount)?.read_only {
+            return Err(Error::ReadOnly);
+        }
+        if find_child(fs, new_parent, new_name).is_some() {
+            return Err(Error::AlreadyExists);
+        }
+        add_child(fs, new_parent, new_name, old_inode)
+    })
+}
+
+pub fn stat(path: &str) -> Result<FileStat, Error> {
+    with_fs(|fs| {
+        let (_mount, inode) = resolve_mount(fs, path, NamespaceId::ROOT)?;
+        let node = fs.inodes[inode as usize];
+        Ok(FileStat {
+            inode: inode as u32,
+            kind: node.kind,
+            mode: node.mode,
+            size: node.size,
+            links: link_count(fs, inode),
+        })
+    })
+}
+
+pub fn read_dir(path: &str, output: &mut [DirectoryEntry]) -> Result<usize, Error> {
+    with_fs(|fs| {
+        let (_mount, inode) = resolve_mount(fs, path, NamespaceId::ROOT)?;
+        if fs.inodes[inode as usize].kind != NodeType::Directory {
+            return Err(Error::NotDirectory);
+        }
+        let mut count = 0;
+        for child in fs.inodes[inode as usize]
+            .children
+            .iter()
+            .filter(|child| child.used)
+        {
+            if count == output.len() {
+                break;
+            }
+            let child_inode = fs.inodes[child.inode as usize];
+            let mut name = [0; NAME_MAX];
+            let name_length = child.name.len as usize;
+            name[..name_length].copy_from_slice(&child.name.bytes[..name_length]);
+            output[count] = DirectoryEntry {
+                kind: child_inode.kind,
+                mode: child_inode.mode,
+                size: child_inode.size,
+                links: link_count(fs, child.inode),
+                name,
+                name_length,
+            };
+            count += 1;
+        }
+        Ok(count)
+    })
+}
+
 pub fn stats() -> Stats {
     let Ok(stats) = with_fs(|fs| {
         let mut files = 0;
@@ -978,18 +1178,27 @@ pub fn list(mut f: impl FnMut(&str, usize)) {
     });
 }
 
+fn link_count(fs: &FileSystem, inode: u16) -> u32 {
+    fs.inodes
+        .iter()
+        .flat_map(|parent| parent.children.iter())
+        .filter(|child| child.used && child.inode == inode)
+        .count()
+        .max(1) as u32
+}
+
 pub fn read(path: &str, output: &mut [u8; 255]) -> Option<usize> {
-    let mut handle = open(path, OpenOptions::read()).ok()?;
-    let result = read_handle(&mut handle, output).ok();
+    let handle = open(path, OpenOptions::read()).ok()?;
+    let result = read_handle(handle, output).ok();
     let _ = close(handle);
     result
 }
 
 pub fn write(path: &str, input: &[u8]) -> bool {
-    let Ok(mut handle) = open(path, OpenOptions::write_create()) else {
+    let Ok(handle) = open(path, OpenOptions::write_create()) else {
         return false;
     };
-    let result = write_handle(&mut handle, input).is_ok();
+    let result = write_handle(handle, input).is_ok();
     let _ = close(handle);
     result
 }
@@ -1067,14 +1276,36 @@ fn mount_tests() -> Result<(), Error> {
         return Err(Error::AlreadyMounted);
     }
     mkdir("/self-test")?;
-    let mut handle = open("/self-test/file", OpenOptions::read_write_create())?;
-    write_handle(&mut handle, b"abcdef")?;
-    seek(&mut handle, -4)?;
+    let handle = open("/self-test/file", OpenOptions::read_write_create())?;
+    write_handle(handle, b"abcdef")?;
+    seek(handle, -4)?;
     let mut output = [0u8; 3];
-    if read_handle(&mut handle, &mut output)? != 3 || output != *b"cde" {
+    if read_handle(handle, &mut output)? != 3 || output != *b"cde" {
         return Err(Error::OffsetOutOfRange);
     }
+    let duplicate = duplicate(handle)?;
+    let mut tail = [0u8; 1];
+    if read_handle(duplicate, &mut tail)? != 1 || tail != *b"f" {
+        return Err(Error::OffsetOutOfRange);
+    }
+    let mut eof = [0u8; 1];
+    if read_handle(handle, &mut eof)? != 0 {
+        return Err(Error::OffsetOutOfRange);
+    }
+    close(duplicate)?;
     close(handle)?;
+    let truncated = open("/self-test/file", OpenOptions::write_truncate())?;
+    write_handle(truncated, b"xy")?;
+    close(truncated)?;
+    let appended = open("/self-test/file", OpenOptions::write_append())?;
+    write_handle(appended, b"z")?;
+    close(appended)?;
+    let combined = open("/self-test/file", OpenOptions::read())?;
+    let mut combined_output = [0u8; 3];
+    if read_handle(combined, &mut combined_output)? != 3 || combined_output != *b"xyz" {
+        return Err(Error::OffsetOutOfRange);
+    }
+    close(combined)?;
     chmod("/self-test/file", 0o400)?;
     if !matches!(
         open("/self-test/file", OpenOptions::write_create()),
@@ -1318,12 +1549,13 @@ fn has_open_handle(fs: &FileSystem, inode: u16) -> bool {
 
 fn validate_handle(fs: &FileSystem, handle: &FileHandle) -> Result<usize, Error> {
     let slot = handle.slot as usize;
-    if slot >= MAX_OPEN_HANDLES
-        || !fs.handles[slot].used
-        || fs.handles[slot].mount != handle.mount
-        || fs.handles[slot].inode != handle.inode
-        || !fs.inodes[handle.inode as usize].used
-        || mount_node(handle.mount).is_err()
+    if slot >= MAX_OPEN_HANDLES || !fs.handles[slot].used {
+        return Err(Error::InvalidHandle);
+    }
+    let description = fs.handles[slot];
+    if description.generation != handle.generation
+        || !fs.inodes[description.inode as usize].used
+        || mount_node(description.mount).is_err()
     {
         return Err(Error::InvalidHandle);
     }

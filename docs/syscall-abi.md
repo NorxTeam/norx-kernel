@@ -1,7 +1,7 @@
 # Norx syscall ABI boundary
 
-The first ABI boundary is architecture-neutral and versioned as `ABI_VERSION =
-1` in `src/syscall.rs`. `Number` owns Linux-shaped syscall numbers, `Args`
+The ABI boundary is architecture-neutral and versioned as `ABI_VERSION =
+2` in `src/syscall.rs`. `Number` owns Linux-shaped syscall numbers, `Args`
 always carries six 64-bit words, and `Metadata` records argument count and
 restart policy. `Errno::return_value()` encodes failures as the unsigned
 two's-complement form of a negative errno, so both entry wrappers expose the
@@ -19,14 +19,51 @@ arguments, calls the same `syscall::dispatch`, restores the saved registers,
 and returns with `eret`. Unsupported numbers and currently unimplemented
 numbers both return `-ENOSYS` through the common dispatcher.
 
-The first runtime slice now handles `read`, `write`, `exit`, `wait`, `getpid`,
+The first runtime slice handles `read`, `write`, `exit`, `wait`, `getpid`,
 `gettid`, `yield`, `sleep`, and `close` against the bounded process table.
 Every process starts with nonblocking fd 0 and writable fds 1/2. `read` polls
-serial input and returns `-EAGAIN` when no byte is ready; `write` copies at most
-1024 bytes from the active user address space to the kernel console, which fans
-out to serial and the available graphical console. Neither call falls back to
-host I/O. Filesystem-backed descriptors and blocking device streams remain
-follow-up work.
+serial input and returns `-EAGAIN` when no byte is ready; VFS-backed descriptors
+use the shared open-file offset, while pipe descriptors expose bounded
+`EAGAIN`/EOF/`EPIPE` behavior. `write` copies at most 1024 bytes from the active
+user address space to the kernel console or selected descriptor. Neither call
+falls back to host I/O; concurrent blocking streams remain follow-up work.
+
+## v2 process-I/O and filesystem extension boundary
+
+ABI version 2 retains the process-I/O calls and publishes the bounded
+filesystem calls needed by the first coreutils port. The numbers and layouts
+are frozen so kernel, Rust, and C implementations cannot drift:
+
+| Call | Number | Shape |
+| --- | ---: | --- |
+| `open` | 2 | path pointer, byte length, flags, mode |
+| `pipe` | 22 | `PipeFds*`, flags |
+| `dup2` | 33 | old fd, new fd |
+| `wait_status` | 402 | child/group, `WaitStatus*`, options |
+| `spawn2` | 401 | `SpawnSpec*` |
+| `setpgid` / `getpgid` | 403 / 404 | process and group IDs |
+| `killpg` | 405 | process group, signal |
+| `tty_get_foreground` / `tty_set_foreground` | 406 / 407 | tty fd and process group |
+| `mkdir` / `rmdir` / `unlink` | 420 / 421 / 422 | path pointer, byte length, mode only for `mkdir` |
+| `rename` / `link` | 423 / 424 | two path pointer/length pairs |
+| `stat` | 425 | path pointer/length, `Stat*` |
+| `read_dir` | 426 | path pointer/length, bounded `DirEntry*` array, capacity |
+
+`PipeFds` is two 64-bit words. `WaitStatus` is four C-layout words: a kind
+(`exited`, `signaled`, `stopped`, or `continued`), signed exit code, signal,
+and reserved word. `SpawnSpec` is eleven 64-bit words containing copied path,
+argument/environment vectors, stdio fds, process group, and flags. Open flags
+are `READ`, `WRITE`, `CREATE`, `TRUNCATE`, and `APPEND`; spawn flags are
+`NEW_PROCESS_GROUP` and `FOREGROUND`.
+
+The kernel implements bounded `open`, VFS-backed `read`/`write`/`close`,
+`pipe`, `dup2`, synchronous `wait_status`, process-group authorization, a
+single serial controlling-TTY ownership backend, and a static-image `spawn2`
+path that copies bounded argv/environment strings, inherits requested standard
+descriptors, publishes a ready child, and switches through a cooperative
+syscall-boundary continuation. The filesystem extension exposes regular files
+and directories, fixed-size metadata, hard links, and bounded directory
+records. Symlink nodes, locale state, and host I/O are not part of this ABI.
 
 `Timespec` is explicitly two signed 64-bit fields; user pointers and words are
 64-bit at this stage. `RestartPolicy` is metadata for the blocking boundary.
@@ -39,11 +76,10 @@ The current `usercopy` boundary validates null/canonical/overflow/size rules.
 x86_64 uses an IDT assembly shim with an active-copy range and recovery RIP;
 aarch64 uses the corresponding SVC-vector data-abort path and ELR recovery.
 Both return an `EFAULT`-class result for an unmapped copy without entering the
-fatal exception path. No syscall currently accepts a user pointer, so the
-copy boundary is the only TOCTOU surface; each operation copies into or out of
-a caller-owned kernel slice in one bounded operation. Process-owned page
-tables and multi-step TOCTOU pinning remain prerequisites for future pointer-
-accepting syscalls.
+fatal exception path. Pointer-accepting calls copy into or out of bounded
+kernel-owned arrays; path and vector lengths are checked before every copy.
+Multi-step TOCTOU pinning remains a future requirement for unbounded APIs, but
+the v2 records never expose kernel pointers or host descriptors.
 
 The public C header and ABI smoke example live under the shared
 `BoaKernel/userspace` tree: `include/norx/syscall.h` and

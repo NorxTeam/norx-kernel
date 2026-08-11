@@ -8,6 +8,7 @@ pub const DIRECT_MAP_BASE: usize = 0xffff_8000_0000_0000;
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_USER: u64 = 1 << 2;
+const PTE_HUGE: u64 = 1 << 7;
 const PTE_NX: u64 = 1 << 63;
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 
@@ -49,13 +50,14 @@ pub fn init_direct_map() -> bool {
         let cr0 = disable_write_protect();
         let mut mapped = true;
         let mut physical = 0usize;
+        const HUGE_PAGE_BYTES: usize = 2 * 1024 * 1024;
         while physical < DIRECT_MAP_BYTES {
-            if !map_to(DIRECT_MAP_BASE + physical, physical as u64) {
+            if !map_huge_to(DIRECT_MAP_BASE + physical, physical as u64) {
                 mapped = false;
                 break;
             }
-            physical += 4096;
-            if physical.is_multiple_of(4096 * 256) {
+            physical += HUGE_PAGE_BYTES;
+            if physical.is_multiple_of(HUGE_PAGE_BYTES * 2) {
                 crate::bootlog::pulse();
             }
         }
@@ -368,6 +370,27 @@ unsafe fn map_page_inner(virtual_address: usize) -> bool {
 
 unsafe fn map_to(virtual_address: usize, frame: u64) -> bool {
     map_to_flags(virtual_address, frame, PTE_PRESENT | PTE_WRITABLE)
+}
+
+unsafe fn map_huge_to(virtual_address: usize, frame: u64) -> bool {
+    let p4_i = (virtual_address >> 39) & 0x1ff;
+    let p3_i = (virtual_address >> 30) & 0x1ff;
+    let p2_i = (virtual_address >> 21) & 0x1ff;
+
+    let cr3 = current_cr3();
+    let p4 = (cr3 & 0x000f_ffff_ffff_f000) as *mut u64;
+    let Some(p3) = next_table(p4.add(p4_i)) else {
+        return false;
+    };
+    let Some(p2) = next_table(p3.add(p3_i)) else {
+        return false;
+    };
+    let entry = p2.add(p2_i);
+    if *entry & PTE_PRESENT != 0 {
+        return false;
+    }
+    *entry = frame | PTE_PRESENT | PTE_WRITABLE | PTE_HUGE;
+    true
 }
 
 unsafe fn map_to_flags(virtual_address: usize, frame: u64, flags: u64) -> bool {

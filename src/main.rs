@@ -28,6 +28,7 @@ mod memory;
 #[cfg(target_arch = "x86_64")]
 mod net;
 mod paging;
+mod pipe;
 mod process;
 mod sched;
 mod serial_debugger;
@@ -35,6 +36,7 @@ mod service;
 mod syscall;
 mod time;
 mod timer;
+mod tty;
 mod user_runtime;
 mod usercopy;
 mod vfs;
@@ -232,6 +234,8 @@ pub fn kernel_start() -> ! {
         "capability authorization checks passed; UID alone cannot bypass privileged operations",
     );
     ipc::contract_self_check();
+    pipe::contract_self_check();
+    tty::contract_self_check();
     bootlog::ok(
         "IPC channel, shared-memory ring, event queue, wait-queue, ownership, and blocking checks passed",
     );
@@ -240,8 +244,10 @@ pub fn kernel_start() -> ! {
         "driver-service supervisor lifecycle, user-thread attachment, restart, and resource revoke checks passed",
     );
     if process::init_runtime() {
+        tty::init();
+        tty::runtime_contract_self_check();
         bootlog::ok(
-            "process runtime initialized with init PID/TID and safe syscall scheduling boundary",
+            "process runtime initialized with init PID/TID, FD lifecycle, process groups, and serial TTY boundary",
         );
         syscall::runtime_contract_self_check();
         bootlog::ok("syscall exit/wait/getpid/gettid/yield/sleep/close runtime checks passed");
@@ -308,9 +314,9 @@ pub fn kernel_start() -> ! {
     bootlog::start(1, "checking userspace init boundary");
     let userspace_init_ok = service::user_entry_self_check();
     if userspace_init_ok {
-        bootlog::ok("userspace init boundary passed; quickinit runs outside the kernel");
+        bootlog::ok("quickinit PID 1 hand-off passed; kernel boot log sequence resumed");
     } else {
-        bootlog::warn("userspace init boundary incomplete; quickinit recovery path remains active");
+        bootlog::fail("quickinit PID 1 unavailable; deterministic recovery path remains active");
     }
     bootlog::quickinit_overlay_stage("starting system services", 93);
     bootlog::start(1, "probing runtime buses");
@@ -380,9 +386,9 @@ pub fn kernel_start() -> ! {
     bootlog::quickinit_overlay_stage("finalizing userspace services", 99);
     bootlog::start(2, "checking userspace init hand-off");
     if userspace_init_ok {
-        bootlog::ok("userspace init contract checked; quickinit remains outside the kernel");
+        bootlog::ok("quickinit PID 1 contract checked; kernel hand-off remains ordered");
     } else {
-        bootlog::warn("userspace init contract incomplete; recovery path remains active");
+        bootlog::warn("quickinit PID 1 contract failed; recovery path remains active");
     }
     bootlog::start(3, "finalizing kernel initialization");
     bootlog::ok("kernel initialization complete");

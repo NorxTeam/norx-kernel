@@ -743,31 +743,135 @@ pub fn user_entry_self_check() -> bool {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         crate::bootlog::quickinit_overlay_begin(crate::boot::info().framebuffer);
-        let quickinit_ok = run_user_fixture(
+        let quickinit_ok = run_init_fixture(
             crate::elf::quickinit_image(),
-            "quickinit-bootstrap",
+            "quickinit",
             option_env!("QUICKINIT_FIXTURE") == Some("external"),
         );
-        crate::bootlog::quickinit_overlay_finish(quickinit_ok);
-        let fixtures_ok = quickinit_ok
-            && run_user_fixture(
-                crate::elf::representative_image(),
-                "rust-smoke",
-                option_env!("RUST_FIXTURE") == Some("external"),
-            )
-            && run_user_fixture(
-                crate::elf::representative_c_image(),
-                "c-runtime",
-                option_env!("C_FIXTURE") == Some("external"),
-            )
-            && run_user_fixture(
-                crate::elf::representative_cxx_image(),
-                "cxx-runtime",
-                option_env!("CXX_FIXTURE") == Some("external"),
+        if !quickinit_ok {
+            crate::bootlog::quickinit_overlay_crash("quickinit PID 1 hand-off failed");
+            crate::bootlog::fail(
+                "quickinit PID 1 hand-off failed; deterministic recovery mode remains active",
             );
-        let ok = quickinit_ok && fixtures_ok;
-        ok
+            return false;
+        }
+        crate::bootlog::quickinit_overlay_finish(true);
+        let fixtures_ok = run_user_fixture(
+            crate::elf::representative_image(),
+            "rust-smoke",
+            option_env!("RUST_FIXTURE") == Some("external"),
+        ) && run_user_fixture(
+            crate::elf::representative_c_image(),
+            "c-runtime",
+            option_env!("C_FIXTURE") == Some("external"),
+        ) && run_user_fixture(
+            crate::elf::representative_cxx_image(),
+            "cxx-runtime",
+            option_env!("CXX_FIXTURE") == Some("external"),
+        );
+        let login_ok = if option_env!("LOGIN_SMOKE") == Some("enabled") {
+            run_user_fixture(
+                crate::elf::login_image(),
+                "login-smoke",
+                option_env!("LOGIN_FIXTURE") == Some("external"),
+            )
+        } else {
+            true
+        };
+        let shell_ok = if option_env!("NSH_SMOKE") == Some("enabled") {
+            run_user_fixture(
+                crate::elf::nsh_image(),
+                "nsh",
+                option_env!("NSH_FIXTURE") == Some("external"),
+            )
+        } else {
+            crate::bootlog::warn(
+                "nsh interactive smoke deferred; build with RUN_NSH_SMOKE=1 to launch the target shell",
+            );
+            true
+        };
+        quickinit_ok && fixtures_ok && shell_ok && login_ok
     }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn run_init_fixture(image: &[u8], label: &'static str, external: bool) -> bool {
+    crate::bootlog::quickinit_overlay_stage("creating PID 1", 12);
+    if !external {
+        crate::bootlog::warn_fmt(format_args!(
+            "{label}: external ELF is required for the PID 1 hand-off"
+        ));
+        return false;
+    }
+
+    let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE);
+    crate::bootlog::quickinit_overlay_stage("validating ELF", 28);
+    let plan = match crate::elf::parse(image, crate::elf::Machine::current(), load_bias) {
+        Ok(plan) => plan,
+        Err(error) => {
+            crate::bootlog::warn_fmt(format_args!("{label}: ELF validation failed: {:?}", error));
+            return false;
+        }
+    };
+    let arguments = [label.as_bytes()];
+    let environment: [&[u8]; 0] = [];
+    let mut runtime = match crate::user_runtime::NativeRuntime::prepare_image(
+        ProcessId::INIT,
+        image,
+        &plan,
+        crate::address_space::AslrHook::new(47),
+        &arguments,
+        &environment,
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            crate::bootlog::warn_fmt(format_args!(
+                "{label}: user image preparation failed: {:?}",
+                error
+            ));
+            return false;
+        }
+    };
+    let Some(root) = runtime.root_frame() else {
+        let _ = runtime.discard();
+        crate::bootlog::warn("quickinit: PID 1 address space has no root frame");
+        return false;
+    };
+    if crate::process::attach_address_space(ProcessId::INIT, root).is_err() {
+        let _ = runtime.discard();
+        crate::bootlog::warn("quickinit: PID 1 address-space attachment failed");
+        return false;
+    }
+    crate::bootlog::quickinit_overlay_stage("preparing PID 1 address space", 48);
+    if runtime.start().is_err() {
+        let _ = runtime.discard();
+        let _ = crate::process::clear_address_space(ProcessId::INIT);
+        crate::bootlog::warn("quickinit: PID 1 start failed");
+        return false;
+    }
+    crate::bootlog::quickinit_overlay_stage("entering PID 1", 68);
+    if runtime.enter_user().is_err() || !runtime.is_exited() {
+        let _ = runtime.discard();
+        let _ = crate::process::clear_address_space(ProcessId::INIT);
+        crate::bootlog::warn("quickinit: PID 1 returned without a clean exit");
+        return false;
+    }
+
+    let status = crate::process::init_exit_status().unwrap_or(-1);
+    let _ = crate::process::clear_address_space(ProcessId::INIT);
+    if crate::process::restore_init_after_user().is_err() {
+        crate::bootlog::warn("quickinit: kernel context restore after PID 1 failed");
+        return false;
+    }
+    crate::bootlog::quickinit_overlay_stage("reaping PID 1 children", 88);
+    if status != 0 {
+        crate::bootlog::warn_fmt(format_args!(
+            "quickinit: PID 1 exited with status={status}; recovery required"
+        ));
+        return false;
+    }
+    crate::bootlog::ok("quickinit: PID 1 hand-off complete; child reaped");
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -780,15 +884,32 @@ pub enum SpawnError {
     Runtime,
 }
 
-pub fn spawn_user_path(path: &str) -> Result<u32, SpawnError> {
-    let (image, label) = match path {
+const SPAWN_INHERIT_CREDENTIALS: u64 = 1 << 2;
+
+fn image_for_user_path<'a>(path: &'a str) -> Result<(&'static [u8], &'a str), SpawnError> {
+    let image = match path {
         "/bin/rust-smoke" | "/bin/userspace-smoke" => {
-            (crate::elf::representative_image(), "rust-smoke")
+            return Ok((crate::elf::representative_image(), "rust-smoke"));
         }
-        "/bin/c-runtime" => (crate::elf::representative_c_image(), "c-runtime"),
-        "/bin/cxx-runtime" => (crate::elf::representative_cxx_image(), "cxx-runtime"),
+        "/bin/c-runtime" => return Ok((crate::elf::representative_c_image(), "c-runtime")),
+        "/bin/cxx-runtime" => {
+            return Ok((crate::elf::representative_cxx_image(), "cxx-runtime"));
+        }
+        "/bin/nsh" => return Ok((crate::elf::nsh_image(), "nsh")),
+        "/bin/cat" | "/bin/echo" | "/bin/env" | "/bin/ls" | "/bin/pwd" | "/bin/mkdir"
+        | "/bin/rmdir" | "/bin/cp" | "/bin/mv" | "/bin/rm" | "/bin/touch" | "/bin/ln"
+        | "/bin/stat" | "/bin/find" | "/bin/grep" | "/bin/head" | "/bin/tail" | "/bin/sort"
+        | "/bin/wc" | "/bin/true" | "/bin/false" | "/bin/sleep" => crate::elf::coreutils_image(),
+        "/bin/userdb-smoke" => crate::elf::userdb_image(),
+        "/bin/getty-smoke" => crate::elf::getty_image(),
+        "/bin/login-smoke" => crate::elf::login_image(),
         _ => return Err(SpawnError::NotFound),
     };
+    Ok((image, path.strip_prefix("/bin/").unwrap_or(path)))
+}
+
+pub fn spawn_user_path(path: &str) -> Result<u32, SpawnError> {
+    let (image, label) = image_for_user_path(path)?;
     if path.as_bytes().contains(&0) {
         return Err(SpawnError::InvalidPath);
     }
@@ -798,8 +919,13 @@ pub fn spawn_user_path(path: &str) -> Result<u32, SpawnError> {
         .map_err(|_| SpawnError::InvalidState)?
         .ok_or(SpawnError::InvalidState)?;
     crate::arch::restore_kernel_address_space();
+    let capabilities = if label == "login-smoke" {
+        1u64 << (crate::process::Capability::SessionAdmin as u8)
+    } else {
+        0
+    };
     let credentials = Credentials {
-        capabilities: 0,
+        capabilities,
         ..Credentials::BOOTSTRAP
     };
     let (child, thread) =
@@ -862,6 +988,106 @@ pub fn spawn_user_path(path: &str) -> Result<u32, SpawnError> {
     Ok(child.get())
 }
 
+pub fn spawn_user_path_resumable(path: &str) -> Result<u32, SpawnError> {
+    let (_, label) = image_for_user_path(path)?;
+    let arguments = [label.as_bytes()];
+    spawn_user_path_resumable_with_args(path, &arguments, &[])
+}
+
+pub fn spawn_user_path_resumable_with_args(
+    path: &str,
+    arguments: &[&[u8]],
+    environment: &[&[u8]],
+) -> Result<u32, SpawnError> {
+    spawn_user_path_resumable_with_args_and_flags(path, arguments, environment, 0)
+}
+
+pub fn spawn_user_path_resumable_with_args_and_flags(
+    path: &str,
+    arguments: &[&[u8]],
+    environment: &[&[u8]],
+    flags: u64,
+) -> Result<u32, SpawnError> {
+    let (image, _label) = image_for_user_path(path)?;
+    if path.as_bytes().contains(&0) {
+        return Err(SpawnError::InvalidPath);
+    }
+    let parent = crate::process::current_process_id().ok_or(SpawnError::InvalidState)?;
+    let credentials = if flags & SPAWN_INHERIT_CREDENTIALS != 0 {
+        crate::process::current_credentials().map_err(|_| SpawnError::InvalidState)?
+    } else {
+        Credentials {
+            capabilities: 0,
+            ..Credentials::BOOTSTRAP
+        }
+    };
+    let (child, thread) =
+        crate::process::spawn_child_current(credentials).map_err(|error| match error {
+            crate::process::Error::ProcessCapacity | crate::process::Error::ThreadCapacity => {
+                SpawnError::Capacity
+            }
+            _ => SpawnError::InvalidState,
+        })?;
+    let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE);
+    let plan = match crate::elf::parse(image, crate::elf::Machine::current(), load_bias) {
+        Ok(plan) => plan,
+        Err(_) => {
+            let _ = crate::process::discard_child(parent, child);
+            return Err(SpawnError::Elf);
+        }
+    };
+    let mut runtime = match crate::user_runtime::NativeRuntime::prepare_image(
+        child,
+        image,
+        &plan,
+        crate::address_space::AslrHook::new(53),
+        &arguments,
+        &environment,
+    ) {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            let _ = crate::process::discard_child(parent, child);
+            return Err(SpawnError::Runtime);
+        }
+    };
+    let Some(root) = runtime.root_frame() else {
+        let mut runtime = runtime;
+        let _ = runtime.discard();
+        let _ = crate::process::discard_child(parent, child);
+        return Err(SpawnError::Runtime);
+    };
+    if runtime.activate_for_resumable().is_err() {
+        let mut runtime = runtime;
+        let _ = runtime.discard();
+        let _ = crate::process::discard_child(parent, child);
+        return Err(SpawnError::Runtime);
+    }
+    if crate::process::attach_address_space(child, root).is_err()
+        || crate::user_runtime::install(child, runtime).is_err()
+    {
+        let _ = crate::user_runtime::discard(child);
+        let _ = crate::process::clear_address_space(child);
+        let _ = crate::process::discard_child(parent, child);
+        return Err(SpawnError::Runtime);
+    }
+    let registers = match crate::user_runtime::start(child) {
+        Ok(registers) => registers,
+        Err(_) => {
+            let _ = crate::user_runtime::discard(child);
+            let _ = crate::process::clear_address_space(child);
+            let _ = crate::process::discard_child(parent, child);
+            return Err(SpawnError::Runtime);
+        }
+    };
+    if crate::process::install_user_context(thread.get(), registers).is_err() {
+        let _ = crate::user_runtime::discard(child);
+        let _ = crate::process::clear_address_space(child);
+        let _ = crate::process::discard_child(parent, child);
+        return Err(SpawnError::Runtime);
+    }
+    Ok(child.get())
+}
+
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn run_user_fixture(image: &[u8], label: &'static str, external: bool) -> bool {
     let quickinit = label == "quickinit-bootstrap";
@@ -869,7 +1095,11 @@ fn run_user_fixture(image: &[u8], label: &'static str, external: bool) -> bool {
         crate::bootlog::quickinit_overlay_stage("creating process", 12);
     }
     let credentials = Credentials {
-        capabilities: 0,
+        capabilities: if label == "login-smoke" {
+            1 << (crate::process::Capability::SessionAdmin as u8)
+        } else {
+            0
+        },
         ..Credentials::BOOTSTRAP
     };
     let (process, thread) = match crate::process::spawn_child_current(credentials) {
@@ -920,14 +1150,32 @@ fn run_user_fixture(image: &[u8], label: &'static str, external: bool) -> bool {
     if quickinit {
         crate::bootlog::quickinit_overlay_stage("preparing address space", 48);
     }
-    crate::process::switch_to_user(process, thread).unwrap();
-    if quickinit {
-        crate::bootlog::quickinit_overlay_stage("entering userspace", 68);
+    let resumable = label == "nsh" && external;
+    if resumable {
+        let registers = runtime.start().unwrap();
+        crate::user_runtime::install(process, runtime).unwrap();
+        crate::process::install_user_context(thread.get(), registers).unwrap();
+        crate::process::switch_to_user(process, thread).unwrap();
+        if quickinit {
+            crate::bootlog::quickinit_overlay_stage("entering userspace", 68);
+        }
+        crate::user_runtime::enter_resumable(process, true).unwrap();
+        let mut runtime = crate::user_runtime::take(process).unwrap();
+        let _ = runtime.discard();
+    } else {
+        crate::process::switch_to_user(process, thread).unwrap();
+        if quickinit {
+            crate::bootlog::quickinit_overlay_stage("entering userspace", 68);
+        }
+        let registers = runtime.start().unwrap();
+        if label == "login-smoke" {
+            crate::process::install_user_context(thread.get(), registers).unwrap();
+        }
+        runtime.enter_user().unwrap();
+        assert!(runtime.is_exited());
     }
-    runtime.start().unwrap();
-    runtime.enter_user().unwrap();
-    assert!(runtime.is_exited());
     assert_eq!(crate::process::current_ids(), None);
+    crate::process::clear_address_space(process).unwrap();
     crate::process::restore_init().unwrap();
     if quickinit {
         crate::bootlog::quickinit_overlay_stage("reaping child", 88);

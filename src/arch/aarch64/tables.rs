@@ -6,9 +6,6 @@ struct KernelStack([u8; 512 * 1024]);
 #[no_mangle]
 static mut norx_aarch64_kernel_stack: KernelStack = KernelStack([0; 512 * 1024]);
 
-#[no_mangle]
-static mut norx_aarch64_vector_saved_x16: u64 = 0;
-
 global_asm!(
     r#"
     .align 11
@@ -61,9 +58,11 @@ norx_aarch64_exception_entry:
 
     .global norx_aarch64_sync_exception
 norx_aarch64_sync_exception:
+    stp x0, x16, [sp, #-32]!
+    stp x17, x18, [sp, #16]
     mrs x17, spsr_el1
     and x17, x17, #0xf
-    cbnz x17, 1f
+    cbnz x17, norx_aarch64_restore_kernel_frame
     adrp x18, norx_aarch64_user_depth
     add x18, x18, :lo12:norx_aarch64_user_depth
     ldr x17, [x18]
@@ -71,9 +70,6 @@ norx_aarch64_sync_exception:
     b.lo norx_aarch64_user_stack_fault
     cmp x17, #4
     b.hs norx_aarch64_user_stack_fault
-    adrp x18, norx_aarch64_vector_saved_x16
-    add x18, x18, :lo12:norx_aarch64_vector_saved_x16
-    str x16, [x18]
     mov x17, #1
     msr spsel, x17
     adrp x17, norx_aarch64_kernel_stack
@@ -87,10 +83,14 @@ norx_aarch64_sync_exception:
     add x17, x17, x16
     sub x17, x17, x18
     mov sp, x17
-    adrp x17, norx_aarch64_vector_saved_x16
-    add x17, x17, :lo12:norx_aarch64_vector_saved_x16
-    ldr x16, [x17]
-1:
+    ldp x0, x16, [sp, #-32]
+    ldp x17, x18, [sp, #-16]
+    b norx_aarch64_exception_frame
+norx_aarch64_restore_kernel_frame:
+    ldp x0, x16, [sp]
+    ldp x17, x18, [sp, #16]
+    add sp, sp, #32
+norx_aarch64_exception_frame:
     sub sp, sp, #160
     stp x1, x2, [sp, #0]
     stp x3, x4, [sp, #16]
@@ -101,6 +101,7 @@ norx_aarch64_sync_exception:
     stp x13, x14, [sp, #96]
     stp x29, x30, [sp, #112]
     stp x15, x16, [sp, #128]
+    stp x17, x18, [sp, #144]
     mrs x9, CurrentEL
     ubfx x9, x9, #2, #2
     cmp x9, #1
@@ -168,7 +169,10 @@ norx_aarch64_sync_exception:
     mov x5, x13
     mov x6, x14
     bl norx_aarch64_syscall_rust
-    mov x9, #-2
+    mov x9, #-4098
+    cmp x0, x9
+    b.eq 10f
+    mov x9, #-4097
     cmp x0, x9
     b.eq 8f
     ldp x1, x2, [sp, #0]
@@ -180,7 +184,104 @@ norx_aarch64_sync_exception:
     ldp x13, x14, [sp, #96]
     ldp x29, x30, [sp, #112]
     ldp x15, x16, [sp, #128]
+    ldp x17, x18, [sp, #144]
     add sp, sp, #160
+    eret
+10:
+    mrs x9, sp_el0
+    adrp x10, SWITCH_SAVED_SP
+    add x10, x10, :lo12:SWITCH_SAVED_SP
+    str x9, [x10]
+    mrs x9, elr_el1
+    adrp x10, SWITCH_SAVED_PC
+    add x10, x10, :lo12:SWITCH_SAVED_PC
+    str x9, [x10]
+    mrs x9, spsr_el1
+    adrp x10, SWITCH_SAVED_PSTATE
+    add x10, x10, :lo12:SWITCH_SAVED_PSTATE
+    str x9, [x10]
+    adrp x10, SWITCH_SAVED_X19
+    add x10, x10, :lo12:SWITCH_SAVED_X19
+    str x19, [x10]
+    adrp x10, SWITCH_SAVED_X20
+    add x10, x10, :lo12:SWITCH_SAVED_X20
+    str x20, [x10]
+    adrp x10, SWITCH_SAVED_X21
+    add x10, x10, :lo12:SWITCH_SAVED_X21
+    str x21, [x10]
+    adrp x10, SWITCH_SAVED_X22
+    add x10, x10, :lo12:SWITCH_SAVED_X22
+    str x22, [x10]
+    adrp x10, SWITCH_SAVED_X23
+    add x10, x10, :lo12:SWITCH_SAVED_X23
+    str x23, [x10]
+    adrp x10, SWITCH_SAVED_X24
+    add x10, x10, :lo12:SWITCH_SAVED_X24
+    str x24, [x10]
+    adrp x10, SWITCH_SAVED_X25
+    add x10, x10, :lo12:SWITCH_SAVED_X25
+    str x25, [x10]
+    adrp x10, SWITCH_SAVED_X26
+    add x10, x10, :lo12:SWITCH_SAVED_X26
+    str x26, [x10]
+    adrp x10, SWITCH_SAVED_X27
+    add x10, x10, :lo12:SWITCH_SAVED_X27
+    str x27, [x10]
+    adrp x10, SWITCH_SAVED_X28
+    add x10, x10, :lo12:SWITCH_SAVED_X28
+    str x28, [x10]
+    adrp x10, SWITCH_SAVED_X29
+    add x10, x10, :lo12:SWITCH_SAVED_X29
+    str x29, [x10]
+    adrp x10, SWITCH_SAVED_X30
+    add x10, x10, :lo12:SWITCH_SAVED_X30
+    str x30, [x10]
+    mov x1, x0
+    mov x0, sp
+    bl norx_aarch64_switch_user_rust
+    cbz x0, 8f
+    mov x20, x0
+    adrp x9, norx_aarch64_kernel_stack
+    add x9, x9, :lo12:norx_aarch64_kernel_stack
+    adrp x10, norx_aarch64_user_depth
+    add x10, x10, :lo12:norx_aarch64_user_depth
+    ldr x10, [x10]
+    lsl x10, x10, #17
+    mov x11, #8
+    lsl x11, x11, #16
+    add x9, x9, x11
+    sub x9, x9, x10
+    mov sp, x9
+    ldr x0, [x20, #24]
+    ldp x1, x2, [x20, #32]
+    ldp x3, x4, [x20, #48]
+    ldp x5, x6, [x20, #64]
+    ldp x7, x8, [x20, #80]
+    ldp x9, x10, [x20, #96]
+    ldp x11, x12, [x20, #112]
+    ldp x13, x14, [x20, #128]
+    ldp x15, x16, [x20, #144]
+    ldr x17, [x20, #160]
+    ldr x18, [x20, #168]
+    ldr x19, [x20, #176]
+    ldr x21, [x20, #192]
+    ldr x22, [x20, #200]
+    ldr x23, [x20, #208]
+    ldr x24, [x20, #216]
+    ldr x25, [x20, #224]
+    ldr x26, [x20, #232]
+    ldr x27, [x20, #240]
+    ldr x28, [x20, #248]
+    ldr x29, [x20, #256]
+    ldr x30, [x20, #264]
+    ldr x9, [x20, #0]
+    msr elr_el1, x9
+    ldr x9, [x20, #16]
+    msr spsr_el1, x9
+    ldr x9, [x20, #8]
+    msr sp_el0, x9
+    ldr x9, [x20, #96]
+    ldr x20, [x20, #184]
     eret
 8:
     adrp x9, norx_aarch64_user_depth
@@ -250,6 +351,7 @@ norx_aarch64_sync_exception:
     ldp x13, x14, [sp, #96]
     ldp x29, x30, [sp, #112]
     ldp x15, x16, [sp, #128]
+    ldp x17, x18, [sp, #144]
     mov x0, #14
     add sp, sp, #160
     eret

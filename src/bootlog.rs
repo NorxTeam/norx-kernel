@@ -13,11 +13,11 @@ pub enum Status {
 static mut ACTIVE_MESSAGE: Option<&'static str> = None;
 static mut SPIN_FRAME: u8 = 0;
 static mut QUICKINIT_FRAMEBUFFER: Option<RawFramebuffer> = None;
-static mut QUICKINIT_STAGE: &'static str = "starting quickinit";
+static mut QUICKINIT_STAGE: &str = "starting quickinit";
 static mut QUICKINIT_PERCENT: u8 = 0;
 static mut QUICKINIT_ACTIVE: bool = false;
 static mut QUICKINIT_DRAWN: bool = false;
-static mut QUICKINIT_RENDERED_STAGE: &'static str = "";
+static mut QUICKINIT_RENDERED_STAGE: &str = "";
 static mut QUICKINIT_RENDERED_PERCENT: u8 = 0;
 static mut QUICKINIT_RENDERED_PROGRESS: bool = false;
 
@@ -28,7 +28,7 @@ impl Status {
     fn label(self) -> &'static str {
         match self {
             Status::Ok => "  OK  ",
-            Status::Fail => "FAILED",
+            Status::Fail => " FAIL ",
             Status::Warn => " WARN ",
             Status::Spin(frame) => match frame & 7 {
                 0 => "  >   ",
@@ -399,7 +399,7 @@ fn put_overlay_text_padded(
 fn percent_cells(percent: u8) -> [u8; 4] {
     let percent = percent.min(100);
     if percent == 100 {
-        [b'1', b'0', b'0', b'%']
+        *b"100%"
     } else if percent >= 10 {
         [b' ', b'0' + percent / 10, b'0' + percent % 10, b'%']
     } else {

@@ -300,3 +300,15 @@ pub fn zero_physical_page(physical: crate::address::PhysAddr) -> bool {
 pub fn enter_user(registers: crate::elf::InitialRegisters) -> bool {
     syscall::enter_user(registers)
 }
+
+pub fn install_user_context(thread: u32, registers: crate::elf::InitialRegisters) -> bool {
+    syscall::install_user_context(thread, registers)
+}
+
+pub fn request_user_switch(from: u32, to: u32) {
+    syscall::request_user_switch(from, to)
+}
+
+pub fn has_user_context(thread: u32) -> bool {
+    syscall::has_user_context(thread)
+}

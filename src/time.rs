@@ -1,7 +1,7 @@
 static mut BOOT_TICKS: u64 = 0;
 static mut LAST_SCHEDULER_TICK: u64 = 0;
 
-const SCHEDULER_HZ: u64 = 100;
+pub const SCHEDULER_HZ: u64 = 100;
 const FALLBACK_TICKS_PER_SCHEDULER_TICK: u64 = 50_000_000;
 
 pub fn init() {
