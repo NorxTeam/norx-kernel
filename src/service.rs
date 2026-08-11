@@ -778,6 +778,15 @@ pub fn user_entry_self_check() -> bool {
         } else {
             true
         };
+        let passwd_ok = if option_env!("PASSWD_SMOKE") == Some("enabled") {
+            run_user_fixture(
+                crate::elf::passwd_image(),
+                "passwd-smoke",
+                option_env!("PASSWD_FIXTURE") == Some("external"),
+            )
+        } else {
+            true
+        };
         let shell_ok = if option_env!("NSH_SMOKE") == Some("enabled") {
             run_user_fixture(
                 crate::elf::nsh_image(),
@@ -790,7 +799,7 @@ pub fn user_entry_self_check() -> bool {
             );
             true
         };
-        quickinit_ok && fixtures_ok && shell_ok && login_ok
+        quickinit_ok && fixtures_ok && shell_ok && login_ok && passwd_ok
     }
 }
 
@@ -903,6 +912,7 @@ fn image_for_user_path<'a>(path: &'a str) -> Result<(&'static [u8], &'a str), Sp
         "/bin/userdb-smoke" => crate::elf::userdb_image(),
         "/bin/getty-smoke" => crate::elf::getty_image(),
         "/bin/login-smoke" => crate::elf::login_image(),
+        "/bin/passwd-smoke" => crate::elf::passwd_image(),
         _ => return Err(SpawnError::NotFound),
     };
     Ok((image, path.strip_prefix("/bin/").unwrap_or(path)))

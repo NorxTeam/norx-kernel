@@ -676,6 +676,10 @@ pub(crate) fn login_image() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/login-smoke.elf"))
 }
 
+pub(crate) fn passwd_image() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/passwd-smoke.elf"))
+}
+
 pub(crate) fn load_bias_for_image(image: &[u8], dynamic_bias: usize) -> usize {
     if image.len() >= 18 && u16::from_le_bytes([image[16], image[17]]) == ET_EXEC {
         0
