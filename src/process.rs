@@ -174,6 +174,7 @@ pub enum Capability {
     MemoryMap = 4,
     DeviceAdmin = 5,
     SessionAdmin = 6,
+    AccountAdmin = 8,
 }
 
 impl Credentials {
@@ -1559,6 +1560,8 @@ pub fn contract_self_check() {
         Capability::NetRaw,
         Capability::MemoryMap,
         Capability::DeviceAdmin,
+        Capability::SessionAdmin,
+        Capability::AccountAdmin,
     ];
     let mut table = ProcessTable::new();
     let (init, init_thread) = table.create_init().unwrap();

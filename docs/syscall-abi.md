@@ -48,12 +48,20 @@ are frozen so kernel, Rust, and C implementations cannot drift:
 | `rename` / `link` | 423 / 424 | two path pointer/length pairs |
 | `stat` | 425 | path pointer/length, `Stat*` |
 | `read_dir` | 426 | path pointer/length, bounded `DirEntry*` array, capacity |
+| `fsync` | 427 | writable fd |
+| `sync_path` | 428 | path pointer/length |
 
 `PipeFds` is two 64-bit words. `WaitStatus` is four C-layout words: a kind
 (`exited`, `signaled`, `stopped`, or `continued`), signed exit code, signal,
 and reserved word. `SpawnSpec` is eleven 64-bit words containing copied path,
 argument/environment vectors, stdio fds, process group, and flags. Open flags
-are `READ`, `WRITE`, `CREATE`, `TRUNCATE`, and `APPEND`; spawn flags are
+are `READ`, `WRITE`, `CREATE`, `TRUNCATE`, `APPEND`, and `EXCLUSIVE`;
+`EXCLUSIVE` requires `CREATE` and fails if the path already exists. `fsync`
+is the file durability boundary and `sync_path` is the publication boundary;
+the current RAMFS backend validates these boundaries and later block-backed
+filesystems must attach actual persistence there. Rename replaces an existing
+regular, unopened destination atomically and refuses directories or open
+destinations. Spawn flags are
 `NEW_PROCESS_GROUP` and `FOREGROUND`.
 
 The kernel implements bounded `open`, VFS-backed `read`/`write`/`close`,

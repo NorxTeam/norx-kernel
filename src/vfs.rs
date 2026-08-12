@@ -68,6 +68,7 @@ pub struct OpenOptions {
     pub create: bool,
     pub truncate: bool,
     pub append: bool,
+    pub exclusive: bool,
     pub mode: u16,
 }
 
@@ -79,6 +80,7 @@ impl OpenOptions {
             create: false,
             truncate: false,
             append: false,
+            exclusive: false,
             mode: 0o644,
         }
     }
@@ -90,6 +92,7 @@ impl OpenOptions {
             create: true,
             truncate: false,
             append: false,
+            exclusive: false,
             mode: 0o644,
         }
     }
@@ -101,6 +104,7 @@ impl OpenOptions {
             create: true,
             truncate: false,
             append: false,
+            exclusive: false,
             mode: 0o644,
         }
     }
@@ -112,6 +116,7 @@ impl OpenOptions {
             create: false,
             truncate: true,
             append: false,
+            exclusive: false,
             mode: 0o644,
         }
     }
@@ -123,6 +128,7 @@ impl OpenOptions {
             create: false,
             truncate: false,
             append: true,
+            exclusive: false,
             mode: 0o644,
         }
     }
@@ -789,6 +795,7 @@ pub fn release_dentry(handle: DentryHandle) -> Result<(), Error> {
 
 pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
     with_fs(|fs| {
+        let existed = resolve_mount(fs, path, NamespaceId::ROOT).is_ok();
         let (mount, inode) = match resolve_mount(fs, path, NamespaceId::ROOT) {
             Ok(result) => result,
             Err(Error::NotFound) if options.create => {
@@ -803,6 +810,9 @@ pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
             }
             Err(error) => return Err(error),
         };
+        if options.create && options.exclusive && existed {
+            return Err(Error::AlreadyExists);
+        }
         if (options.write || options.create) && mount_flags(mount)?.read_only {
             return Err(Error::ReadOnly);
         }
@@ -856,6 +866,13 @@ pub fn close(handle: FileHandle) -> Result<(), Error> {
             fs.handles[slot] = HandleSlot::EMPTY;
             fs.open_count = fs.open_count.saturating_sub(1);
         }
+        Ok(())
+    })
+}
+
+pub fn sync_path(path: &str) -> Result<(), Error> {
+    with_fs(|fs| {
+        let _ = resolve_mount(fs, path, NamespaceId::ROOT)?;
         Ok(())
     })
 }
@@ -1042,26 +1059,66 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), Error> {
         if mount_flags(old_mount)?.read_only {
             return Err(Error::ReadOnly);
         }
-        if find_child(fs, new_parent, new_name).is_some() {
-            return Err(Error::AlreadyExists);
+        if old_parent == new_parent && old_name == new_name {
+            return Ok(());
         }
         if fs.inodes[inode as usize].kind == NodeType::Directory
             && is_descendant(fs, new_parent, inode)
         {
             return Err(Error::InvalidPath);
         }
+        let old_slot = find_child_slot(fs, old_parent, old_name).ok_or(Error::NotFound)?;
+        let new_slot = find_child_slot(fs, new_parent, new_name);
+        let replaced = new_slot.map(|slot| fs.inodes[new_parent as usize].children[slot]);
+        if let Some(child) = replaced {
+            if fs.inodes[child.inode as usize].kind == NodeType::Directory {
+                return Err(Error::IsDirectory);
+            }
+            if has_open_handle(fs, child.inode) {
+                return Err(Error::Busy);
+            }
+        }
         if old_parent == new_parent {
-            let slot = find_child_slot(fs, old_parent, old_name).ok_or(Error::NotFound)?;
-            fs.inodes[old_parent as usize].children[slot].name = new_name;
+            fs.inodes[old_parent as usize].children[old_slot].name = new_name;
+            if let Some(slot) = new_slot {
+                let replaced = fs.inodes[new_parent as usize].children[slot];
+                fs.inodes[new_parent as usize].children[slot] = Child::EMPTY;
+                if replaced.inode != inode {
+                    fs.inodes[replaced.inode as usize] = Inode::EMPTY;
+                }
+            }
             return Ok(());
         }
-        if !has_free_child(fs, new_parent) {
+        if new_slot.is_none() && !has_free_child(fs, new_parent) {
             return Err(Error::NoSpace);
         }
-        remove_child(fs, old_parent, old_name)?;
-        if add_child(fs, new_parent, new_name, inode).is_err() {
-            let _ = add_child(fs, old_parent, old_name, inode);
+        let old_child = fs.inodes[old_parent as usize].children[old_slot];
+        fs.inodes[old_parent as usize].children[old_slot] = Child::EMPTY;
+        if let Some(slot) = new_slot {
+            fs.inodes[new_parent as usize].children[slot] = Child::EMPTY;
+        }
+        let destination_slot = new_slot.or_else(|| {
+            fs.inodes[new_parent as usize]
+                .children
+                .iter()
+                .position(|child| !child.used)
+        });
+        let Some(destination_slot) = destination_slot else {
+            fs.inodes[old_parent as usize].children[old_slot] = old_child;
+            if let (Some(slot), Some(child)) = (new_slot, replaced) {
+                fs.inodes[new_parent as usize].children[slot] = child;
+            }
             return Err(Error::NoSpace);
+        };
+        fs.inodes[new_parent as usize].children[destination_slot] = Child {
+            used: true,
+            inode,
+            name: new_name,
+        };
+        if let Some(child) = replaced {
+            if child.inode != inode {
+                fs.inodes[child.inode as usize] = Inode::EMPTY;
+            }
         }
         fs.inodes[inode as usize].parent = new_parent;
         Ok(())
@@ -1315,12 +1372,29 @@ fn mount_tests() -> Result<(), Error> {
     }
     chmod("/self-test/file", 0o644)?;
     rename("/self-test/file", "/self-test/renamed")?;
+    let replacement = open("/self-test/replacement", OpenOptions::read_write_create())?;
+    write_handle(replacement, b"old")?;
+    close(replacement)?;
+    let incoming = open("/self-test/incoming", OpenOptions::read_write_create())?;
+    write_handle(incoming, b"new")?;
+    close(incoming)?;
+    rename("/self-test/incoming", "/self-test/replacement")?;
+    let replaced = open("/self-test/replacement", OpenOptions::read())?;
+    let mut replacement_output = [0; 3];
+    if read_handle(replaced, &mut replacement_output)? != 3 || replacement_output != *b"new" {
+        return Err(Error::OffsetOutOfRange);
+    }
+    close(replaced)?;
+    if open("/self-test/incoming", OpenOptions::read()).is_ok() {
+        return Err(Error::AlreadyExists);
+    }
     let open_handle = open("/self-test/renamed", OpenOptions::read())?;
     if unmount_ramfs() != Err(Error::Busy) {
         return Err(Error::Busy);
     }
     close(open_handle)?;
     unlink("/self-test/renamed")?;
+    unlink("/self-test/replacement")?;
     remove_dir("/self-test")?;
     unmount_ramfs()?;
     mount_ramfs()

@@ -10,6 +10,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RUN_NSH_SMOKE");
     println!("cargo:rerun-if-env-changed=RUN_LOGIN_SMOKE");
     println!("cargo:rerun-if-env-changed=RUN_PASSWD_SMOKE");
+    println!("cargo:rerun-if-env-changed=RUN_USERCTL_SMOKE");
     println!("cargo:rerun-if-env-changed=REQUIRE_COREUTILS_FIXTURE");
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
@@ -128,6 +129,15 @@ fn main() {
                 .join("passwd-smoke.elf"),
             "passwd-smoke.elf",
         ),
+        (
+            "userctl",
+            rootfs
+                .join("tests")
+                .join("userctl")
+                .join(triple)
+                .join("userctl-smoke.elf"),
+            "userctl-smoke.elf",
+        ),
     ];
 
     for (name, source, destination_name) in fixtures {
@@ -167,6 +177,11 @@ fn main() {
         println!("cargo:rustc-env=PASSWD_SMOKE=enabled");
     } else {
         println!("cargo:rustc-env=PASSWD_SMOKE=disabled");
+    }
+    if env::var_os("RUN_USERCTL_SMOKE").is_some() {
+        println!("cargo:rustc-env=USERCTL_SMOKE=enabled");
+    } else {
+        println!("cargo:rustc-env=USERCTL_SMOKE=disabled");
     }
 }
 

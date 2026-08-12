@@ -48,6 +48,8 @@ pub enum Number {
     Link = 424,
     Stat = 425,
     ReadDir = 426,
+    Fsync = 427,
+    SyncPath = 428,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -64,7 +66,7 @@ pub struct Metadata {
     pub restart: RestartPolicy,
 }
 
-pub const TABLE: [Metadata; 31] = [
+pub const TABLE: [Metadata; 33] = [
     Metadata {
         number: Number::Read,
         name: "read",
@@ -251,6 +253,18 @@ pub const TABLE: [Metadata; 31] = [
         arguments: 4,
         restart: RestartPolicy::Never,
     },
+    Metadata {
+        number: Number::Fsync,
+        name: "fsync",
+        arguments: 1,
+        restart: RestartPolicy::Never,
+    },
+    Metadata {
+        number: Number::SyncPath,
+        name: "sync_path",
+        arguments: 2,
+        restart: RestartPolicy::Never,
+    },
 ];
 
 #[repr(C)]
@@ -404,6 +418,7 @@ pub const OPEN_WRITE: UserWord = 1 << 1;
 pub const OPEN_CREATE: UserWord = 1 << 2;
 pub const OPEN_TRUNCATE: UserWord = 1 << 3;
 pub const OPEN_APPEND: UserWord = 1 << 4;
+pub const OPEN_EXCLUSIVE: UserWord = 1 << 5;
 pub const PIPE_NONBLOCK: UserWord = 1 << 0;
 pub const SPAWN_NEW_PROCESS_GROUP: UserWord = 1 << 0;
 pub const SPAWN_FOREGROUND: UserWord = 1 << 1;
@@ -697,7 +712,10 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 spec.flags,
             ) {
                 Ok(child) => child,
-                Err(crate::service::SpawnError::NotFound) => return Errno::Enoent.return_value(),
+                Err(crate::service::SpawnError::NotFound) => {
+                    crate::bootlog::warn_fmt(format_args!("spawn2 path not found: {path}"));
+                    return Errno::Enoent.return_value();
+                }
                 Err(crate::service::SpawnError::Capacity) => return Errno::Eagain.return_value(),
                 Err(_) => return Errno::Einval.return_value(),
             };
@@ -839,7 +857,8 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 _ => return Errno::Einval.return_value(),
             };
             let flags = args.values[2];
-            let allowed = OPEN_READ | OPEN_WRITE | OPEN_CREATE | OPEN_TRUNCATE | OPEN_APPEND;
+            let allowed =
+                OPEN_READ | OPEN_WRITE | OPEN_CREATE | OPEN_TRUNCATE | OPEN_APPEND | OPEN_EXCLUSIVE;
             if flags & !allowed != 0 || flags & (OPEN_READ | OPEN_WRITE) == 0 {
                 return Errno::Einval.return_value();
             }
@@ -865,12 +884,16 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Ok(session) => session.umask,
                 Err(_) => return Errno::Einval.return_value(),
             };
+            if flags & OPEN_EXCLUSIVE != 0 && flags & OPEN_CREATE == 0 {
+                return Errno::Einval.return_value();
+            }
             let options = crate::vfs::OpenOptions {
                 read: flags & OPEN_READ != 0,
                 write: flags & OPEN_WRITE != 0,
                 create: flags & OPEN_CREATE != 0,
                 truncate: flags & OPEN_TRUNCATE != 0,
                 append: flags & OPEN_APPEND != 0,
+                exclusive: flags & OPEN_EXCLUSIVE != 0,
                 mode: requested_mode & !umask,
             };
             let handle = match crate::vfs::open(path, options) {
@@ -1039,6 +1062,37 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 }
             }
             count as UserWord
+        }
+        value if value == Number::Fsync as UserWord => {
+            let fd = match u32::try_from(args.values[0]) {
+                Ok(fd) => fd,
+                Err(_) => return Errno::Ebadf.return_value(),
+            };
+            let (open_file, _, _, writable) = match current_fd_info(fd) {
+                Ok(info) => info,
+                Err(errno) => return errno.return_value(),
+            };
+            if !writable {
+                return Errno::Ebadf.return_value();
+            }
+            match crate::vfs::FileHandle::from_raw(open_file)
+                .ok_or(crate::vfs::Error::InvalidHandle)
+                .and_then(|_| Ok(()))
+            {
+                Ok(()) => 0,
+                Err(error) => vfs_errno(error).return_value(),
+            }
+        }
+        value if value == Number::SyncPath as UserWord => {
+            let mut path_bytes = [0u8; MAX_PATH];
+            let path = match copy_user_path(args.values[0], args.values[1], &mut path_bytes) {
+                Ok(path) => path,
+                Err(errno) => return errno.return_value(),
+            };
+            match crate::vfs::sync_path(path) {
+                Ok(()) => 0,
+                Err(error) => vfs_errno(error).return_value(),
+            }
         }
         value if value == Number::Pipe as UserWord => {
             let address = args.values[0];
@@ -1407,7 +1461,7 @@ pub fn contract_self_check() {
     assert!(!is_error(EXIT_TO_KERNEL));
     assert!(!is_error(SWITCH_TO_USER));
     assert_ne!(EXIT_TO_KERNEL, SWITCH_TO_USER);
-    assert_eq!(TABLE.len(), 31);
+    assert_eq!(TABLE.len(), 33);
     assert!(TABLE.iter().all(|entry| entry.arguments <= MAX_ARGS as u8));
     assert_eq!(TABLE[0].number as UserWord, Number::Read as UserWord);
     assert!(TABLE.iter().all(|entry| !entry.name.is_empty()));

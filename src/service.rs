@@ -787,6 +787,15 @@ pub fn user_entry_self_check() -> bool {
         } else {
             true
         };
+        let userctl_ok = if option_env!("USERCTL_SMOKE") == Some("enabled") {
+            run_user_fixture(
+                crate::elf::userctl_image(),
+                "userctl-smoke",
+                option_env!("USERCTL_FIXTURE") == Some("external"),
+            )
+        } else {
+            true
+        };
         let shell_ok = if option_env!("NSH_SMOKE") == Some("enabled") {
             run_user_fixture(
                 crate::elf::nsh_image(),
@@ -799,7 +808,7 @@ pub fn user_entry_self_check() -> bool {
             );
             true
         };
-        quickinit_ok && fixtures_ok && shell_ok && login_ok && passwd_ok
+        quickinit_ok && fixtures_ok && shell_ok && login_ok && passwd_ok && userctl_ok
     }
 }
 
@@ -913,6 +922,7 @@ fn image_for_user_path<'a>(path: &'a str) -> Result<(&'static [u8], &'a str), Sp
         "/bin/getty-smoke" => crate::elf::getty_image(),
         "/bin/login-smoke" => crate::elf::login_image(),
         "/bin/passwd-smoke" => crate::elf::passwd_image(),
+        "/bin/userctl-smoke" => crate::elf::userctl_image(),
         _ => return Err(SpawnError::NotFound),
     };
     Ok((image, path.strip_prefix("/bin/").unwrap_or(path)))
@@ -929,10 +939,10 @@ pub fn spawn_user_path(path: &str) -> Result<u32, SpawnError> {
         .map_err(|_| SpawnError::InvalidState)?
         .ok_or(SpawnError::InvalidState)?;
     crate::arch::restore_kernel_address_space();
-    let capabilities = if label == "login-smoke" {
-        1u64 << (crate::process::Capability::SessionAdmin as u8)
-    } else {
-        0
+    let capabilities = match label {
+        "login-smoke" => 1u64 << (crate::process::Capability::SessionAdmin as u8),
+        "userctl-smoke" => 1u64 << (crate::process::Capability::AccountAdmin as u8),
+        _ => 0,
     };
     let credentials = Credentials {
         capabilities,
@@ -1105,10 +1115,10 @@ fn run_user_fixture(image: &[u8], label: &'static str, external: bool) -> bool {
         crate::bootlog::quickinit_overlay_stage("creating process", 12);
     }
     let credentials = Credentials {
-        capabilities: if label == "login-smoke" {
-            1 << (crate::process::Capability::SessionAdmin as u8)
-        } else {
-            0
+        capabilities: match label {
+            "login-smoke" => 1 << (crate::process::Capability::SessionAdmin as u8),
+            "userctl-smoke" => 1 << (crate::process::Capability::AccountAdmin as u8),
+            _ => 0,
         },
         ..Credentials::BOOTSTRAP
     };
