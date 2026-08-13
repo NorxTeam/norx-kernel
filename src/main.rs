@@ -98,6 +98,7 @@ pub fn kernel_start() -> ! {
     }
     bootlog::start(3, "initializing kernel clock");
     time::init();
+    time::contract_self_check();
     bootlog::ok("kernel clock initialized");
     bootlog::start(0, "probing built-in drivers");
     if drivers::init(boot.framebuffer) {
@@ -327,6 +328,46 @@ pub fn kernel_start() -> ! {
     } else {
         bootlog::fail("architecture-neutral page-fault contract unavailable");
     }
+    bootlog::start(1, "checking scheduler");
+    sched::self_check();
+    bootlog::ok("scheduler self-check passed");
+    bootlog::start(2, "initializing scheduler runtime");
+    sched::init_runtime();
+    bootlog::ok("scheduler runtime initialized");
+    bootlog::start(2, "checking timer source");
+    let timer_ready = timer::init();
+    if timer_ready {
+        bootlog::ok("hardware scheduler timer initialized");
+    } else {
+        bootlog::warn("hardware scheduler timer unavailable; using polling");
+    }
+    bootlog::start(3, "selecting timer source");
+    if timer_ready {
+        bootlog::ok("timer source irq");
+    } else {
+        bootlog::warn("timer source polling");
+    }
+    let scheduler_runtime_ok = sched::runtime_self_check(timer_ready);
+    if scheduler_runtime_ok {
+        let status = sched::status();
+        let irq = irq::stats();
+        bootlog::ok_fmt(format_args!(
+            "scheduler runtime verified hz={} mode={} ticks={} clock={} irq_timer={} irq_deferred_total={}",
+            time::scheduler_hz(),
+            if timer_ready { "irq" } else { "poll" },
+            status.timer_ticks,
+            status.clock,
+            irq.timer,
+            irq.deferred,
+        ));
+    } else {
+        let status = sched::status();
+        let irq = irq::stats();
+        bootlog::fail_fmt(format_args!(
+            "scheduler runtime accounting probe failed ticks={} clock={} irq_timer={} pending={}",
+            status.timer_ticks, status.clock, irq.timer, irq.timer_pending,
+        ));
+    }
     bootlog::start(1, "checking userspace init boundary");
     let userspace_init_ok = service::user_entry_self_check();
     if userspace_init_ok {
@@ -375,25 +416,6 @@ pub fn kernel_start() -> ! {
         bootlog::warn("network stack unsupported on aarch64 bring-up");
     }
     bootlog::quickinit_overlay_stage("initializing virtual memory", 96);
-    bootlog::start(1, "checking scheduler");
-    sched::self_check();
-    bootlog::ok("scheduler self-check passed");
-    bootlog::start(2, "initializing scheduler runtime");
-    sched::init_runtime();
-    bootlog::ok("scheduler runtime initialized");
-    bootlog::start(2, "checking timer source");
-    let timer_ready = timer::init();
-    if timer_ready {
-        bootlog::ok("hardware scheduler timer initialized");
-    } else {
-        bootlog::warn("hardware scheduler timer unavailable; using polling");
-    }
-    bootlog::start(3, "selecting timer source");
-    if timer_ready {
-        bootlog::ok("timer source irq");
-    } else {
-        bootlog::warn("timer source polling");
-    }
     bootlog::start(0, "reporting architecture");
     bootlog::ok_fmt(format_args!("architecture {}", arch::NAME));
     bootlog::start(1, "reading timer ticks");

@@ -239,14 +239,17 @@ pub fn init() -> bool {
     load_gdt();
     load_idt();
     unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) };
-    let timer = crate::irq::register(
+    let timer_registration = crate::irq::register(
         crate::drivers::framework::IrqKind::Legacy,
         0,
         32,
         timer_hard,
         Some(timer_deferred),
-    )
-    .is_ok();
+    );
+    if let Ok(id) = timer_registration {
+        crate::irq::register_timer(id);
+    }
+    let timer = timer_registration.is_ok();
     timer && crate::drivers::ps2::register_irqs()
 }
 
@@ -410,7 +413,12 @@ fn timer_hard() -> bool {
 }
 
 fn timer_deferred() {
-    crate::sched::on_timer_tick();
+    for _ in 0..crate::irq::take_timer_ticks(32) {
+        crate::sched::on_timer_tick();
+    }
+    if crate::irq::timer_pending() {
+        crate::irq::requeue_timer();
+    }
 }
 
 extern "x86-interrupt" fn divide_error(_stack: InterruptStackFrame) {

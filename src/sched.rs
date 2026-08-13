@@ -3,6 +3,9 @@ use core::cell::UnsafeCell;
 const MAX_TASKS: usize = 16;
 const BASE_SLICE: u64 = 4;
 const INTERACTIVE_SLICE: u64 = 2;
+const HARDWARE_PROBE_SPINS: u32 = 100_000_000;
+const POLLING_PROBE_SPINS: u32 = 100_000_000;
+const PROBE_BATCH_SPINS: u32 = 4096;
 
 struct RuntimeCell(UnsafeCell<Scheduler>);
 
@@ -144,6 +147,14 @@ pub fn self_check() {
     assert_eq!(sched.pick(), Some(2));
     sched.charge(2, 4, true);
     assert_eq!(sched.pick(), Some(2));
+
+    let mut accounting = Scheduler::new();
+    assert!(accounting.add(Task::new(7, 1024, 0)));
+    for _ in 0..8 {
+        let current = accounting.pick().unwrap();
+        accounting.charge(current, 1, false);
+    }
+    assert_eq!(accounting.clock(), 8);
 }
 
 pub fn init_runtime() {
@@ -167,6 +178,49 @@ pub fn on_timer_tick() {
         }
         CURRENT = runtime.pick();
     });
+}
+
+pub fn runtime_self_check(hardware_ticks: bool) -> bool {
+    let before = status();
+    let before_irq_timer = crate::irq::stats().timer;
+    if crate::time::scheduler_hz() != 100
+        || before.tasks < 2
+        || before.current.is_none()
+        || before.next.is_none()
+    {
+        return false;
+    }
+    let probe_limit = if hardware_ticks {
+        HARDWARE_PROBE_SPINS
+    } else {
+        POLLING_PROBE_SPINS
+    };
+    let mut spins = 0;
+    while spins < probe_limit {
+        if hardware_ticks {
+            let _ = crate::irq::run_deferred();
+            spins += 1;
+        } else {
+            for _ in 0..PROBE_BATCH_SPINS {
+                core::hint::spin_loop();
+            }
+            if crate::time::poll_scheduler_tick() {
+                on_timer_tick();
+            }
+            spins = spins.saturating_add(PROBE_BATCH_SPINS);
+        }
+        if status().timer_ticks != before.timer_ticks {
+            break;
+        }
+    }
+    let after = status();
+    let after_irq_timer = crate::irq::stats().timer;
+    let advanced = after.timer_ticks.saturating_sub(before.timer_ticks);
+    advanced != 0
+        && after.clock.saturating_sub(before.clock) >= advanced
+        && after.current.is_some()
+        && after.next.is_some()
+        && (!hardware_ticks || after_irq_timer > before_irq_timer)
 }
 
 pub fn status() -> Status {
