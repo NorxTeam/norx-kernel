@@ -417,7 +417,7 @@ extern "C" fn norx_page_fault_dispatch(rip: u64, code: u64) -> u64 {
     if crate::usercopy::handles_fault(rip) {
         return crate::usercopy::recovery_address();
     }
-    if crate::vm::handle_page_fault(address, code) {
+    if crate::vm::handle_page_fault(crate::vm::FaultInfo::x86_page_fault(address, code)) {
         return rip;
     }
     crate::irq::exception();

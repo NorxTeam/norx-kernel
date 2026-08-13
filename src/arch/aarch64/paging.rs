@@ -156,10 +156,10 @@ pub fn user_space_map(
         }
     }
 
-    let Some(table_ptr) = table_ptr(table) else {
+    let Some(leaf_table_ptr) = table_ptr(table) else {
         return false;
     };
-    let slot = unsafe { table_ptr.add(indices[3]) };
+    let slot = unsafe { leaf_table_ptr.add(indices[3]) };
     if unsafe { slot.read_volatile() } & VALID != 0 {
         return false;
     }
@@ -178,7 +178,11 @@ pub fn user_space_map(
     true
 }
 
-pub fn user_space_unmap(root: crate::address::PhysAddr, virtual_address: usize) -> bool {
+pub fn user_space_unmap(
+    root: crate::address::PhysAddr,
+    virtual_address: usize,
+    owned_tables: &mut [Option<crate::address::PhysAddr>],
+) -> bool {
     if !virtual_address.is_multiple_of(PAGE_SIZE as usize) {
         return false;
     }
@@ -189,25 +193,56 @@ pub fn user_space_unmap(root: crate::address::PhysAddr, virtual_address: usize) 
         (virtual_address >> 12) & 0x1ff,
     ];
     let mut table = root.value();
-    for index in indices[..3].iter().copied() {
+    let mut child_tables = [0u64; 3];
+    let mut parent_entries = [core::ptr::null_mut(); 3];
+    for (depth, index) in indices[..3].iter().copied().enumerate() {
         let Some(table_ptr) = table_ptr(table) else {
             return false;
         };
+        parent_entries[depth] = unsafe { table_ptr.add(index) };
         let descriptor = unsafe { table_ptr.add(index).read_volatile() };
         if descriptor & (VALID | TABLE_OR_PAGE) != (VALID | TABLE_OR_PAGE) {
             return false;
         }
         table = descriptor & ADDRESS_MASK;
+        if !owned_table(owned_tables, table) {
+            return false;
+        }
+        child_tables[depth] = table;
     }
-    let Some(table_ptr) = table_ptr(table) else {
+    let Some(leaf_table_ptr) = table_ptr(table) else {
         return false;
     };
-    let slot = unsafe { table_ptr.add(indices[3]) };
+    let slot = unsafe { leaf_table_ptr.add(indices[3]) };
     if unsafe { slot.read_volatile() } & VALID == 0 {
         return false;
     }
     unsafe { slot.write_volatile(0) };
     flush_tlb();
+    for depth in (0..3).rev() {
+        let Some(child_table_ptr) = table_ptr(child_tables[depth]) else {
+            break;
+        };
+        let empty = unsafe {
+            (0..TABLE_ENTRIES).all(|index| child_table_ptr.add(index).read_volatile() & VALID == 0)
+        };
+        if !empty {
+            break;
+        }
+        let entry = parent_entries[depth];
+        let Some(slot_index) = owned_tables.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|frame| frame.value() == child_tables[depth])
+        }) else {
+            return false;
+        };
+        let frame = owned_tables[slot_index].expect("owned page table");
+        if !crate::memory::free_frame(frame.value()) {
+            return false;
+        }
+        unsafe { entry.write_volatile(0) };
+        owned_tables[slot_index] = None;
+    }
     true
 }
 
@@ -246,6 +281,21 @@ pub fn write_physical(physical: crate::address::PhysAddr, offset: usize, bytes: 
     unsafe {
         for (index, byte) in bytes.iter().copied().enumerate() {
             ptr.add(index).write_volatile(byte);
+        }
+    }
+    true
+}
+
+pub fn read_physical(physical: crate::address::PhysAddr, offset: usize, bytes: &mut [u8]) -> bool {
+    if offset > PAGE_SIZE as usize || bytes.len() > PAGE_SIZE as usize - offset {
+        return false;
+    }
+    let Some(ptr) = physical_ptr(physical.value().saturating_add(offset as u64)) else {
+        return false;
+    };
+    unsafe {
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = ptr.add(index).read_volatile();
         }
     }
     true

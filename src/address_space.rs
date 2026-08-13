@@ -213,6 +213,38 @@ impl AddressSpace {
         Ok(true)
     }
 
+    pub fn handle_fault(&mut self, fault: crate::vm::FaultInfo) -> crate::vm::FaultResult {
+        if !fault.user {
+            return crate::vm::FaultResult::KernelFatal;
+        }
+        if fault.kind != crate::vm::FaultKind::Translation || fault.instruction {
+            return crate::vm::FaultResult::UserFault(crate::vm::FaultReason::Protection);
+        }
+        let page = fault.address & !(PAGE_SIZE - 1);
+        if self.stack_guard == Some(page) {
+            if !fault.write {
+                return crate::vm::FaultResult::UserFault(crate::vm::FaultReason::Protection);
+            }
+            return match self.grow_stack(fault.address) {
+                Ok(true) => crate::vm::FaultResult::Resolved,
+                Ok(false) => {
+                    crate::vm::FaultResult::UserFault(crate::vm::FaultReason::StackOverflow)
+                }
+                Err(Error::NoFrames) => {
+                    crate::vm::FaultResult::UserFault(crate::vm::FaultReason::OutOfMemory)
+                }
+                Err(_) => crate::vm::FaultResult::UserFault(crate::vm::FaultReason::GuardPage),
+            };
+        }
+        if let Some(mapping) = self.mapping(page) {
+            if (fault.write && !mapping.flags.writable) || (!fault.write && !mapping.flags.readable)
+            {
+                return crate::vm::FaultResult::UserFault(crate::vm::FaultReason::Protection);
+            }
+        }
+        crate::vm::FaultResult::UserFault(crate::vm::FaultReason::InvalidAddress)
+    }
+
     pub fn mapping(&self, virtual_address: usize) -> Option<MappingInfo> {
         self.mappings
             .iter()
@@ -238,26 +270,30 @@ impl AddressSpace {
         let root = self.root_frame.ok_or(Error::InvalidState)?;
         if self.active {
             crate::arch::user_space_reset(root);
+            crate::arch::restore_kernel_address_space();
             self.active = false;
         }
         if self.root_frame.is_none() {
             return Err(Error::InvalidState);
         }
+        let mut error = None;
         for mapping in self.mappings.iter_mut().flatten() {
-            if !crate::memory::free_frame(mapping.physical_frame.value()) {
-                return Err(Error::FrameReturn);
+            if !crate::memory::free_frame(mapping.physical_frame.value()) && error.is_none() {
+                error = Some(Error::FrameReturn);
             }
         }
         self.mappings = [None; MAX_MAPPINGS];
-        self.release_table_frames();
+        if !self.release_table_frames() && error.is_none() {
+            error = Some(Error::FrameReturn);
+        }
         let root = self.root_frame.take().ok_or(Error::InvalidState)?;
-        if !crate::memory::free_frame(root.value()) {
-            return Err(Error::FrameReturn);
+        if !crate::memory::free_frame(root.value()) && error.is_none() {
+            error = Some(Error::FrameReturn);
         }
         self.owner = None;
         self.stack_guard = None;
         self.stack_pages = 0;
-        Ok(())
+        error.map_or(Ok(()), Err)
     }
 
     pub fn is_destroyed(&self) -> bool {
@@ -290,7 +326,7 @@ impl AddressSpace {
                 &mut self.table_frames,
             ) {
                 crate::arch::user_space_reset(root);
-                self.release_table_frames();
+                let _ = self.release_table_frames();
                 return Err(Error::HardwareMapping);
             }
         }
@@ -368,7 +404,10 @@ impl AddressSpace {
         let physical_frame = crate::memory::alloc_frame()
             .map(PhysAddr::new)
             .ok_or(Error::NoFrames)?;
-        let _ = crate::arch::zero_physical_page(physical_frame);
+        if !crate::arch::zero_physical_page(physical_frame) {
+            let _ = crate::memory::free_frame(physical_frame.value());
+            return Err(Error::HardwareUnavailable);
+        }
         let mapping = Mapping {
             virtual_address,
             physical_frame,
@@ -411,7 +450,7 @@ impl AddressSpace {
             .ok_or(Error::InvalidAddress)?;
         if self.active {
             let root = self.root_frame.ok_or(Error::InvalidState)?;
-            if !crate::arch::user_space_unmap(root, virtual_address) {
+            if !crate::arch::user_space_unmap(root, virtual_address, &mut self.table_frames) {
                 return Err(Error::HardwareMapping);
             }
         }
@@ -423,11 +462,23 @@ impl AddressSpace {
         Ok(())
     }
 
-    fn release_table_frames(&mut self) {
+    fn release_table_frames(&mut self) -> bool {
+        let mut released = true;
         for frame in &mut self.table_frames {
             if let Some(frame) = frame.take() {
-                let _ = crate::memory::free_frame(frame.value());
+                if !crate::memory::free_frame(frame.value()) {
+                    released = false;
+                }
             }
+        }
+        released
+    }
+}
+
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        if self.root_frame.is_some() {
+            let _ = self.destroy();
         }
     }
 }
@@ -485,7 +536,17 @@ pub fn contract_self_check() {
     );
     space.map_stack().unwrap();
     let guard = space.stack_guard().unwrap();
-    assert!(space.grow_stack(guard + 17).unwrap());
+    assert_eq!(
+        space.handle_fault(crate::vm::FaultInfo {
+            address: guard,
+            raw: 0,
+            kind: crate::vm::FaultKind::Translation,
+            write: true,
+            instruction: false,
+            user: true,
+        }),
+        crate::vm::FaultResult::Resolved
+    );
     assert_eq!(space.mapping(guard).unwrap().kind, MappingKind::Stack);
     assert_eq!(space.unmap_page(guard), Err(Error::InvalidState));
     assert_eq!(
@@ -507,7 +568,28 @@ pub fn contract_self_check() {
         space.map_anonymous(base + 1, PageFlags::USER_READ),
         Err(Error::Unaligned)
     );
+    space.activate().unwrap();
+    assert!(space.is_active());
     space.unmap_page(base).unwrap();
+    let zero_page = space
+        .mapping(base + PAGE_SIZE * 3)
+        .expect("anonymous page mapping");
+    let zero_bytes = [0xff; 16];
+    assert!(crate::arch::write_physical(
+        zero_page.physical_frame,
+        0,
+        &zero_bytes
+    ));
+    assert!(crate::arch::zero_physical_page(zero_page.physical_frame));
+    let mut read_back = [0xff; 16];
+    assert!(crate::arch::read_physical(
+        zero_page.physical_frame,
+        0,
+        &mut read_back
+    ));
+    assert_eq!(read_back, [0; 16]);
+    space.unmap_page(base + PAGE_SIZE * 3).unwrap();
+    assert!(space.mapping(base + PAGE_SIZE * 3).is_none());
     space.destroy().unwrap();
     assert!(space.is_destroyed());
     assert_eq!(space.owner(), None);

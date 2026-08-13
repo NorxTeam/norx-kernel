@@ -221,7 +221,11 @@ pub fn user_space_map(
     true
 }
 
-pub fn user_space_unmap(root: crate::address::PhysAddr, virtual_address: usize) -> bool {
+pub fn user_space_unmap(
+    root: crate::address::PhysAddr,
+    virtual_address: usize,
+    owned_tables: &mut [Option<crate::address::PhysAddr>],
+) -> bool {
     unsafe {
         let Some(mut table) = direct_map_ptr(root.value()).map(|ptr| ptr.cast::<u64>()) else {
             return false;
@@ -232,7 +236,10 @@ pub fn user_space_unmap(root: crate::address::PhysAddr, virtual_address: usize) 
             (virtual_address >> 21) & 0x1ff,
             (virtual_address >> 12) & 0x1ff,
         ];
-        for index in indices[..3].iter().copied() {
+        let mut child_tables = [core::ptr::null_mut(); 3];
+        let mut parent_entries = [core::ptr::null_mut(); 3];
+        for (depth, index) in indices[..3].iter().copied().enumerate() {
+            parent_entries[depth] = table.add(index);
             let value = table.add(index).read_volatile();
             if value & PTE_PRESENT == 0 || value & (1 << 7) != 0 {
                 return false;
@@ -243,6 +250,7 @@ pub fn user_space_unmap(root: crate::address::PhysAddr, virtual_address: usize) 
                 Some(table) => table,
                 None => return false,
             };
+            child_tables[depth] = table;
         }
         let leaf = table.add(indices[3]);
         if leaf.read_volatile() & PTE_PRESENT == 0 {
@@ -250,6 +258,27 @@ pub fn user_space_unmap(root: crate::address::PhysAddr, virtual_address: usize) 
         }
         leaf.write_volatile(0);
         asm!("invlpg [{}]", in(reg) virtual_address, options(nostack, preserves_flags));
+        for depth in (0..3).rev() {
+            let child = child_tables[depth];
+            let parent_entry = parent_entries[depth];
+            let empty = (0..512).all(|index| child.add(index).read_volatile() & PTE_PRESENT == 0);
+            if !empty {
+                break;
+            }
+            let child_frame = parent_entry.read_volatile() & ADDRESS_MASK;
+            let Some(slot_index) = owned_tables.iter().position(|slot| {
+                slot.as_ref()
+                    .is_some_and(|frame| frame.value() == child_frame)
+            }) else {
+                return false;
+            };
+            let frame = owned_tables[slot_index].expect("owned page table");
+            if !crate::memory::free_frame(frame.value()) {
+                return false;
+            }
+            parent_entry.write_volatile(0);
+            owned_tables[slot_index] = None;
+        }
     }
     true
 }
@@ -288,6 +317,17 @@ pub fn write_physical(physical: crate::address::PhysAddr, offset: usize, bytes: 
         return false;
     };
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len()) };
+    true
+}
+
+pub fn read_physical(physical: crate::address::PhysAddr, offset: usize, bytes: &mut [u8]) -> bool {
+    if offset >= 4096 || bytes.len() > 4096 - offset {
+        return false;
+    }
+    let Some(pointer) = direct_map_ptr(physical.value().saturating_add(offset as u64)) else {
+        return false;
+    };
+    unsafe { core::ptr::copy_nonoverlapping(pointer, bytes.as_mut_ptr(), bytes.len()) };
     true
 }
 

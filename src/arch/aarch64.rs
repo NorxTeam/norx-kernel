@@ -296,8 +296,12 @@ pub fn user_space_map(
     paging::user_space_map(root, mapping, tables)
 }
 
-pub fn user_space_unmap(root: crate::address::PhysAddr, virtual_address: usize) -> bool {
-    paging::user_space_unmap(root, virtual_address)
+pub fn user_space_unmap(
+    root: crate::address::PhysAddr,
+    virtual_address: usize,
+    tables: &mut [Option<crate::address::PhysAddr>],
+) -> bool {
+    paging::user_space_unmap(root, virtual_address, tables)
 }
 
 pub fn user_space_reset(root: crate::address::PhysAddr) {
@@ -314,6 +318,10 @@ pub fn restore_kernel_address_space() {
 
 pub fn write_physical(physical: crate::address::PhysAddr, offset: usize, bytes: &[u8]) -> bool {
     paging::write_physical(physical, offset, bytes)
+}
+
+pub fn read_physical(physical: crate::address::PhysAddr, offset: usize, bytes: &mut [u8]) -> bool {
+    paging::read_physical(physical, offset, bytes)
 }
 
 pub fn zero_physical_page(physical: crate::address::PhysAddr) -> bool {

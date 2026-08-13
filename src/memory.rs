@@ -1,7 +1,7 @@
 use crate::boot::{BootInfo, MemoryRegion};
 
 const MAX_RANGES: usize = 64;
-const MAX_RETURNED_FRAMES: usize = 128;
+const MAX_RETURNED_FRAMES: usize = 512;
 const PAGE_SIZE: u64 = 4096;
 const MIN_FRAME: u64 = 0x100000;
 

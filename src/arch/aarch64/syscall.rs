@@ -268,6 +268,12 @@ pub fn enter_user(registers: crate::elf::InitialRegisters) -> bool {
 #[no_mangle]
 extern "C" fn norx_aarch64_usercopy_fault(rip: u64) -> u64 {
     let exception = crate::arch::tables::exception_state();
+    let fault = crate::vm::FaultInfo::aarch64_data_abort(
+        exception.fault_address as usize,
+        exception.syndrome,
+        exception.saved_program_status & 0xf == 0,
+    );
+    let _ = crate::vm::classify_fault(fault, false);
     let recovery_address = if crate::usercopy::handles_fault(rip) {
         crate::usercopy::recovery_address()
     } else {

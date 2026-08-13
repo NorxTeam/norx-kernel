@@ -229,6 +229,12 @@ pub fn kernel_start() -> ! {
     bootlog::ok(
         "user pointer validation and fault boundary checks passed; process user pages unavailable",
     );
+    bootlog::start(1, "initializing syscall entry");
+    arch::init_syscalls();
+    if !paging::init() {
+        bootlog::fail("kernel paging initialization failed");
+        arch::halt();
+    }
     process::contract_self_check();
     bootlog::ok(
         "process PID/TID, parent-child, credentials, FD, signal, event, and wait model checks passed",
@@ -257,10 +263,6 @@ pub fn kernel_start() -> ! {
     } else {
         bootlog::fail("process runtime initialization failed");
     }
-    address_space::contract_self_check();
-    bootlog::ok(
-        "address-space user isolation, page-table ownership, guard stack, ASLR, W^X, and teardown checks passed",
-    );
     elf::contract_self_check();
     bootlog::ok(
         "ELF64 headers, PT_LOAD bounds, zero-fill, W^X, entry, stack, auxv, and register checks passed",
@@ -311,19 +313,19 @@ pub fn kernel_start() -> ! {
     bootlog::ok(
         "kernel/user trust boundary and capability transfer model documented; IPC grants deferred",
     );
-    bootlog::start(1, "initializing syscall entry");
-    arch::init_syscalls();
-    if !paging::init() {
-        bootlog::fail("kernel paging initialization failed");
-        arch::halt();
-    }
+    address_space::contract_self_check();
+    bootlog::ok(
+        "address-space user isolation, page-table ownership, guard stack, ASLR, W^X, and teardown checks passed",
+    );
     bootlog::quickinit_overlay_stage("checking lazy page faults", 94);
     vm::init();
-    #[cfg(target_arch = "x86_64")]
     if vm::contract_self_check() {
+        #[cfg(target_arch = "x86_64")]
         bootlog::ok("x86_64 lazy page faults allocate, zero, and map through the direct map");
+        #[cfg(target_arch = "aarch64")]
+        bootlog::ok("aarch64 fault syndrome classification and architecture-neutral page-fault contract checks passed");
     } else {
-        bootlog::fail("x86_64 lazy page fault path unavailable");
+        bootlog::fail("architecture-neutral page-fault contract unavailable");
     }
     bootlog::start(1, "checking userspace init boundary");
     let userspace_init_ok = service::user_entry_self_check();
