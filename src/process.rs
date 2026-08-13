@@ -174,6 +174,7 @@ pub enum Capability {
     MemoryMap = 4,
     DeviceAdmin = 5,
     SessionAdmin = 6,
+    PrivilegeDelegation = 7,
     AccountAdmin = 8,
 }
 
@@ -699,6 +700,35 @@ impl ProcessTable {
         Ok(())
     }
 
+    pub fn authorize_process_group_signal(
+        &self,
+        caller: ProcessId,
+        pgid: ProcessId,
+    ) -> Result<(), Error> {
+        let caller_record = self.process(caller)?;
+        if caller_record.state != ProcessState::Running || pgid.get() == 0 {
+            return Err(Error::InvalidState);
+        }
+        if caller_record.pgid == pgid {
+            return Ok(());
+        }
+        if self
+            .processes
+            .iter()
+            .flatten()
+            .any(|record| record.parent == Some(caller) && record.pgid == pgid)
+        {
+            return Ok(());
+        }
+        if self
+            .credentials(caller)?
+            .has_capability(Capability::SessionAdmin as u8)
+        {
+            return Ok(());
+        }
+        Err(Error::PermissionDenied)
+    }
+
     pub fn raise_signal_to_group(&mut self, pgid: ProcessId, signal: u8) -> Result<(), Error> {
         if pgid.get() == 0 {
             return Err(Error::InvalidId);
@@ -717,6 +747,67 @@ impl ProcessTable {
         if members == 0 {
             return Err(Error::InvalidId);
         }
+        Ok(())
+    }
+
+    pub fn terminate_signal_to_group(&mut self, pgid: ProcessId, signal: u8) -> Result<(), Error> {
+        if pgid.get() == 0 || signal >= 64 {
+            return Err(Error::InvalidState);
+        }
+        let members: [Option<ProcessId>; MAX_PROCESSES] = {
+            let mut members = [None; MAX_PROCESSES];
+            let mut count = 0;
+            for record in self.processes.iter().flatten() {
+                if record.pgid == pgid && record.state == ProcessState::Running {
+                    if count == MAX_PROCESSES {
+                        return Err(Error::ProcessCapacity);
+                    }
+                    members[count] = Some(record.id);
+                    count += 1;
+                }
+            }
+            members
+        };
+        let mut terminated = 0;
+        for process in members.into_iter().flatten() {
+            self.terminate(process, signal)?;
+            terminated += 1;
+        }
+        if terminated == 0 {
+            return Err(Error::InvalidId);
+        }
+        Ok(())
+    }
+
+    fn terminate(&mut self, process: ProcessId, signal: u8) -> Result<(), Error> {
+        if process == ProcessId::INIT || self.process(process)?.state != ProcessState::Running {
+            return Err(Error::InvalidState);
+        }
+        {
+            let record = self.process_mut(process)?;
+            record.state = ProcessState::Exiting;
+            record.exit_status = Some(-(signal as i32));
+            let fds = record.fds;
+            record.fds = [None; MAX_FDS];
+            for entry in fds.into_iter().flatten() {
+                release_open_file(entry.open_file);
+            }
+        }
+        for thread in &mut self.threads {
+            if let Some(thread) = thread.as_mut() {
+                if thread.process == Some(process) {
+                    thread.state = ThreadState::Exited;
+                }
+            }
+        }
+        for record in &mut self.processes {
+            if let Some(record) = record.as_mut() {
+                if record.parent == Some(process) {
+                    record.parent = Some(ProcessId::INIT);
+                }
+            }
+        }
+        self.process_mut(process)?.state = ProcessState::Zombie;
         Ok(())
     }
 

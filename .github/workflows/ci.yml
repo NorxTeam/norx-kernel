@@ -161,7 +161,7 @@ jobs:
             wait "$qemu_pid" 2>/dev/null || true
           }
 
-          smoke x86_64 "persistent warm-reboot log initialized" "vnc=127.0.0.1:0"
+          smoke x86_64 "x86_64 lazy page faults allocate, zero, and map through the direct map" "vnc=127.0.0.1:0"
           smoke aarch64 "persistent warm-reboot status committed" "vnc=127.0.0.1:1"
           grep -F "NORX_SERIAL_DEBUGGER_READY v=1" "$RUNNER_TEMP/norx-aarch64.stable.log"
 

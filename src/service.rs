@@ -796,6 +796,15 @@ pub fn user_entry_self_check() -> bool {
         } else {
             true
         };
+        let sudo_ok = if option_env!("SUDO_SMOKE") == Some("enabled") {
+            run_user_fixture(
+                crate::elf::sudo_image(),
+                "sudo-smoke",
+                option_env!("SUDO_FIXTURE") == Some("external"),
+            )
+        } else {
+            true
+        };
         let shell_ok = if option_env!("NSH_SMOKE") == Some("enabled") {
             run_user_fixture(
                 crate::elf::nsh_image(),
@@ -808,7 +817,7 @@ pub fn user_entry_self_check() -> bool {
             );
             true
         };
-        quickinit_ok && fixtures_ok && shell_ok && login_ok && passwd_ok && userctl_ok
+        quickinit_ok && fixtures_ok && shell_ok && login_ok && passwd_ok && userctl_ok && sudo_ok
     }
 }
 
@@ -923,6 +932,7 @@ fn image_for_user_path<'a>(path: &'a str) -> Result<(&'static [u8], &'a str), Sp
         "/bin/login-smoke" => crate::elf::login_image(),
         "/bin/passwd-smoke" => crate::elf::passwd_image(),
         "/bin/userctl-smoke" => crate::elf::userctl_image(),
+        "/bin/sudo-smoke" => crate::elf::sudo_image(),
         _ => return Err(SpawnError::NotFound),
     };
     Ok((image, path.strip_prefix("/bin/").unwrap_or(path)))
@@ -939,14 +949,25 @@ pub fn spawn_user_path(path: &str) -> Result<u32, SpawnError> {
         .map_err(|_| SpawnError::InvalidState)?
         .ok_or(SpawnError::InvalidState)?;
     crate::arch::restore_kernel_address_space();
-    let capabilities = match label {
-        "login-smoke" => 1u64 << (crate::process::Capability::SessionAdmin as u8),
-        "userctl-smoke" => 1u64 << (crate::process::Capability::AccountAdmin as u8),
-        _ => 0,
-    };
-    let credentials = Credentials {
-        capabilities,
-        ..Credentials::BOOTSTRAP
+    let credentials = match label {
+        "sudo-smoke" => Credentials {
+            real_uid: 1000,
+            effective_uid: 1000,
+            saved_uid: 1000,
+            real_gid: 1000,
+            effective_gid: 1000,
+            saved_gid: 1000,
+            capabilities: (1u64 << (crate::process::Capability::Mount as u8))
+                | (1u64 << (crate::process::Capability::PrivilegeDelegation as u8)),
+        },
+        _ => Credentials {
+            capabilities: match label {
+                "login-smoke" => 1u64 << (crate::process::Capability::SessionAdmin as u8),
+                "userctl-smoke" => 1u64 << (crate::process::Capability::AccountAdmin as u8),
+                _ => 0,
+            },
+            ..Credentials::BOOTSTRAP
+        },
     };
     let (child, thread) =
         crate::process::spawn_child_current(credentials).map_err(|error| match error {
@@ -1028,18 +1049,46 @@ pub fn spawn_user_path_resumable_with_args_and_flags(
     environment: &[&[u8]],
     flags: u64,
 ) -> Result<u32, SpawnError> {
+    spawn_user_path_resumable_with_args_and_credentials(path, arguments, environment, flags, None)
+}
+
+pub fn spawn_delegated_user_path_resumable_with_args(
+    path: &str,
+    arguments: &[&[u8]],
+    environment: &[&[u8]],
+    flags: u64,
+    credentials: Credentials,
+) -> Result<u32, SpawnError> {
+    spawn_user_path_resumable_with_args_and_credentials(
+        path,
+        arguments,
+        environment,
+        flags,
+        Some(credentials),
+    )
+}
+
+fn spawn_user_path_resumable_with_args_and_credentials(
+    path: &str,
+    arguments: &[&[u8]],
+    environment: &[&[u8]],
+    flags: u64,
+    credentials_override: Option<Credentials>,
+) -> Result<u32, SpawnError> {
     let (image, _label) = image_for_user_path(path)?;
     if path.as_bytes().contains(&0) {
         return Err(SpawnError::InvalidPath);
     }
     let parent = crate::process::current_process_id().ok_or(SpawnError::InvalidState)?;
-    let credentials = if flags & SPAWN_INHERIT_CREDENTIALS != 0 {
-        crate::process::current_credentials().map_err(|_| SpawnError::InvalidState)?
-    } else {
-        Credentials {
+    let credentials = match credentials_override {
+        Some(credentials) => credentials,
+        None if flags & SPAWN_INHERIT_CREDENTIALS != 0 => {
+            crate::process::current_credentials().map_err(|_| SpawnError::InvalidState)?
+        }
+        None => Credentials {
             capabilities: 0,
             ..Credentials::BOOTSTRAP
-        }
+        },
     };
     let (child, thread) =
         crate::process::spawn_child_current(credentials).map_err(|error| match error {
@@ -1114,13 +1163,25 @@ fn run_user_fixture(image: &[u8], label: &'static str, external: bool) -> bool {
     if quickinit {
         crate::bootlog::quickinit_overlay_stage("creating process", 12);
     }
-    let credentials = Credentials {
-        capabilities: match label {
-            "login-smoke" => 1 << (crate::process::Capability::SessionAdmin as u8),
-            "userctl-smoke" => 1 << (crate::process::Capability::AccountAdmin as u8),
-            _ => 0,
+    let credentials = match label {
+        "sudo-smoke" => Credentials {
+            real_uid: 1000,
+            effective_uid: 1000,
+            saved_uid: 1000,
+            real_gid: 1000,
+            effective_gid: 1000,
+            saved_gid: 1000,
+            capabilities: (1 << (crate::process::Capability::Mount as u8))
+                | (1 << (crate::process::Capability::PrivilegeDelegation as u8)),
         },
-        ..Credentials::BOOTSTRAP
+        _ => Credentials {
+            capabilities: match label {
+                "login-smoke" => 1 << (crate::process::Capability::SessionAdmin as u8),
+                "userctl-smoke" => 1 << (crate::process::Capability::AccountAdmin as u8),
+                _ => 0,
+            },
+            ..Credentials::BOOTSTRAP
+        },
     };
     let (process, thread) = match crate::process::spawn_child_current(credentials) {
         Ok(ids) => ids,
@@ -1170,7 +1231,7 @@ fn run_user_fixture(image: &[u8], label: &'static str, external: bool) -> bool {
     if quickinit {
         crate::bootlog::quickinit_overlay_stage("preparing address space", 48);
     }
-    let resumable = label == "nsh" && external;
+    let resumable = external;
     if resumable {
         let registers = runtime.start().unwrap();
         crate::user_runtime::install(process, runtime).unwrap();
@@ -1188,7 +1249,7 @@ fn run_user_fixture(image: &[u8], label: &'static str, external: bool) -> bool {
             crate::bootlog::quickinit_overlay_stage("entering userspace", 68);
         }
         let registers = runtime.start().unwrap();
-        if label == "login-smoke" {
+        if matches!(label, "login-smoke" | "sudo-smoke") {
             crate::process::install_user_context(thread.get(), registers).unwrap();
         }
         runtime.enter_user().unwrap();

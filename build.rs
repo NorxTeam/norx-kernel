@@ -11,6 +11,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RUN_LOGIN_SMOKE");
     println!("cargo:rerun-if-env-changed=RUN_PASSWD_SMOKE");
     println!("cargo:rerun-if-env-changed=RUN_USERCTL_SMOKE");
+    println!("cargo:rerun-if-env-changed=RUN_SUDO_SMOKE");
     println!("cargo:rerun-if-env-changed=REQUIRE_COREUTILS_FIXTURE");
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
@@ -138,6 +139,15 @@ fn main() {
                 .join("userctl-smoke.elf"),
             "userctl-smoke.elf",
         ),
+        (
+            "sudo",
+            rootfs
+                .join("tests")
+                .join("sudo")
+                .join(triple)
+                .join("sudo-smoke.elf"),
+            "sudo-smoke.elf",
+        ),
     ];
 
     for (name, source, destination_name) in fixtures {
@@ -182,6 +192,11 @@ fn main() {
         println!("cargo:rustc-env=USERCTL_SMOKE=enabled");
     } else {
         println!("cargo:rustc-env=USERCTL_SMOKE=disabled");
+    }
+    if env::var_os("RUN_SUDO_SMOKE").is_some() {
+        println!("cargo:rustc-env=SUDO_SMOKE=enabled");
+    } else {
+        println!("cargo:rustc-env=SUDO_SMOKE=disabled");
     }
 }
 

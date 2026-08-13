@@ -59,8 +59,8 @@ slots never cross the syscall boundary.
 ## Credentials and events
 
 Credentials contain real/effective/saved UID and GID values plus a fixed
-capability bitset (`Mount`, `RawIo`, `NetAdmin`, `NetRaw`, `MemoryMap`, and
-`DeviceAdmin`). Authorization checks consume the effective credentials and the
+capability bitset (`Mount`, `RawIo`, `NetAdmin`, `NetRaw`, `MemoryMap`,
+`DeviceAdmin`, `PrivilegeDelegation`, and `AccountAdmin`). Authorization checks consume the effective credentials and the
 operation's capability requirement; UID 0 without the capability is denied,
 so there is no implicit global-root escape hatch. A process owns a bounded
 signal/event bitmap and a pending queue. Delivery is recorded as pending state

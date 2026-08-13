@@ -8,17 +8,68 @@ global_asm!(
     .section .text,"ax"
     .global norx_page_fault_entry
 norx_page_fault_entry:
-    sub rsp, 8
-    mov rdi, qword ptr [rsp + 16]
-    mov rsi, qword ptr [rsp + 8]
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push rbx
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r15, qword ptr [rsp + 120]
+    mov rbx, rsp
+    and rsp, -16
+    cld
+    mov rdi, qword ptr [rbx + 128]
+    mov rsi, r15
     call norx_page_fault_dispatch
+    mov r15, rax
+    mov rax, r15
     test rax, rax
     jz 1f
-    mov qword ptr [rsp + 16], rax
-    add rsp, 8
+    mov qword ptr [rbx + 128], rax
+    mov rsp, rbx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbx
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
     add rsp, 8
     iretq
 1:
+    mov rsp, rbx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbx
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
     ud2
 "#
 );

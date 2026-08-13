@@ -76,10 +76,10 @@ _start:
     jmp 1b
     .size _start, .-_start
 
-    .section .bss,"aw",@nobits
+    .section .boot_stack,"aw",@nobits
     .align 16
 norx_boot_stack:
-    .skip 131072
+    .skip 524288
 norx_boot_stack_top:
 "#
 );

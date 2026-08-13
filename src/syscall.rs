@@ -41,6 +41,7 @@ pub enum Number {
     TtySetWindow = 409,
     SetSession = 410,
     GetCredentials = 411,
+    SpawnDelegated = 412,
     Mkdir = 420,
     Rmdir = 421,
     Unlink = 422,
@@ -66,7 +67,7 @@ pub struct Metadata {
     pub restart: RestartPolicy,
 }
 
-pub const TABLE: [Metadata; 33] = [
+pub const TABLE: [Metadata; 34] = [
     Metadata {
         number: Number::Read,
         name: "read",
@@ -212,6 +213,12 @@ pub const TABLE: [Metadata; 33] = [
         restart: RestartPolicy::Never,
     },
     Metadata {
+        number: Number::SpawnDelegated,
+        name: "spawn_delegated",
+        arguments: 1,
+        restart: RestartPolicy::Restartable,
+    },
+    Metadata {
         number: Number::Mkdir,
         name: "mkdir",
         arguments: 3,
@@ -354,7 +361,28 @@ pub struct SpawnSpec {
     pub flags: UserWord,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DelegatedSpawnSpec {
+    pub path: UserPointer,
+    pub path_length: UserWord,
+    pub argv: UserPointer,
+    pub argc: UserWord,
+    pub environment: UserPointer,
+    pub environment_count: UserWord,
+    pub stdin_fd: UserWord,
+    pub stdout_fd: UserWord,
+    pub stderr_fd: UserWord,
+    pub process_group: UserWord,
+    pub flags: UserWord,
+    pub target_uid: u32,
+    pub target_gid: u32,
+    pub reserved: u32,
+    pub capabilities: u64,
+}
+
 pub const SPAWN_INHERIT_CREDENTIALS: UserWord = 1 << 2;
+pub const CAP_PRIVILEGE_DELEGATION: u64 = 1 << 7;
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -588,11 +616,20 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Err(crate::process::Error::NoChild) => return Errno::Echild.return_value(),
                 Err(_) => return Errno::Einval.return_value(),
             };
-            let status = WaitStatus {
-                kind: WAIT_EXITED,
-                code,
-                signal: 0,
-                reserved: 0,
+            let status = if code < 0 {
+                WaitStatus {
+                    kind: WAIT_SIGNALED,
+                    code: 0,
+                    signal: code.unsigned_abs(),
+                    reserved: 0,
+                }
+            } else {
+                WaitStatus {
+                    kind: WAIT_EXITED,
+                    code,
+                    signal: 0,
+                    reserved: 0,
+                }
             };
             let bytes = unsafe {
                 core::slice::from_raw_parts(
@@ -769,6 +806,104 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                     let _ = crate::process::discard_child(parent, child_id);
                 }
                 let _ = crate::user_runtime::discard(child_id);
+                return Errno::Eperm.return_value();
+            }
+            child as UserWord
+        }
+        value if value == Number::SpawnDelegated as UserWord => {
+            if crate::usercopy::validate(args.values[0], core::mem::size_of::<DelegatedSpawnSpec>())
+                .is_err()
+            {
+                return Errno::Efault.return_value();
+            }
+            let mut spec_bytes = [0u8; core::mem::size_of::<DelegatedSpawnSpec>()];
+            if crate::usercopy::copy_from_user(args.values[0], &mut spec_bytes).is_err() {
+                return Errno::Efault.return_value();
+            }
+            let spec = unsafe {
+                core::ptr::read_unaligned(spec_bytes.as_ptr().cast::<DelegatedSpawnSpec>())
+            };
+            let caller = match crate::process::current_credentials() {
+                Ok(credentials) => credentials,
+                Err(_) => return Errno::Eperm.return_value(),
+            };
+            if !caller.has_capability(crate::process::Capability::PrivilegeDelegation as u8)
+                || spec.capabilities & !caller.capabilities != 0
+                || spec.capabilities
+                    & ((1u64 << crate::process::Capability::SessionAdmin as u8)
+                        | (1u64 << crate::process::Capability::PrivilegeDelegation as u8))
+                    != 0
+            {
+                return Errno::Eperm.return_value();
+            }
+            if spec.flags & !(SPAWN_NEW_PROCESS_GROUP | SPAWN_FOREGROUND) != 0 {
+                return Errno::Einval.return_value();
+            }
+            let path_length = match usize::try_from(spec.path_length) {
+                Ok(length) if length != 0 && length <= MAX_PATH => length,
+                _ => return Errno::Einval.return_value(),
+            };
+            let mut path_bytes = [0u8; MAX_PATH];
+            if crate::usercopy::copy_from_user(spec.path, &mut path_bytes[..path_length]).is_err() {
+                return Errno::Efault.return_value();
+            }
+            let path = match core::str::from_utf8(&path_bytes[..path_length]) {
+                Ok(path) if !path.as_bytes().contains(&0) => path,
+                _ => return Errno::Einval.return_value(),
+            };
+            let mut argument_storage = [[0u8; MAX_SPAWN_STRING]; MAX_SPAWN_ARGUMENTS];
+            let mut arguments = [&[][..]; MAX_SPAWN_ARGUMENTS];
+            let argument_count = match copy_user_string_vector(
+                spec.argv,
+                spec.argc,
+                &mut argument_storage,
+                &mut arguments,
+            ) {
+                Ok(count) => count,
+                Err(errno) => return errno.return_value(),
+            };
+            let mut environment_storage = [[0u8; MAX_SPAWN_STRING]; MAX_SPAWN_ENVIRONMENT];
+            let mut environment = [&[][..]; MAX_SPAWN_ENVIRONMENT];
+            let environment_count = match copy_user_string_vector(
+                spec.environment,
+                spec.environment_count,
+                &mut environment_storage,
+                &mut environment,
+            ) {
+                Ok(count) => count,
+                Err(errno) => return errno.return_value(),
+            };
+            let credentials = crate::process::Credentials {
+                real_uid: spec.target_uid,
+                effective_uid: spec.target_uid,
+                saved_uid: spec.target_uid,
+                real_gid: spec.target_gid,
+                effective_gid: spec.target_gid,
+                saved_gid: spec.target_gid,
+                capabilities: spec.capabilities,
+            };
+            let child = match crate::service::spawn_delegated_user_path_resumable_with_args(
+                path,
+                &arguments[..argument_count],
+                &environment[..environment_count],
+                spec.flags,
+                credentials,
+            ) {
+                Ok(child) => child,
+                Err(crate::service::SpawnError::NotFound) => return Errno::Enoent.return_value(),
+                Err(crate::service::SpawnError::Capacity) => return Errno::Eagain.return_value(),
+                Err(_) => return Errno::Einval.return_value(),
+            };
+            if finalize_spawn(
+                child,
+                spec.stdin_fd,
+                spec.stdout_fd,
+                spec.stderr_fd,
+                spec.process_group,
+                spec.flags,
+            )
+            .is_err()
+            {
                 return Errno::Eperm.return_value();
             }
             child as UserWord
@@ -1198,14 +1333,16 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 crate::process::raise_signal_to_current_group(signal)
             } else {
                 crate::process::with_process_table(|table| {
-                    table.raise_signal_to_group(
-                        crate::process::ProcessId::from_raw(group as u32),
-                        signal,
-                    )
+                    let caller = crate::process::current_process_id()
+                        .ok_or(crate::process::Error::InvalidState)?;
+                    let group = crate::process::ProcessId::from_raw(group as u32);
+                    table.authorize_process_group_signal(caller, group)?;
+                    table.terminate_signal_to_group(group, signal)
                 })
             };
             match result {
                 Ok(()) => 0,
+                Err(crate::process::Error::PermissionDenied) => Errno::Eperm.return_value(),
                 Err(_) => Errno::Einval.return_value(),
             }
         }
@@ -1415,6 +1552,52 @@ fn copy_user_string_vector<'a>(
     Ok(count)
 }
 
+fn finalize_spawn(
+    child: u32,
+    stdin_fd: UserWord,
+    stdout_fd: UserWord,
+    stderr_fd: UserWord,
+    process_group: UserWord,
+    flags: UserWord,
+) -> Result<(), ()> {
+    let child_id = crate::process::ProcessId::from_raw(child);
+    let source_fds = [stdin_fd, stdout_fd, stderr_fd];
+    let source_fds = match (
+        u32::try_from(source_fds[0]),
+        u32::try_from(source_fds[1]),
+        u32::try_from(source_fds[2]),
+    ) {
+        (Ok(stdin), Ok(stdout), Ok(stderr)) => [stdin, stdout, stderr],
+        _ => {
+            discard_spawn(child_id);
+            return Err(());
+        }
+    };
+    if crate::process::inherit_current_standard_fds(child_id, source_fds).is_err() {
+        discard_spawn(child_id);
+        return Err(());
+    }
+    let requested_group = if flags & SPAWN_NEW_PROCESS_GROUP != 0 {
+        child_id
+    } else {
+        crate::process::ProcessId::from_raw(process_group as u32)
+    };
+    if (flags & SPAWN_NEW_PROCESS_GROUP != 0 || process_group != 0)
+        && crate::process::set_process_group_for_child(child_id, requested_group).is_err()
+    {
+        discard_spawn(child_id);
+        return Err(());
+    }
+    Ok(())
+}
+
+fn discard_spawn(child: crate::process::ProcessId) {
+    if let Some(parent) = crate::process::current_process_id() {
+        let _ = crate::process::discard_child(parent, child);
+    }
+    let _ = crate::user_runtime::discard(child);
+}
+
 fn current_fd_info(fd: u32) -> Result<(u32, bool, bool, bool), Errno> {
     let (open_file, _, nonblocking, readable, writable) = crate::process::current_fd_info(fd)
         .map_err(|error| match error {
@@ -1461,7 +1644,7 @@ pub fn contract_self_check() {
     assert!(!is_error(EXIT_TO_KERNEL));
     assert!(!is_error(SWITCH_TO_USER));
     assert_ne!(EXIT_TO_KERNEL, SWITCH_TO_USER);
-    assert_eq!(TABLE.len(), 33);
+    assert_eq!(TABLE.len(), 34);
     assert!(TABLE.iter().all(|entry| entry.arguments <= MAX_ARGS as u8));
     assert_eq!(TABLE[0].number as UserWord, Number::Read as UserWord);
     assert!(TABLE.iter().all(|entry| !entry.name.is_empty()));
@@ -1479,6 +1662,7 @@ pub fn contract_self_check() {
     assert_eq!(core::mem::size_of::<PipeFds>(), 16);
     assert_eq!(core::mem::size_of::<WaitStatus>(), 16);
     assert_eq!(core::mem::size_of::<SpawnSpec>(), 88);
+    assert_eq!(core::mem::size_of::<DelegatedSpawnSpec>(), 112);
     assert_eq!(core::mem::size_of::<Credentials>(), 32);
     assert_eq!(core::mem::size_of::<SessionSpec>(), 72);
     assert_eq!(core::mem::size_of::<Stat>(), 24);

@@ -684,6 +684,10 @@ pub(crate) fn userctl_image() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/userctl-smoke.elf"))
 }
 
+pub(crate) fn sudo_image() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/sudo-smoke.elf"))
+}
+
 pub(crate) fn load_bias_for_image(image: &[u8], dynamic_bias: usize) -> usize {
     if image.len() >= 18 && u16::from_le_bytes([image[16], image[17]]) == ET_EXEC {
         0

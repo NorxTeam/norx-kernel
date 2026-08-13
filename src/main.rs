@@ -310,7 +310,18 @@ pub fn kernel_start() -> ! {
     );
     bootlog::start(1, "initializing syscall entry");
     arch::init_syscalls();
-    paging::init();
+    if !paging::init() {
+        bootlog::fail("kernel paging initialization failed");
+        arch::halt();
+    }
+    bootlog::quickinit_overlay_stage("checking lazy page faults", 94);
+    vm::init();
+    #[cfg(target_arch = "x86_64")]
+    if vm::contract_self_check() {
+        bootlog::ok("x86_64 lazy page faults allocate, zero, and map through the direct map");
+    } else {
+        bootlog::fail("x86_64 lazy page fault path unavailable");
+    }
     bootlog::start(1, "checking userspace init boundary");
     let userspace_init_ok = service::user_entry_self_check();
     if userspace_init_ok {
@@ -359,7 +370,6 @@ pub fn kernel_start() -> ! {
         bootlog::warn("network stack unsupported on aarch64 bring-up");
     }
     bootlog::quickinit_overlay_stage("initializing virtual memory", 96);
-    vm::init();
     bootlog::start(1, "checking scheduler");
     sched::self_check();
     bootlog::ok("scheduler self-check passed");

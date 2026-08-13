@@ -36,6 +36,11 @@ SECTIONS
         *(COMMON)
     }
 
+    .boot_stack ALIGN(4096) :
+    {
+        *(.boot_stack)
+    }
+
     . = ALIGN(4096);
     __kernel_end = .;
 

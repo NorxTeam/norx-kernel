@@ -41,6 +41,7 @@ are frozen so kernel, Rust, and C implementations cannot drift:
 | `dup2` | 33 | old fd, new fd |
 | `wait_status` | 402 | child/group, `WaitStatus*`, options |
 | `spawn2` | 401 | `SpawnSpec*` |
+| `spawn_delegated` | 412 | `DelegatedSpawnSpec*` |
 | `setpgid` / `getpgid` | 403 / 404 | process and group IDs |
 | `killpg` | 405 | process group, signal |
 | `tty_get_foreground` / `tty_set_foreground` | 406 / 407 | tty fd and process group |
@@ -66,7 +67,8 @@ destinations. Spawn flags are
 
 The kernel implements bounded `open`, VFS-backed `read`/`write`/`close`,
 `pipe`, `dup2`, synchronous `wait_status`, process-group authorization, a
-single serial controlling-TTY ownership backend, and a static-image `spawn2`
+single serial controlling-TTY ownership backend, a static-image `spawn2`, and a
+bounded `spawn_delegated`
 path that copies bounded argv/environment strings, inherits requested standard
 descriptors, publishes a ready child, and switches through a cooperative
 syscall-boundary continuation. The filesystem extension exposes regular files

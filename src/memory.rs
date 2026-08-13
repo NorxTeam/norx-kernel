@@ -10,6 +10,7 @@ static mut RANGE_COUNT: usize = 0;
 static mut NEXT_RANGE: usize = 0;
 static mut NEXT_FRAME: u64 = 0;
 static mut USABLE_PAGES: u64 = 0;
+static mut PHYSICAL_LIMIT: u64 = 0;
 static mut ALLOCATED_FRAMES: u64 = 0;
 static mut SKIPPED_RANGES: usize = 0;
 static mut RETURNED_FRAMES: [u64; MAX_RETURNED_FRAMES] = [0; MAX_RETURNED_FRAMES];
@@ -52,6 +53,7 @@ pub fn init(info: BootInfo) -> Summary {
         NEXT_RANGE = 0;
         NEXT_FRAME = 0;
         USABLE_PAGES = 0;
+        PHYSICAL_LIMIT = 0;
         ALLOCATED_FRAMES = 0;
         SKIPPED_RANGES = 0;
         RETURNED_COUNT = 0;
@@ -66,6 +68,9 @@ pub fn init(info: BootInfo) -> Summary {
     {
         if index & 3 == 0 {
             crate::bootlog::pulse();
+        }
+        if let Some(end) = region.base.checked_add(region.length) {
+            unsafe { PHYSICAL_LIMIT = PHYSICAL_LIMIT.max(end) };
         }
         add_available(region, &info);
     }
@@ -126,6 +131,13 @@ pub fn stats() -> Stats {
             next_frame: NEXT_FRAME,
         }
     }
+}
+
+/// Returns the first physical address above the platform memory map. The
+/// direct map also needs firmware-owned page-table frames, which may be
+/// reserved rather than allocator-usable.
+pub fn physical_limit() -> u64 {
+    unsafe { PHYSICAL_LIMIT }
 }
 
 fn add_available(region: MemoryRegion, info: &BootInfo) {
