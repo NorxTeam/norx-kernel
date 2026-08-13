@@ -368,6 +368,10 @@ extern "C" {
 pub fn init() -> bool {
     let current_el: u64;
     let vectors = unsafe { &norx_exception_vectors as *const u8 as u64 };
+    if vectors & 0x7ff != 0 {
+        crate::bootlog::fail("aarch64 exception vectors are not 2048-byte aligned");
+        return false;
+    }
     crate::bootlog::ok_fmt(format_args!("aarch64 exception vectors=0x{:x}", vectors));
 
     unsafe {
@@ -405,6 +409,108 @@ pub fn current_el() -> u8 {
     ((value >> 2) & 3) as u8
 }
 
+#[derive(Clone, Copy)]
+pub struct ExceptionState {
+    pub current_el: u8,
+    pub syndrome: u64,
+    pub fault_address: u64,
+    pub return_address: u64,
+    pub saved_program_status: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct UsercopyFault {
+    pub exception: ExceptionState,
+    pub recovery_address: u64,
+}
+
+static mut LAST_USERCOPY_FAULT: Option<UsercopyFault> = None;
+
+pub fn record_usercopy_fault(exception: ExceptionState, recovery_address: u64) {
+    unsafe {
+        LAST_USERCOPY_FAULT = Some(UsercopyFault {
+            exception,
+            recovery_address,
+        });
+    }
+}
+
+pub fn last_usercopy_fault() -> Option<UsercopyFault> {
+    unsafe { LAST_USERCOPY_FAULT }
+}
+
+pub fn exception_state() -> ExceptionState {
+    let current_el: u64;
+    unsafe {
+        asm!(
+            "mrs {}, CurrentEL",
+            out(reg) current_el,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let current_el = ((current_el >> 2) & 3) as u8;
+    let (syndrome, fault_address, return_address, saved_program_status) = unsafe {
+        match current_el {
+            1 => {
+                let syndrome: u64;
+                let fault_address: u64;
+                let return_address: u64;
+                let saved_program_status: u64;
+                asm!("mrs {}, esr_el1", out(reg) syndrome, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, far_el1", out(reg) fault_address, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, elr_el1", out(reg) return_address, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, spsr_el1", out(reg) saved_program_status, options(nomem, nostack, preserves_flags));
+                (
+                    syndrome,
+                    fault_address,
+                    return_address,
+                    saved_program_status,
+                )
+            }
+            2 => {
+                let syndrome: u64;
+                let fault_address: u64;
+                let return_address: u64;
+                let saved_program_status: u64;
+                asm!("mrs {}, esr_el2", out(reg) syndrome, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, far_el2", out(reg) fault_address, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, elr_el2", out(reg) return_address, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, spsr_el2", out(reg) saved_program_status, options(nomem, nostack, preserves_flags));
+                (
+                    syndrome,
+                    fault_address,
+                    return_address,
+                    saved_program_status,
+                )
+            }
+            3 => {
+                let syndrome: u64;
+                let fault_address: u64;
+                let return_address: u64;
+                let saved_program_status: u64;
+                asm!("mrs {}, esr_el3", out(reg) syndrome, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, far_el3", out(reg) fault_address, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, elr_el3", out(reg) return_address, options(nomem, nostack, preserves_flags));
+                asm!("mrs {}, spsr_el3", out(reg) saved_program_status, options(nomem, nostack, preserves_flags));
+                (
+                    syndrome,
+                    fault_address,
+                    return_address,
+                    saved_program_status,
+                )
+            }
+            _ => (0, 0, 0, 0),
+        }
+    };
+    ExceptionState {
+        current_el,
+        syndrome,
+        fault_address,
+        return_address,
+        saved_program_status,
+    }
+}
+
 #[no_mangle]
 extern "C" fn norx_aarch64_kernel_stack_top() -> u64 {
     core::ptr::addr_of!(norx_aarch64_kernel_stack) as u64
@@ -413,49 +519,27 @@ extern "C" fn norx_aarch64_kernel_stack_top() -> u64 {
 
 #[no_mangle]
 extern "C" fn norx_aarch64_exception() -> ! {
-    let current_el: u64;
-    let esr: u64;
-    let far: u64;
-    let elr: u64;
-    let spsr: u64;
-
-    unsafe {
-        asm!("mrs {}, CurrentEL", out(reg) current_el, options(nomem, nostack, preserves_flags));
-        match (current_el >> 2) & 3 {
-            1 => {
-                asm!("mrs {}, esr_el1", out(reg) esr, options(nomem, nostack, preserves_flags));
-                asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack, preserves_flags));
-                asm!("mrs {}, elr_el1", out(reg) elr, options(nomem, nostack, preserves_flags));
-                asm!("mrs {}, spsr_el1", out(reg) spsr, options(nomem, nostack, preserves_flags));
-            }
-            2 => {
-                asm!("mrs {}, esr_el2", out(reg) esr, options(nomem, nostack, preserves_flags));
-                asm!("mrs {}, far_el2", out(reg) far, options(nomem, nostack, preserves_flags));
-                asm!("mrs {}, elr_el2", out(reg) elr, options(nomem, nostack, preserves_flags));
-                asm!("mrs {}, spsr_el2", out(reg) spsr, options(nomem, nostack, preserves_flags));
-            }
-            3 => {
-                asm!("mrs {}, esr_el3", out(reg) esr, options(nomem, nostack, preserves_flags));
-                asm!("mrs {}, far_el3", out(reg) far, options(nomem, nostack, preserves_flags));
-                asm!("mrs {}, elr_el3", out(reg) elr, options(nomem, nostack, preserves_flags));
-                asm!("mrs {}, spsr_el3", out(reg) spsr, options(nomem, nostack, preserves_flags));
-            }
-            _ => {
-                esr = 0;
-                far = 0;
-                elr = 0;
-                spsr = 0;
-            }
-        }
-    }
-
+    let state = exception_state();
+    let exception_class = ((state.syndrome >> 26) & 0x3f) as u8;
+    let (message, code) = match exception_class {
+        0x20 | 0x21 => ("aarch64 instruction abort", exception_class as u64),
+        0x24 | 0x25 => ("aarch64 data abort", exception_class as u64),
+        _ => ("aarch64 exception", exception_class as u64),
+    };
     crate::irq::exception();
-    crate::kprintln!("  frame: elr=0x{:016x} spsr=0x{:016x}", elr, spsr);
+    crate::kprintln!(
+        "  frame: el{} elr=0x{:016x} spsr=0x{:016x} esr=0x{:016x} far=0x{:016x}",
+        state.current_el,
+        state.return_address,
+        state.saved_program_status,
+        state.syndrome,
+        state.fault_address,
+    );
     crate::crash::fatal(crate::error::KernelError::arch_cpu_exception(
-        "aarch64 exception",
-        0x20ff,
-        "arg0 contains current_el in high nibble and esr in low bits; arg1 is far",
-        (((current_el >> 2) & 3) << 60) | esr,
-        far,
+        message,
+        code,
+        "arg0 is ESR_ELx syndrome; arg1 is FAR_ELx fault address",
+        state.syndrome,
+        state.fault_address,
     ))
 }

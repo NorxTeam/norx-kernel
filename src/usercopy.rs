@@ -189,4 +189,15 @@ pub fn contract_self_check() {
     let unmapped = USER_LIMIT - 0x1000;
     assert_eq!(copy_from_user(unmapped, &mut output), Err(Error::Unmapped));
     assert_eq!(copy_to_user(unmapped, b"x"), Err(Error::Unmapped));
+    #[cfg(target_arch = "aarch64")]
+    {
+        let fault = crate::arch::tables::last_usercopy_fault().expect("aarch64 usercopy fault");
+        let exception_class = (fault.exception.syndrome >> 26) & 0x3f;
+        assert!(matches!(exception_class, 0x24 | 0x25));
+        assert_eq!(fault.exception.fault_address, unmapped);
+        assert_eq!(fault.recovery_address, recovery_address());
+        let copy_start = norx_aarch64_copy_from_user as *const () as u64;
+        assert!(fault.exception.return_address >= copy_start);
+        assert!(fault.exception.return_address < fault.recovery_address);
+    }
 }

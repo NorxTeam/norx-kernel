@@ -223,6 +223,9 @@ pub fn kernel_start() -> ! {
         syscall::MAX_ARGS,
     ));
     usercopy::contract_self_check();
+    #[cfg(target_arch = "aarch64")]
+    bootlog::ok("aarch64 ESR/FAR/ELR exception entry and usercopy recovery checks passed");
+    #[cfg(target_arch = "x86_64")]
     bootlog::ok(
         "user pointer validation and fault boundary checks passed; process user pages unavailable",
     );
