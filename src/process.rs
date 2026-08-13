@@ -1302,6 +1302,19 @@ pub fn address_space_root(process: ProcessId) -> Result<Option<PhysAddr>, Error>
     })
 }
 
+pub fn handle_user_fault(fault: crate::vm::FaultInfo) -> crate::vm::FaultResult {
+    let Some(process) = current_process_id() else {
+        return crate::vm::FaultResult::KernelFatal;
+    };
+    crate::user_runtime::handle_fault(process, fault).unwrap_or_else(|| {
+        if fault.user {
+            crate::vm::FaultResult::UserFault(crate::vm::FaultReason::InvalidAddress)
+        } else {
+            crate::vm::FaultResult::KernelFatal
+        }
+    })
+}
+
 pub fn clear_address_space(process: ProcessId) -> Result<(), Error> {
     crate::arch::without_interrupts(|| unsafe {
         (&mut *RUNTIME.0.get()).table.clear_address_space(process)

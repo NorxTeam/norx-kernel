@@ -50,8 +50,9 @@ pub fn replace<'a>(
         Ok(interpreter) => interpreter,
         Err(error) => return Replacement::RolledBack(old, Error::Elf(error)),
     };
-    let mut next = match NativeRuntime::prepare(
+    let mut next = match NativeRuntime::prepare_image(
         request.owner,
+        request.image,
         &plan,
         request.aslr,
         request.arguments,

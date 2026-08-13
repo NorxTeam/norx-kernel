@@ -1,4 +1,4 @@
-use crate::address_space::{AddressSpace, AslrHook, PageFlags, PAGE_SIZE, USER_LIMIT};
+use crate::address_space::{AddressSpace, AslrHook, PageFlags, PAGE_SIZE};
 use crate::elf::{InitialRegisters, LoadPlan};
 use crate::process::ProcessId;
 use core::cell::UnsafeCell;
@@ -114,13 +114,14 @@ impl NativeRuntime {
             let _ = address_space.destroy();
             return Err(Error::AddressSpace(error));
         }
-        let stack = match plan.build_initial_stack(USER_LIMIT - PAGE_SIZE, arguments, environment) {
-            Ok(stack) => stack,
-            Err(error) => {
-                let _ = address_space.destroy();
-                return Err(Error::Elf(error));
-            }
-        };
+        let stack =
+            match plan.build_initial_stack(address_space.stack_top(), arguments, environment) {
+                Ok(stack) => stack,
+                Err(error) => {
+                    let _ = address_space.destroy();
+                    return Err(Error::Elf(error));
+                }
+            };
         if image.is_some() {
             address_space
                 .load(stack.string_base(), stack.string_bytes())
@@ -129,10 +130,13 @@ impl NativeRuntime {
                 .load_words(stack.stack_pointer, stack.words())
                 .map_err(Error::AddressSpace)?;
         }
+        let heap_next = address_space
+            .heap_base(align_up(heap_next, PAGE_SIZE).ok_or(Error::NoSpace)?)
+            .ok_or(Error::NoSpace)?;
         Ok(Self {
             address_space,
             registers: stack.registers(plan.entry),
-            heap_next: align_up(heap_next, PAGE_SIZE).ok_or(Error::NoSpace)?,
+            heap_next,
             started: false,
             exited: false,
         })
@@ -224,7 +228,7 @@ impl NativeRuntime {
         }
         let size = align_up(bytes, PAGE_SIZE).ok_or(Error::NoSpace)?;
         let end = self.heap_next.checked_add(size).ok_or(Error::NoSpace)?;
-        if end > USER_LIMIT {
+        if end > self.address_space.heap_limit() {
             return Err(Error::NoSpace);
         }
         let start = self.heap_next;
@@ -336,6 +340,18 @@ pub fn discard(process: ProcessId) -> Result<(), Error> {
         return Ok(());
     };
     runtime.discard()
+}
+
+pub fn handle_fault(
+    process: ProcessId,
+    fault: crate::vm::FaultInfo,
+) -> Option<crate::vm::FaultResult> {
+    let index = runtime_index(process)?;
+    crate::arch::without_interrupts(|| unsafe {
+        (&mut *RUNTIME_STORE.0.get())[index]
+            .as_mut()
+            .map(|runtime| runtime.address_space.handle_fault(fault))
+    })
 }
 
 fn align_up(value: usize, alignment: usize) -> Option<usize> {

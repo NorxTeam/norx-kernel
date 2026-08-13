@@ -56,6 +56,9 @@ static mut SWITCH_FROM: u64 = 0;
 static mut SWITCH_TO: u64 = 0;
 
 #[no_mangle]
+pub static mut PAGE_FAULT_TARGET_CONTEXT: u64 = 0;
+
+#[no_mangle]
 static mut KERNEL_STACK_TOP: u64 = 0;
 
 #[no_mangle]
@@ -305,6 +308,28 @@ pub fn request_user_switch(from: u32, to: u32) {
         SWITCH_FROM = from as u64;
         SWITCH_TO = to as u64;
     }
+}
+
+pub fn terminate_user_fault() -> u64 {
+    let Some((_, from)) = crate::process::current_ids() else {
+        return 0;
+    };
+    let Ok(switch) = crate::process::exit_current(128 + 11) else {
+        return 0;
+    };
+    let Some(switch) = switch else {
+        return crate::syscall::PAGE_FAULT_EXIT;
+    };
+    let Ok(root) = crate::process::commit_user_switch(from, switch.to.get()) else {
+        return 0;
+    };
+    if !crate::arch::switch_to_user(root) {
+        return 0;
+    }
+    unsafe {
+        PAGE_FAULT_TARGET_CONTEXT = context_pointer(switch.to.get()) as u64;
+    }
+    crate::syscall::PAGE_FAULT_SWITCH
 }
 
 pub fn has_user_context(thread: u32) -> bool {

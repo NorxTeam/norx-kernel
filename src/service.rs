@@ -538,7 +538,8 @@ pub fn risky_driver_handoff() -> bool {
         }
     };
     let image = crate::elf::service_image(crate::elf::Machine::current());
-    let plan = match crate::elf::parse(&image, crate::elf::Machine::current(), USER_SERVICE_BASE) {
+    let load_bias = crate::elf::load_bias_for_image(&image, USER_SERVICE_BASE, 53);
+    let plan = match crate::elf::parse(&image, crate::elf::Machine::current(), load_bias) {
         Ok(plan) => plan,
         Err(error) => {
             crate::bootlog::warn_fmt(format_args!("xHCI service image parse failed: {:?}", error));
@@ -831,7 +832,7 @@ fn run_init_fixture(image: &[u8], label: &'static str, external: bool) -> bool {
         return false;
     }
 
-    let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE);
+    let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE, 47);
     crate::bootlog::quickinit_overlay_stage("validating ELF", 28);
     let plan = match crate::elf::parse(image, crate::elf::Machine::current(), load_bias) {
         Ok(plan) => plan,
@@ -976,7 +977,7 @@ pub fn spawn_user_path(path: &str) -> Result<u32, SpawnError> {
             }
             _ => SpawnError::InvalidState,
         })?;
-    let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE);
+    let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE, 53);
     let plan = match crate::elf::parse(image, crate::elf::Machine::current(), load_bias) {
         Ok(plan) => plan,
         Err(_) => {
@@ -1097,7 +1098,7 @@ fn spawn_user_path_resumable_with_args_and_credentials(
             }
             _ => SpawnError::InvalidState,
         })?;
-    let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE);
+    let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE, 53);
     let plan = match crate::elf::parse(image, crate::elf::Machine::current(), load_bias) {
         Ok(plan) => plan,
         Err(_) => {
@@ -1193,7 +1194,7 @@ fn run_user_fixture(image: &[u8], label: &'static str, external: bool) -> bool {
             return false;
         }
     };
-    let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE);
+    let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE, 47);
     if quickinit {
         crate::bootlog::quickinit_overlay_stage("validating ELF", 28);
     }

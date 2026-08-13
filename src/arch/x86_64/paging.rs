@@ -165,7 +165,14 @@ pub fn user_space_map(
     mapping: crate::address_space::MappingInfo,
     tables: &mut [Option<crate::address::PhysAddr>],
 ) -> bool {
-    if !mapping.virtual_address.is_multiple_of(4096)
+    if !mapping.flags.is_valid()
+        || mapping.virtual_address < crate::address_space::PAGE_SIZE
+        || mapping.virtual_address >= crate::address_space::USER_LIMIT
+        || mapping
+            .virtual_address
+            .checked_add(crate::address_space::PAGE_SIZE)
+            .is_none_or(|end| end > crate::address_space::USER_LIMIT)
+        || !mapping.virtual_address.is_multiple_of(4096)
         || !mapping.physical_frame.value().is_multiple_of(4096)
     {
         return false;

@@ -13,6 +13,8 @@ pub type UserPointer = u64;
 // request to leave the user entry path.
 pub const EXIT_TO_KERNEL: UserWord = UserWord::MAX - 4096;
 pub const SWITCH_TO_USER: UserWord = UserWord::MAX - 4097;
+pub const PAGE_FAULT_SWITCH: UserWord = UserWord::MAX - 4098;
+pub const PAGE_FAULT_EXIT: UserWord = UserWord::MAX - 4099;
 
 #[repr(u64)]
 #[derive(Clone, Copy, PartialEq, Eq)]

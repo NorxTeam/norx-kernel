@@ -37,6 +37,10 @@ pub enum FaultReason {
     OutOfMemory,
 }
 
+pub fn handle_user_fault(fault: FaultInfo) -> FaultResult {
+    crate::process::handle_user_fault(fault)
+}
+
 impl FaultInfo {
     #[cfg(target_arch = "x86_64")]
     pub const fn x86_page_fault(address: usize, error_code: u64) -> Self {
@@ -69,6 +73,24 @@ impl FaultInfo {
             },
             write: syndrome & (1 << 6) != 0,
             instruction: false,
+            user: from_user,
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub const fn aarch64_instruction_abort(address: usize, syndrome: u64, from_user: bool) -> Self {
+        let status = syndrome & 0x3f;
+        Self {
+            address,
+            raw: syndrome,
+            kind: match status {
+                0b000100..=0b000111 => FaultKind::Translation,
+                0b001000..=0b001011 => FaultKind::AccessFlag,
+                0b001100..=0b001111 => FaultKind::Protection,
+                _ => FaultKind::Unknown,
+            },
+            write: false,
+            instruction: true,
             user: from_user,
         }
     }
@@ -157,6 +179,8 @@ pub fn contract_self_check() -> bool {
         assert_eq!(fault.kind, FaultKind::Translation);
         assert!(fault.write);
         assert!(fault.user);
+        let instruction = FaultInfo::aarch64_instruction_abort(0x1234_5000, syndrome, true);
+        assert!(instruction.instruction);
         true
     }
 }

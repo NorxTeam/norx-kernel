@@ -284,6 +284,38 @@ extern "C" fn norx_aarch64_usercopy_fault(rip: u64) -> u64 {
 }
 
 #[no_mangle]
+extern "C" fn norx_aarch64_user_fault() -> u64 {
+    let exception = crate::arch::tables::exception_state();
+    let from_user = exception.saved_program_status & 0xf == 0;
+    if !from_user {
+        return 0;
+    }
+    let class = (exception.syndrome >> 26) & 0x3f;
+    let fault = if matches!(class, 0x20 | 0x21) {
+        crate::vm::FaultInfo::aarch64_instruction_abort(
+            exception.fault_address as usize,
+            exception.syndrome,
+            true,
+        )
+    } else {
+        crate::vm::FaultInfo::aarch64_data_abort(
+            exception.fault_address as usize,
+            exception.syndrome,
+            true,
+        )
+    };
+    match crate::vm::handle_user_fault(fault) {
+        crate::vm::FaultResult::Resolved => 1,
+        crate::vm::FaultResult::UserFault(_) => match crate::process::exit_current(128 + 11) {
+            Ok(Some(_)) => crate::syscall::SWITCH_TO_USER,
+            Ok(None) => crate::syscall::EXIT_TO_KERNEL,
+            Err(_) => 0,
+        },
+        crate::vm::FaultResult::KernelFatal => 0,
+    }
+}
+
+#[no_mangle]
 extern "C" fn norx_aarch64_syscall_rust(
     _op: u64,
     _a0: u64,

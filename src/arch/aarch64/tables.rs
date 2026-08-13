@@ -123,6 +123,10 @@ norx_aarch64_exception_frame:
     ubfx x12, x10, #26, #6
     cmp x12, #0x15
     b.eq 6f
+    cmp x12, #0x20
+    b.eq 55f
+    cmp x12, #0x21
+    b.eq 55f
     cmp x12, #0x24
     b.eq 5f
     cmp x12, #0x25
@@ -154,6 +158,18 @@ norx_aarch64_exception_frame:
     cbz x0, 9f
     msr elr_el3, x0
     b 7f
+55:
+    bl norx_aarch64_user_fault
+    mov x9, #1
+    cmp x0, x9
+    b.eq 7f
+    mov x9, #-4098
+    cmp x0, x9
+    b.eq 10f
+    mov x9, #-4097
+    cmp x0, x9
+    b.eq 8f
+    b 9f
 6:
     mov x9, x0
     mov x10, x1

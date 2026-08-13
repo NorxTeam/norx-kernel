@@ -114,7 +114,8 @@ pub fn user_space_map(
     mapping: crate::address_space::MappingInfo,
     tables: &mut [Option<crate::address::PhysAddr>],
 ) -> bool {
-    if !mapping.flags.user
+    if !mapping.flags.is_valid()
+        || mapping.virtual_address < crate::address_space::PAGE_SIZE
         || !mapping.virtual_address.is_multiple_of(PAGE_SIZE as usize)
         || mapping.virtual_address >= crate::address_space::USER_LIMIT
         || !mapping.physical_frame.is_aligned(PAGE_SIZE as usize)

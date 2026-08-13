@@ -34,6 +34,10 @@ norx_page_fault_entry:
     mov rax, r15
     test rax, rax
     jz 1f
+    cmp rax, -4099
+    je 2f
+    cmp rax, -4100
+    je 3f
     mov qword ptr [rbx + 128], rax
     mov rsp, rbx
     pop r15
@@ -53,6 +57,52 @@ norx_page_fault_entry:
     pop rax
     add rsp, 8
     iretq
+2:
+    mov rdx, qword ptr [rip + PAGE_FAULT_TARGET_CONTEXT]
+    test rdx, rdx
+    jz 1f
+    mov rsp, rbx
+    push 0x1b
+    push qword ptr [rdx + 8]
+    push qword ptr [rdx + 16]
+    push 0x23
+    push qword ptr [rdx + 0]
+    mov rax, qword ptr [rdx + 24]
+    mov rbx, qword ptr [rdx + 32]
+    mov rbp, qword ptr [rdx + 40]
+    mov r12, qword ptr [rdx + 48]
+    mov r13, qword ptr [rdx + 56]
+    mov r14, qword ptr [rdx + 64]
+    mov r15, qword ptr [rdx + 72]
+    mov rdi, qword ptr [rdx + 80]
+    mov rsi, qword ptr [rdx + 88]
+    mov r8, qword ptr [rdx + 104]
+    mov r9, qword ptr [rdx + 112]
+    mov r10, qword ptr [rdx + 120]
+    mov rdx, qword ptr [rdx + 96]
+    iretq
+3:
+    mov rax, qword ptr [rip + USER_RETURN_DEPTH]
+    test rax, rax
+    jz 1f
+    dec rax
+    mov qword ptr [rip + USER_RETURN_DEPTH], rax
+    lea rdx, [rip + KERNEL_RETURN_RBX_STACK]
+    mov rbx, qword ptr [rdx + rax*8]
+    lea rdx, [rip + KERNEL_RETURN_RBP_STACK]
+    mov rbp, qword ptr [rdx + rax*8]
+    lea rdx, [rip + KERNEL_RETURN_R12_STACK]
+    mov r12, qword ptr [rdx + rax*8]
+    lea rdx, [rip + KERNEL_RETURN_R13_STACK]
+    mov r13, qword ptr [rdx + rax*8]
+    lea rdx, [rip + KERNEL_RETURN_R14_STACK]
+    mov r14, qword ptr [rdx + rax*8]
+    lea rdx, [rip + KERNEL_RETURN_R15_STACK]
+    mov r15, qword ptr [rdx + rax*8]
+    lea rdx, [rip + USER_RETURN_RSP_STACK]
+    mov rsp, qword ptr [rdx + rax*8]
+    sti
+    ret
 1:
     mov rsp, rbx
     pop r15
@@ -417,8 +467,21 @@ extern "C" fn norx_page_fault_dispatch(rip: u64, code: u64) -> u64 {
     if crate::usercopy::handles_fault(rip) {
         return crate::usercopy::recovery_address();
     }
-    if crate::vm::handle_page_fault(crate::vm::FaultInfo::x86_page_fault(address, code)) {
+    let fault = crate::vm::FaultInfo::x86_page_fault(address, code);
+    if crate::vm::handle_page_fault(fault) {
         return rip;
+    }
+    if fault.user {
+        match crate::vm::handle_user_fault(fault) {
+            crate::vm::FaultResult::Resolved => return rip,
+            crate::vm::FaultResult::UserFault(_) => {
+                let result = crate::arch::syscall::terminate_user_fault();
+                if result != 0 {
+                    return result;
+                }
+            }
+            crate::vm::FaultResult::KernelFatal => {}
+        }
     }
     crate::irq::exception();
     crate::kprintln!("  frame: rip=0x{:016x}", rip);

@@ -50,7 +50,10 @@ pub struct SegmentFlags {
 impl SegmentFlags {
     const fn from_raw(raw: u32) -> Self {
         Self {
-            readable: raw & 4 != 0,
+            // Hardware page tables expose writable user pages as readable too.
+            // Normalize a producer's W-only segment to the permission class
+            // the MMU can actually enforce instead of rejecting valid images.
+            readable: raw & 4 != 0 || raw & PF_W != 0,
             writable: raw & PF_W != 0,
             executable: raw & PF_X != 0,
         }
@@ -292,6 +295,7 @@ pub enum Error {
     FileSizeExceedsMemory,
     SegmentOverlap,
     WriteExecute,
+    InvalidPermissions,
     InvalidEntry,
     TooManyStrings,
     InteriorNul,
@@ -388,6 +392,9 @@ pub fn parse(image: &[u8], machine: Machine, load_bias: usize) -> Result<LoadPla
         if file_offset % PAGE_SIZE as u64 != virtual_raw % PAGE_SIZE as u64 {
             return Err(Error::InvalidAlignment);
         }
+        if virtual_raw % PAGE_SIZE as u64 != 0 {
+            return Err(Error::InvalidAlignment);
+        }
         let file_end = file_offset
             .checked_add(file_size)
             .ok_or(Error::FileRangeOverflow)?;
@@ -410,6 +417,9 @@ pub fn parse(image: &[u8], machine: Machine, load_bias: usize) -> Result<LoadPla
         let flags = SegmentFlags::from_raw(flags_raw);
         if flags.writable && flags.executable {
             return Err(Error::WriteExecute);
+        }
+        if !flags.readable {
+            return Err(Error::InvalidPermissions);
         }
         let segment = SegmentPlan {
             virtual_start,
@@ -688,11 +698,13 @@ pub(crate) fn sudo_image() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/sudo-smoke.elf"))
 }
 
-pub(crate) fn load_bias_for_image(image: &[u8], dynamic_bias: usize) -> usize {
+pub(crate) fn load_bias_for_image(image: &[u8], dynamic_bias: usize, seed: u64) -> usize {
     if image.len() >= 18 && u16::from_le_bytes([image[16], image[17]]) == ET_EXEC {
         0
     } else {
-        dynamic_bias
+        crate::address_space::AslrHook::new(seed)
+            .choose_base(dynamic_bias, PAGE_SIZE, PAGE_SIZE)
+            .unwrap_or(dynamic_bias)
     }
 }
 
@@ -717,6 +729,7 @@ pub fn contract_self_check() {
         Error::FileSizeExceedsMemory,
         Error::SegmentOverlap,
         Error::WriteExecute,
+        Error::InvalidPermissions,
         Error::InvalidEntry,
         Error::TooManyStrings,
         Error::InteriorNul,
@@ -762,6 +775,18 @@ pub fn contract_self_check() {
     assert_eq!(
         parse(&variant, Machine::current(), 0),
         Err(Error::WriteExecute)
+    );
+    variant = image;
+    write_u64(&mut variant, program_header + 16, 0x400123);
+    assert_eq!(
+        parse(&variant, Machine::current(), 0),
+        Err(Error::InvalidAlignment)
+    );
+    variant = image;
+    write_u32(&mut variant, program_header + 4, PF_X);
+    assert_eq!(
+        parse(&variant, Machine::current(), 0),
+        Err(Error::InvalidPermissions)
     );
     variant = image;
     variant[0] = 0;

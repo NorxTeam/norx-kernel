@@ -41,17 +41,21 @@ impl PageFlags {
         executable: true,
     };
 
-    fn validate(self) -> Result<(), Error> {
+    pub(crate) fn validate(self) -> Result<(), Error> {
         if !self.user {
             return Err(Error::KernelMapping);
         }
         if self.writable && self.executable {
             return Err(Error::WriteExecute);
         }
-        if !self.readable && !self.writable && !self.executable {
+        if !self.readable {
             return Err(Error::NoAccess);
         }
         Ok(())
+    }
+
+    pub(crate) const fn is_valid(self) -> bool {
+        self.user && self.readable && !(self.writable && self.executable)
     }
 }
 
@@ -100,6 +104,8 @@ pub struct AslrHook {
 }
 
 impl AslrHook {
+    const WINDOW: usize = 256 * 1024 * 1024;
+
     pub const fn new(seed: u64) -> Self {
         Self { seed }
     }
@@ -110,8 +116,10 @@ impl AslrHook {
         }
         let span = align_up(span, PAGE_SIZE)?;
         let alignment_mask = alignment - 1;
-        let jitter = self.seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) as usize;
-        let base = hint.checked_add(jitter & alignment_mask)? & !alignment_mask;
+        let slots = (Self::WINDOW / alignment).max(1);
+        let jitter = self.seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let offset = ((jitter >> 12) as usize % slots).checked_mul(alignment)?;
+        let base = hint.checked_add(offset)? & !alignment_mask;
         let end = base.checked_add(span)?;
         if base < PAGE_SIZE || end > USER_LIMIT {
             return None;
@@ -142,7 +150,13 @@ impl AddressSpace {
             owner: Some(owner),
             root_frame: Some(root_frame),
             mappings: [None; MAX_MAPPINGS],
-            stack_top: USER_LIMIT - PAGE_SIZE,
+            stack_top: aslr
+                .choose_base(
+                    USER_LIMIT.saturating_sub(AslrHook::WINDOW),
+                    PAGE_SIZE,
+                    PAGE_SIZE,
+                )
+                .unwrap_or(USER_LIMIT - PAGE_SIZE),
             stack_guard: None,
             stack_pages: 0,
             aslr,
@@ -161,6 +175,19 @@ impl AddressSpace {
 
     pub fn aslr_base(&self, hint: usize, span: usize, alignment: usize) -> Option<usize> {
         self.aslr.choose_base(hint, span, alignment)
+    }
+
+    pub fn stack_top(&self) -> usize {
+        self.stack_top
+    }
+
+    pub fn heap_base(&self, hint: usize) -> Option<usize> {
+        let base = self.aslr.choose_base(hint, PAGE_SIZE, PAGE_SIZE)?;
+        (base < self.heap_limit()).then_some(base)
+    }
+
+    pub(crate) fn heap_limit(&self) -> usize {
+        self.stack_guard.unwrap_or(self.stack_top)
     }
 
     pub fn map_anonymous(
@@ -273,7 +300,7 @@ impl AddressSpace {
             crate::arch::restore_kernel_address_space();
             self.active = false;
         }
-        if self.root_frame.is_none() {
+        if self.root_frame.is_none() || self.active {
             return Err(Error::InvalidState);
         }
         let mut error = None;
@@ -336,7 +363,7 @@ impl AddressSpace {
 
     #[allow(dead_code)]
     pub fn load(&self, virtual_address: usize, bytes: &[u8]) -> Result<(), Error> {
-        if self.root_frame.is_none() {
+        if self.root_frame.is_none() || self.active {
             return Err(Error::InvalidState);
         }
         let mut cursor = virtual_address;
@@ -522,6 +549,22 @@ pub fn contract_self_check() {
         space.map_anonymous(base, PageFlags::USER_RW),
         Err(Error::Overlap)
     );
+    assert_ne!(
+        space.aslr_base(base_hint, PAGE_SIZE, PAGE_SIZE),
+        AslrHook::new(8).choose_base(base_hint, PAGE_SIZE, PAGE_SIZE)
+    );
+    assert_eq!(
+        space.map_anonymous(
+            base + PAGE_SIZE * 4,
+            PageFlags {
+                user: true,
+                readable: false,
+                writable: false,
+                executable: true,
+            },
+        ),
+        Err(Error::NoAccess)
+    );
     assert_eq!(
         space.map_anonymous(
             base + PAGE_SIZE * 2,
@@ -534,6 +577,16 @@ pub fn contract_self_check() {
         ),
         Err(Error::WriteExecute)
     );
+    let load_page = base + PAGE_SIZE * 3;
+    space.map_anonymous(load_page, PageFlags::USER_RX).unwrap();
+    space.activate().unwrap();
+    assert_eq!(space.load(load_page, &[0xaa]), Err(Error::InvalidState));
+    space.destroy().unwrap();
+    let mut space = AddressSpace::new(owner, AslrHook::new(7)).unwrap();
+    let base = space
+        .aslr_base(base_hint, PAGE_SIZE * 2, PAGE_SIZE)
+        .unwrap();
+    space.map_anonymous(base, PageFlags::USER_RX).unwrap();
     space.map_stack().unwrap();
     let guard = space.stack_guard().unwrap();
     assert_eq!(
