@@ -229,6 +229,10 @@ pub fn timer_frequency_hz() -> Option<u64> {
     Some(value)
 }
 
+pub fn timer_source() -> &'static str {
+    "poll"
+}
+
 pub fn init_timer_interrupts() -> bool {
     false
 }

@@ -123,9 +123,36 @@ pub fn timer_frequency_hz() -> Option<u64> {
     None
 }
 
+pub fn timer_source() -> &'static str {
+    if apic::timer_enabled() {
+        "apic"
+    } else {
+        "pit"
+    }
+}
+
 pub fn init_timer_interrupts() -> bool {
+    if apic::timer_calibration().is_some() {
+        remap_pic();
+        disable_legacy_irq(0);
+        if apic::enable_timer() {
+            let input_ok = crate::drivers::ps2::enable_interrupts();
+            let ps2 = crate::drivers::ps2::status();
+            if input_ok && ps2.controller {
+                crate::bootlog::ok("ps/2 IRQ1/IRQ12 routing enabled");
+            } else if !input_ok && ps2.controller {
+                crate::bootlog::warn("ps/2 interrupt routing unavailable; input remains polled");
+            } else {
+                crate::bootlog::warn("ps/2 IRQ routing skipped; controller unavailable");
+            }
+            crate::bootlog::ok("APIC timer IRQ enabled; PIT IRQ0 masked");
+            unsafe { asm!("sti", options(nomem, nostack, preserves_flags)) };
+            return true;
+        }
+    }
     remap_pic();
     init_pit(crate::time::scheduler_hz() as u16);
+    crate::bootlog::ok("timer source=pit calibration=none");
     let input_ok = crate::drivers::ps2::enable_interrupts();
     let ps2 = crate::drivers::ps2::status();
     if input_ok && ps2.controller {
@@ -140,19 +167,36 @@ pub fn init_timer_interrupts() -> bool {
 }
 
 pub fn init_interrupt_controller() {
+    apic::contract_self_check();
     let status = apic::init();
     if status.present {
         crate::bootlog::ok_fmt(format_args!(
-            "local apic id {} version {} base 0x{:x} x2apic={} enabled={} software={}",
+            "local apic id {} version {} base 0x{:x} x2apic={} x2apic-enabled={} enabled={} software={}",
             status.id,
             status.version,
             status.base,
             status.x2apic,
+            status.x2apic_enabled,
             status.enabled,
             status.software_enabled
         ));
     } else {
         crate::bootlog::warn("local apic unavailable; using legacy pic");
+    }
+    if let Some(calibration) =
+        apic::prepare_timer(crate::boot::info().acpi_rsdp, crate::time::scheduler_hz())
+    {
+        crate::bootlog::ok_fmt(format_args!(
+            "timer source=apic calibration=hpet reference_hz={} apic_hz={} target_hz={} initial_count={}",
+            calibration.hpet_hz,
+            calibration.apic_timer_hz,
+            crate::time::scheduler_hz(),
+            calibration.initial_count,
+        ));
+    } else {
+        crate::bootlog::warn(
+            "APIC/HPET timer calibration unavailable; legacy PIT/PIC fallback remains",
+        );
     }
 }
 
@@ -180,7 +224,11 @@ pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
 }
 
 pub fn end_timer_interrupt() {
-    port_write(0x20, 0x20);
+    if apic::timer_enabled() {
+        apic::end_of_interrupt();
+    } else {
+        port_write(0x20, 0x20);
+    }
 }
 
 pub fn end_legacy_interrupt(line: u8) {
@@ -201,6 +249,17 @@ pub fn enable_legacy_irq(line: u8) {
     port_write(0xa1, slave_mask);
     let master_mask = port_read(0x21) & !(1 << 2);
     port_write(0x21, master_mask);
+}
+
+pub fn disable_legacy_irq(line: u8) {
+    if line < 8 {
+        let mask = port_read(0x21) | (1 << line);
+        port_write(0x21, mask);
+        return;
+    }
+    let slave_line = line - 8;
+    let slave_mask = port_read(0xa1) | (1 << slave_line);
+    port_write(0xa1, slave_mask);
 }
 
 pub fn fault_address() -> usize {

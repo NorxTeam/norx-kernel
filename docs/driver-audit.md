@@ -228,8 +228,8 @@ paths are evidence for the audit only.
   requirements justify a second block implementation.
 - Direct VFS-to-LBA knowledge with the first mountable filesystem vertical
   path.
-- PIC/PIT-only timer delivery with an explicit interrupt/timer source contract
-  after APIC/HPET and GIC work is ready.
+- Legacy PIT/PIC fallback remains available behind an explicit interrupt/timer
+  source contract; x86 APIC/HPET delivery is now the calibrated default.
 - Raw framebuffer assumptions with a display contract once mode selection,
   flush, cursor, damage, and hotplug semantics are needed.
 

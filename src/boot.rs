@@ -30,11 +30,13 @@ norx_multiboot2_header:
 
     .short 1
     .short 0
-    .long 24
+    .long 32
     .long 6
     .long 8
     .long 1
     .long 12
+    .long 14
+    .long 15
     .align 8
 
     .short 5
@@ -167,6 +169,8 @@ pub struct BootInfo {
     pub cmdline_len: usize,
     pub handoff_address: u64,
     pub efi_system_table: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub acpi_rsdp: u64,
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub efi_runtime_el: u8,
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
@@ -190,6 +194,8 @@ impl BootInfo {
             cmdline_len: 0,
             handoff_address: 0,
             efi_system_table: 0,
+            #[cfg(target_arch = "x86_64")]
+            acpi_rsdp: 0,
             efi_runtime_el: 0,
             efi_runtime_vbar: 0,
             efi_runtime_sp_el0: 0,
@@ -437,6 +443,7 @@ unsafe fn parse_multiboot2(address: usize) -> Option<BootInfo> {
     let mut framebuffer_info = None;
     let mut efi_system_table = 0u64;
     let mut efi_image_handle = 0u64;
+    let mut acpi_rsdp = 0u64;
 
     while offset.checked_add(8)? <= total_size {
         let tag = address.checked_add(offset)?;
@@ -488,6 +495,8 @@ unsafe fn parse_multiboot2(address: usize) -> Option<BootInfo> {
                 }
             }
             12 if size >= 16 => efi_system_table = read_u64(tag + 8)?,
+            14 if size >= 28 && acpi_rsdp == 0 => acpi_rsdp = tag as u64 + 8,
+            15 if size >= 44 => acpi_rsdp = tag as u64 + 8,
             20 if size >= 16 => efi_image_handle = read_u64(tag + 8)?,
             0 => break,
             _ => {}
@@ -504,6 +513,7 @@ unsafe fn parse_multiboot2(address: usize) -> Option<BootInfo> {
     info.framebuffer = framebuffer_info;
     info.handoff_address = address as u64;
     info.efi_system_table = efi_system_table;
+    info.acpi_rsdp = acpi_rsdp;
     add_reserved(&mut info, address as u64, total_size as u64);
     #[cfg(not(target_os = "uefi"))]
     reserve_kernel(&mut info);

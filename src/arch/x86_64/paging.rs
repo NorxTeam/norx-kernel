@@ -5,6 +5,8 @@ const TABLE_PAGES: usize = 32;
 const HUGE_PAGE_BYTES: usize = 2 * 1024 * 1024;
 const DIRECT_MAP_LIMIT: usize = 1usize << 47;
 pub const DIRECT_MAP_BASE: usize = 0xffff_8000_0000_0000;
+const DEVICE_MAP_BASE: usize = 0xffff_a000_0000_0000;
+const DEVICE_MAP_LIMIT: usize = 0xffff_b000_0000_0000;
 
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
@@ -118,6 +120,36 @@ pub fn physical_from_direct_map(virtual_address: usize) -> Option<u64> {
         }
     }
     Some((virtual_address - DIRECT_MAP_BASE) as u64)
+}
+
+pub fn map_device(physical: u64, size: usize) -> Option<usize> {
+    if size == 0 {
+        return None;
+    }
+    let physical_start = usize::try_from(physical).ok()? & !0xfff;
+    let physical_end = physical.checked_add(size as u64)?.checked_add(0xfff)? & !0xfff;
+    let bytes = usize::try_from(physical_end.checked_sub(physical_start as u64)?).ok()?;
+    let virtual_end = DEVICE_MAP_BASE.checked_add(bytes)?;
+    if virtual_end > DEVICE_MAP_LIMIT {
+        return None;
+    }
+    crate::arch::without_interrupts(|| unsafe {
+        let mut offset = 0usize;
+        while offset < bytes {
+            let Some(frame) = physical_start.checked_add(offset) else {
+                return None;
+            };
+            if !map_to_flags(
+                DEVICE_MAP_BASE + offset,
+                frame as u64,
+                PTE_PRESENT | PTE_WRITABLE | PTE_NX,
+            ) {
+                return None;
+            }
+            offset += 4096;
+        }
+        Some(DEVICE_MAP_BASE + (physical as usize - physical_start))
+    })
 }
 
 pub fn stats() -> Stats {

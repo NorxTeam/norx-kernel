@@ -58,6 +58,15 @@ impl MmioRegion {
     }
 
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+    pub fn read_u64_le(self, offset: usize) -> Option<u64> {
+        let address = self.address(offset, 8)?;
+        fence(Ordering::SeqCst);
+        let value = unsafe { (address as *const u64).read_volatile() };
+        fence(Ordering::SeqCst);
+        Some(u64::from_le(value))
+    }
+
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     pub fn write_u8(self, offset: usize, value: u8) -> bool {
         let Some(address) = self.address(offset, 1) else {
             return false;

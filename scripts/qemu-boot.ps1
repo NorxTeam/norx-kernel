@@ -3,6 +3,8 @@ param(
     [ValidateSet('x86_64', 'aarch64')]
     [string]$Arch = 'x86_64',
     [int]$TimeoutSeconds = 60,
+    [string]$Machine,
+    [string]$Cpu,
     [string]$Esp,
     [string]$Vars,
     [string]$SerialLog,
@@ -88,9 +90,11 @@ if (-not (Test-Path $firmwarePath -PathType Leaf)) {
     throw "QEMU firmware not found: $firmwarePath (set QEMU_SHARE)"
 }
 
+$machineName = if ($Machine) { $Machine } elseif ($Arch -eq 'x86_64') { 'q35' } else { 'virt' }
+$cpuName = if ($Cpu) { $Cpu } elseif ($Arch -eq 'x86_64') { 'max' } else { 'cortex-a57' }
 $qemuArgs = @(
-    '-M', $(if ($Arch -eq 'x86_64') { 'q35' } else { 'virt' }),
-    '-cpu', $(if ($Arch -eq 'x86_64') { 'max' } else { 'cortex-a57' }),
+    '-M', $machineName,
+    '-cpu', $cpuName,
     '-m', '256M',
     '-display', 'none',
     '-no-reboot',

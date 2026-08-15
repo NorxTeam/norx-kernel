@@ -6,6 +6,7 @@ const INTERACTIVE_SLICE: u64 = 2;
 const HARDWARE_PROBE_SPINS: u32 = 100_000_000;
 const POLLING_PROBE_SPINS: u32 = 100_000_000;
 const PROBE_BATCH_SPINS: u32 = 4096;
+const RUNTIME_PROBE_TICKS: u64 = 8;
 
 struct RuntimeCell(UnsafeCell<Scheduler>);
 
@@ -182,7 +183,7 @@ pub fn on_timer_tick() {
 
 pub fn runtime_self_check(hardware_ticks: bool) -> bool {
     let before = status();
-    let before_irq_timer = crate::irq::stats().timer;
+    let before_irq = crate::irq::stats();
     if crate::time::scheduler_hz() != 100
         || before.tasks < 2
         || before.current.is_none()
@@ -209,18 +210,22 @@ pub fn runtime_self_check(hardware_ticks: bool) -> bool {
             }
             spins = spins.saturating_add(PROBE_BATCH_SPINS);
         }
-        if status().timer_ticks != before.timer_ticks {
+        if status().timer_ticks.saturating_sub(before.timer_ticks) >= RUNTIME_PROBE_TICKS {
             break;
         }
     }
     let after = status();
-    let after_irq_timer = crate::irq::stats().timer;
+    let after_irq = crate::irq::stats();
     let advanced = after.timer_ticks.saturating_sub(before.timer_ticks);
+    let irq_delta = after_irq.timer.saturating_sub(before_irq.timer);
+    let available = before_irq.timer_pending.saturating_add(irq_delta);
+    let accounted = advanced.saturating_add(after_irq.timer_pending);
     advanced != 0
         && after.clock.saturating_sub(before.clock) >= advanced
         && after.current.is_some()
         && after.next.is_some()
-        && (!hardware_ticks || after_irq_timer > before_irq_timer)
+        && (!hardware_ticks
+            || (after_irq.timer != 0 && accounted <= available && advanced >= RUNTIME_PROBE_TICKS))
 }
 
 pub fn status() -> Status {

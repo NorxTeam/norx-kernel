@@ -343,18 +343,25 @@ pub fn kernel_start() -> ! {
     }
     bootlog::start(3, "selecting timer source");
     if timer_ready {
-        bootlog::ok("timer source irq");
+        bootlog::ok_fmt(format_args!(
+            "timer source={} mode=irq",
+            arch::timer_source()
+        ));
     } else {
-        bootlog::warn("timer source polling");
+        bootlog::warn_fmt(format_args!(
+            "timer source={} mode=poll",
+            arch::timer_source()
+        ));
     }
     let scheduler_runtime_ok = sched::runtime_self_check(timer_ready);
     if scheduler_runtime_ok {
         let status = sched::status();
         let irq = irq::stats();
         bootlog::ok_fmt(format_args!(
-            "scheduler runtime verified hz={} mode={} ticks={} clock={} irq_timer={} irq_deferred_total={}",
+            "scheduler runtime verified hz={} mode={} source={} ticks={} clock={} irq_timer={} irq_deferred_total={}",
             time::scheduler_hz(),
             if timer_ready { "irq" } else { "poll" },
+            arch::timer_source(),
             status.timer_ticks,
             status.clock,
             irq.timer,
