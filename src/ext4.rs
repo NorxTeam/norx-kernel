@@ -834,6 +834,16 @@ pub fn probe_block() -> Result<Mount, Error> {
     Mount::open_at(ramdisk_read_sector, partition.start_lba, partition.sectors)
 }
 
+pub fn probe_block_rw() -> Result<Mount, Error> {
+    let partition = block::partition(0).ok_or(Error::InvalidSuperblock)?;
+    Mount::open_at_rw(
+        ramdisk_read_sector,
+        ramdisk_write_sector,
+        partition.start_lba,
+        partition.sectors,
+    )
+}
+
 pub fn contract_self_check() {
     assert!(fixture_check());
 }
@@ -842,6 +852,12 @@ fn ramdisk_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
     usize::try_from(lba)
         .ok()
         .is_some_and(|lba| block::read_sector(lba, output))
+}
+
+fn ramdisk_write_sector(lba: u64, input: &[u8; SECTOR_SIZE]) -> bool {
+    usize::try_from(lba)
+        .ok()
+        .is_some_and(|lba| block::write_sector(lba, input))
 }
 
 const FIXTURE_SECTORS: usize = 32;

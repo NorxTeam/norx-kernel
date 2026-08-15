@@ -62,6 +62,15 @@ Boot now attempts the first valid persistent reader at `/storage`; its bounded
 VFS smoke is optional when no persistent block device is present and rolls back
 the mount if lookup, metadata, I/O, or reopen checks fail.
 
+The current writable-storage boundary is narrower than the table's original
+deferred summary: FAT32 now includes LFN create/rename/unlink, directory-chain
+growth, and empty-directory removal; journal-clean ext4 supports bounded
+rewrites of existing depth-0 extent files through a JBD2 transaction. Btrfs has
+only a validated COW transaction boundary (generation, checksum, ordering, and
+rollback); allocation, root publication, mirrored superblocks, and recovery are
+still typed-unsupported, so btrfs remains read-only. These additions do not
+claim the complete mount-tree/POSIX filesystem stack.
+
 ## Cross-cutting release rules
 
 1. A caller must have one named owner for every resource, buffer, mapping,

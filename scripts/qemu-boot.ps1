@@ -9,6 +9,7 @@ param(
     [string]$Vars,
     [string]$SerialLog,
     [string]$SerialDevice = 'stdio',
+    [string]$StorageImage,
     [string]$Display = 'none',
     [string[]]$Marker = @(),
     [switch]$Interactive
@@ -65,6 +66,15 @@ if (-not (Test-Path $Esp -PathType Container)) {
 if (-not (Test-Path $Vars -PathType Leaf)) {
     throw "UEFI vars file not found: $Vars (pass -Vars)"
 }
+if ($StorageImage) {
+    if ($Arch -ne 'x86_64') {
+        throw 'StorageImage smoke is supported only on x86_64 virtio-blk'
+    }
+    $StorageImage = Resolve-RepoPath $StorageImage
+    if (-not (Test-Path $StorageImage -PathType Leaf)) {
+        throw "Storage image not found: $StorageImage"
+    }
+}
 
 $qemuName = "qemu-system-$Arch.exe"
 $qemuPath = if ($env:QEMU_BIN) {
@@ -119,6 +129,12 @@ $qemuArgs += @(
     '-drive', "if=pflash,format=raw,file=$Vars",
     '-drive', "format=raw,file=fat:rw:$Esp"
 )
+if ($StorageImage) {
+    $qemuArgs += @(
+        '-drive', "format=raw,file=$StorageImage,if=none,id=storage",
+        '-device', 'virtio-blk-pci,drive=storage'
+    )
+}
 
 if ($Interactive) {
     Write-Host "Launching QEMU $Arch interactively from $Esp"

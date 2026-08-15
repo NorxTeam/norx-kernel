@@ -88,7 +88,11 @@ When a read-only persistent mount is present, `open`, `read`, `lseek`, `stat`,
 `fstat`, `read_dir`, and `fsync` dispatch to the bounded filesystem reader and
 block flush boundary. An explicitly writable FAT32 mount additionally supports
 bounded existing-file rewrite plus short 8.3 create/mkdir, empty-file unlink,
-and same-directory rename; ext4 and btrfs remain read-only. `spawn2`
+and same-directory rename; LFN create/rename, rmdir, and directory-chain growth
+are also bounded. A journal-clean writable ext4 mount supports rewrites of
+existing depth-0 extent files; allocation and directory mutations remain
+unsupported. Btrfs remains read-only until its COW allocator and root
+publication are implemented. `spawn2`
 accepts `NORX_SPAWN_INHERIT_OPEN_FDS`/`SPAWN_INHERIT_OPEN_FDS` for bounded
 inheritance of the parent's open descriptor table while preserving `FD_CLOEXEC`.
 

@@ -229,7 +229,7 @@ impl PersistentBackendKind {
     }
 
     pub const fn read_only(self) -> bool {
-        matches!(self, Self::Ext4 | Self::Btrfs)
+        matches!(self, Self::Btrfs)
     }
 }
 
@@ -544,11 +544,23 @@ impl PersistentBackend {
                 mount.map(Self::Fat32).map_err(map_fat32_error)
             }
             PersistentBackendKind::Ext4 => {
-                ext4::probe_block().map(Self::Ext4).map_err(map_ext4_error)
+                let mount =
+                    if crate::drivers::block::persistent() && !crate::drivers::block::read_only() {
+                        ext4::probe_block_rw()
+                    } else {
+                        ext4::probe_block()
+                    };
+                mount.map(Self::Ext4).map_err(map_ext4_error)
             }
-            PersistentBackendKind::Btrfs => btrfs::probe_block()
-                .map(Self::Btrfs)
-                .map_err(map_btrfs_error),
+            PersistentBackendKind::Btrfs => {
+                let mount =
+                    if crate::drivers::block::persistent() && !crate::drivers::block::read_only() {
+                        btrfs::probe_block_rw()
+                    } else {
+                        btrfs::probe_block()
+                    };
+                mount.map(Self::Btrfs).map_err(map_btrfs_error)
+            }
         }
     }
 
@@ -579,28 +591,40 @@ impl PersistentBackend {
     fn create_file(self, path: &str) -> Result<(), Error> {
         match self {
             Self::Fat32(mount) => mount.create_file(path).map_err(map_fat32_error),
-            Self::Ext4(_) | Self::Btrfs(_) => Err(Error::ReadOnly),
+            Self::Ext4(_) => Err(Error::BackendUnsupported),
+            Self::Btrfs(_) => Err(Error::ReadOnly),
         }
     }
 
     fn mkdir(self, path: &str) -> Result<(), Error> {
         match self {
             Self::Fat32(mount) => mount.mkdir(path).map_err(map_fat32_error),
-            Self::Ext4(_) | Self::Btrfs(_) => Err(Error::ReadOnly),
+            Self::Ext4(_) => Err(Error::BackendUnsupported),
+            Self::Btrfs(_) => Err(Error::ReadOnly),
         }
     }
 
     fn unlink(self, path: &str) -> Result<(), Error> {
         match self {
             Self::Fat32(mount) => mount.unlink(path).map_err(map_fat32_error),
-            Self::Ext4(_) | Self::Btrfs(_) => Err(Error::ReadOnly),
+            Self::Ext4(_) => Err(Error::BackendUnsupported),
+            Self::Btrfs(_) => Err(Error::ReadOnly),
         }
     }
 
     fn rename(self, old_path: &str, new_path: &str) -> Result<(), Error> {
         match self {
             Self::Fat32(mount) => mount.rename(old_path, new_path).map_err(map_fat32_error),
-            Self::Ext4(_) | Self::Btrfs(_) => Err(Error::ReadOnly),
+            Self::Ext4(_) => Err(Error::BackendUnsupported),
+            Self::Btrfs(_) => Err(Error::ReadOnly),
+        }
+    }
+
+    fn rmdir(self, path: &str) -> Result<(), Error> {
+        match self {
+            Self::Fat32(mount) => mount.rmdir(path).map_err(map_fat32_error),
+            Self::Ext4(_) => Err(Error::BackendUnsupported),
+            Self::Btrfs(_) => Err(Error::ReadOnly),
         }
     }
 
@@ -809,6 +833,14 @@ impl PersistentMount {
         }
         self.backend.rename(old_path, new_path)
     }
+
+    fn rmdir(self, path: &str) -> Result<(), Error> {
+        validate_persistent_path(path)?;
+        if self.read_only() {
+            return Err(Error::ReadOnly);
+        }
+        self.backend.rmdir(path)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -979,7 +1011,7 @@ pub fn contract_self_check() {
     assert!(validate_persistent_path("relative").is_err());
     assert_eq!(validate_persistent_path("/a/../b"), Err(Error::InvalidPath));
     assert!(!PersistentBackendKind::Fat32.read_only());
-    assert!(PersistentBackendKind::Ext4.read_only());
+    assert!(!PersistentBackendKind::Ext4.read_only());
     assert!(PersistentBackendKind::Btrfs.read_only());
     let mut persistent_path = PersistentPath::ROOT;
     assert_eq!(persistent_path.as_str(), Ok("/"));
@@ -1875,14 +1907,13 @@ pub fn unlink(path: &str) -> Result<(), Error> {
 
 pub fn remove_dir(path: &str) -> Result<(), Error> {
     with_fs(|fs| {
-        if let Some((mount, _persistent_path)) =
-            locate_persistent_path(fs, path, NamespaceId::ROOT)?
+        if let Some((mount, persistent_path)) = locate_persistent_path(fs, path, NamespaceId::ROOT)?
         {
             let backend = persistent_backend(mount)?;
             if mount_flags(mount)?.read_only || backend.read_only() {
                 return Err(Error::ReadOnly);
             }
-            return Err(Error::BackendUnsupported);
+            return backend.rmdir(persistent_path.as_str()?);
         }
         let (mount, parent, name) = parent_and_name_mount(fs, path, NamespaceId::ROOT)?;
         if mount_flags(mount)?.read_only {
