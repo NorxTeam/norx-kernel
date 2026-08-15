@@ -3,6 +3,8 @@ use crate::drivers::block;
 const BYTES_PER_SECTOR: usize = 512;
 const MAX_LFN_CHARS: usize = 260;
 const MAX_COMPONENTS: usize = 16;
+const MAX_PATH_BYTES: usize = 4096;
+const MAX_COMPONENT_BYTES: usize = MAX_LFN_CHARS * 4;
 const EOC_MIN: u32 = 0x0fff_fff8;
 const BAD_CLUSTER: u32 = 0x0fff_fff7;
 const FAT_VALUE_MASK: u32 = 0x0fff_ffff;
@@ -12,6 +14,8 @@ const MAX_DATA_CLUSTER: u32 = 0x0fff_ffef;
 pub type ReadSector = fn(u64, &mut [u8; BYTES_PER_SECTOR]) -> bool;
 pub type WriteSector = fn(u64, &[u8; BYTES_PER_SECTOR]) -> bool;
 
+pub const MAX_NAME_BYTES: usize = MAX_COMPONENT_BYTES;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Io,
@@ -20,6 +24,7 @@ pub enum Error {
     NotFound,
     NotDirectory,
     IsDirectory,
+    BadDirectory,
     BadClusterChain,
     BufferTooSmall,
     NoSpace,
@@ -54,8 +59,38 @@ pub struct Mount {
     root_cluster: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileInfo {
+    pub directory: bool,
+    pub cluster: u32,
+    pub size: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    pub name: [u8; MAX_NAME_BYTES],
+    pub name_len: u16,
+    pub directory: bool,
+    pub cluster: u32,
+    pub size: u64,
+}
+
+impl DirectoryEntry {
+    pub const EMPTY: Self = Self {
+        name: [0; MAX_NAME_BYTES],
+        name_len: 0,
+        directory: false,
+        cluster: 0,
+        size: 0,
+    };
+
+    pub fn name_bytes(&self) -> &[u8] {
+        &self.name[..(self.name_len as usize).min(self.name.len())]
+    }
+}
+
 #[derive(Clone, Copy)]
-struct DirectoryEntry {
+struct EntryMetadata {
     directory: bool,
     cluster: u32,
     size: u32,
@@ -63,7 +98,7 @@ struct DirectoryEntry {
 
 #[derive(Clone, Copy)]
 struct EntryLocation {
-    entry: DirectoryEntry,
+    entry: EntryMetadata,
     sector: u64,
     offset: usize,
 }
@@ -73,6 +108,7 @@ struct LongName {
     chars: [u16; MAX_LFN_CHARS],
     checksum: u8,
     max_sequence: u8,
+    next_sequence: u8,
     seen: u32,
     valid: bool,
 }
@@ -82,6 +118,7 @@ impl LongName {
         chars: [0; MAX_LFN_CHARS],
         checksum: 0,
         max_sequence: 0,
+        next_sequence: 0,
         seen: 0,
         valid: false,
     };
@@ -92,17 +129,29 @@ impl LongName {
 
     fn accept(&mut self, entry: &[u8; 32]) {
         let sequence = entry[0] & 0x1f;
-        if sequence == 0 || sequence as usize > MAX_LFN_CHARS / 13 {
+        if sequence == 0
+            || sequence as usize > MAX_LFN_CHARS / 13
+            || entry[12] != 0
+            || le_u16(entry, 26) != 0
+        {
             self.reset();
             return;
         }
         if entry[0] & 0x40 != 0 {
+            if self.valid {
+                self.reset();
+            }
             self.max_sequence = sequence;
+            self.next_sequence = sequence;
             self.checksum = entry[13];
             self.seen = 0;
             self.valid = true;
         }
-        if !self.valid || self.checksum != entry[13] {
+        if !self.valid
+            || self.checksum != entry[13]
+            || sequence != self.next_sequence
+            || self.seen & (1u32 << (sequence - 1)) != 0
+        {
             self.reset();
             return;
         }
@@ -117,28 +166,56 @@ impl LongName {
             }
         }
         self.seen |= 1 << (sequence - 1);
+        self.next_sequence = sequence.saturating_sub(1);
     }
 
     fn matches(&self, target: &str, short_checksum: u8) -> bool {
         if !self.valid
             || self.max_sequence == 0
             || self.checksum != short_checksum
+            || self.next_sequence != 0
             || self.seen & ((1u32 << self.max_sequence) - 1) != (1u32 << self.max_sequence) - 1
         {
             return false;
         }
-        let mut encoded = [0u8; MAX_LFN_CHARS * 3];
-        let mut length = 0;
-        for character in self.chars.iter().take(self.max_sequence as usize * 13) {
-            if *character == 0 || *character == 0xffff {
+        let mut encoded = [0u8; MAX_NAME_BYTES];
+        let Some(length) = self.encode(&mut encoded) else {
+            return false;
+        };
+        encoded[..length] == target.as_bytes()[..]
+    }
+
+    fn encode(self, output: &mut [u8; MAX_NAME_BYTES]) -> Option<usize> {
+        if !self.valid || self.max_sequence == 0 || self.next_sequence != 0 {
+            return None;
+        }
+        let length = self.max_sequence as usize * 13;
+        let mut offset = 0;
+        let mut index = 0;
+        while index < length {
+            let character = self.chars[index];
+            if character == 0 {
                 break;
             }
-            let Some(next) = encode_utf8(*character, &mut encoded, length) else {
-                return false;
+            if character == 0xffff {
+                return None;
+            }
+            let code_point = if (0xd800..=0xdbff).contains(&character) {
+                index += 1;
+                let low = *self.chars.get(index)?;
+                if !(0xdc00..=0xdfff).contains(&low) {
+                    return None;
+                }
+                0x1_0000 + (((character as u32 - 0xd800) << 10) | (low as u32 - 0xdc00))
+            } else if (0xdc00..=0xdfff).contains(&character) {
+                return None;
+            } else {
+                character as u32
             };
-            length = next;
+            offset = encode_utf8(code_point, output, offset)?;
+            index += 1;
         }
-        encoded[..length] == target.as_bytes()[..]
+        Some(offset)
     }
 }
 
@@ -260,6 +337,73 @@ impl Mount {
             }
         }
         Err(Error::InvalidPath)
+    }
+
+    pub fn stat(self, path: &str) -> Result<FileInfo, Error> {
+        let (components, count) = components_allow_root(path)?;
+        if count == 0 {
+            return Ok(FileInfo {
+                directory: true,
+                cluster: self.root_cluster,
+                size: 0,
+            });
+        }
+        let mut directory_cluster = self.root_cluster;
+        for (index, component) in components.iter().take(count).enumerate() {
+            let entry = self.find_entry(directory_cluster, component)?;
+            if index + 1 == count {
+                return Ok(FileInfo {
+                    directory: entry.directory,
+                    cluster: entry.cluster,
+                    size: entry.size as u64,
+                });
+            }
+            if !entry.directory {
+                return Err(Error::NotDirectory);
+            }
+            directory_cluster = entry.cluster;
+        }
+        Err(Error::InvalidPath)
+    }
+
+    pub fn read_dir(self, path: &str, output: &mut [DirectoryEntry]) -> Result<usize, Error> {
+        let (components, count) = components_allow_root(path)?;
+        let mut directory_cluster = self.root_cluster;
+        for component in components.iter().take(count) {
+            let entry = self.find_entry(directory_cluster, component)?;
+            if !entry.directory {
+                return Err(Error::NotDirectory);
+            }
+            directory_cluster = entry.cluster;
+        }
+
+        let mut count = 0;
+        self.scan_directory(directory_cluster, |sector, offset, raw, long_name| {
+            if count == output.len() {
+                return Ok(true);
+            }
+            let entry = self.entry_metadata(raw)?;
+            let mut name = [0u8; MAX_NAME_BYTES];
+            let checksum = short_checksum(&raw[..11]);
+            let name_len = if long_name.checksum == checksum {
+                long_name.encode(&mut name)
+            } else {
+                None
+            }
+            .or_else(|| encode_short_name(raw, &mut name))
+            .ok_or(Error::BadDirectory)?;
+            output[count] = DirectoryEntry {
+                name,
+                name_len: name_len as u16,
+                directory: entry.directory,
+                cluster: entry.cluster,
+                size: entry.size as u64,
+            };
+            let _ = (sector, offset);
+            count += 1;
+            Ok(false)
+        })?;
+        Ok(count)
     }
 
     pub fn write_file(self, path: &str, input: &[u8]) -> Result<usize, Error> {
@@ -395,7 +539,7 @@ impl Mount {
         Ok(())
     }
 
-    fn find_entry(self, directory_cluster: u32, target: &str) -> Result<DirectoryEntry, Error> {
+    fn find_entry(self, directory_cluster: u32, target: &str) -> Result<EntryMetadata, Error> {
         Ok(self.find_entry_location(directory_cluster, target)?.entry)
     }
 
@@ -404,6 +548,29 @@ impl Mount {
         directory_cluster: u32,
         target: &str,
     ) -> Result<EntryLocation, Error> {
+        let mut found = None;
+        self.scan_directory(directory_cluster, |sector, offset, entry, long_name| {
+            let checksum = short_checksum(&entry[..11]);
+            if long_name.matches(target, checksum) || short_name_matches(entry, target) {
+                found = Some(EntryLocation {
+                    entry: self.entry_metadata(entry)?,
+                    sector,
+                    offset,
+                });
+                return Ok(true);
+            }
+            Ok(false)
+        })?;
+        found.ok_or(Error::NotFound)
+    }
+
+    fn scan_directory<F>(self, directory_cluster: u32, mut visit: F) -> Result<(), Error>
+    where
+        F: FnMut(u64, usize, &[u8; 32], LongName) -> Result<bool, Error>,
+    {
+        if !self.valid_cluster(directory_cluster) {
+            return Err(Error::BadClusterChain);
+        }
         let mut cluster = directory_cluster;
         let mut long_name = LongName::EMPTY;
         for _ in 0..self.cluster_count {
@@ -416,7 +583,7 @@ impl Mount {
                     let mut entry = [0u8; 32];
                     entry.copy_from_slice(&data[entry_offset..entry_offset + 32]);
                     if entry[0] == 0 {
-                        return Err(Error::NotFound);
+                        return Ok(());
                     }
                     if entry[0] == 0xe5 {
                         long_name.reset();
@@ -426,35 +593,47 @@ impl Mount {
                         long_name.accept(&entry);
                         continue;
                     }
-                    let checksum = short_checksum(&entry[..11]);
-                    let matches =
-                        long_name.matches(target, checksum) || short_name_matches(&entry, target);
-                    let result = if matches {
-                        Some(EntryLocation {
-                            entry: DirectoryEntry {
-                                directory: entry[11] & 0x10 != 0,
-                                cluster: (le_u16(&entry, 20) as u32) << 16
-                                    | le_u16(&entry, 26) as u32,
-                                size: le_u32(&entry, 28),
-                            },
-                            sector: self.cluster_sector(cluster) + sector,
-                            offset: entry_offset,
-                        })
-                    } else {
-                        None
-                    };
+                    let pending_long_name = long_name;
                     long_name.reset();
-                    if let Some(result) = result {
-                        return Ok(result);
+                    if entry[11] & 0x08 != 0 {
+                        continue;
+                    }
+                    if visit(
+                        self.cluster_sector(cluster) + sector,
+                        entry_offset,
+                        &entry,
+                        pending_long_name,
+                    )? {
+                        return Ok(());
                     }
                 }
             }
             let Some(next) = self.next_cluster(cluster)? else {
-                return Err(Error::NotFound);
+                return Ok(());
             };
             cluster = next;
         }
         Err(Error::BadClusterChain)
+    }
+
+    fn entry_metadata(self, entry: &[u8; 32]) -> Result<EntryMetadata, Error> {
+        let directory = entry[11] & 0x10 != 0;
+        let cluster = (le_u16(entry, 20) as u32) << 16 | le_u16(entry, 26) as u32;
+        let size = le_u32(entry, 28);
+        if directory {
+            if !self.valid_cluster(cluster) {
+                return Err(Error::BadClusterChain);
+            }
+        } else if cluster != 0 && !self.valid_cluster(cluster) {
+            return Err(Error::BadClusterChain);
+        } else if size != 0 && cluster == 0 {
+            return Err(Error::BadClusterChain);
+        }
+        Ok(EntryMetadata {
+            directory,
+            cluster,
+            size,
+        })
     }
 
     fn read_chain(self, start: u32, size: usize, output: &mut [u8]) -> Result<usize, Error> {
@@ -859,11 +1038,13 @@ fn ramdisk_write_sector(lba: u64, input: &[u8; BYTES_PER_SECTOR]) -> bool {
 static mut FIXTURE_DIRECTORY: [u8; BYTES_PER_SECTOR] = [0; BYTES_PER_SECTOR];
 static mut FIXTURE_DATA: [u8; BYTES_PER_SECTOR] = [0; BYTES_PER_SECTOR];
 static mut FIXTURE_DATA_TAIL: [u8; BYTES_PER_SECTOR] = [0; BYTES_PER_SECTOR];
+static mut FIXTURE_DATA_GROWN: [u8; BYTES_PER_SECTOR] = [0; BYTES_PER_SECTOR];
 static mut FIXTURE_FAT_PRIMARY: [u8; BYTES_PER_SECTOR] = [0; BYTES_PER_SECTOR];
 static mut FIXTURE_FAT_SECONDARY: [u8; BYTES_PER_SECTOR] = [0; BYTES_PER_SECTOR];
 static mut FIXTURE_DIRECTORY_VALID: bool = false;
 static mut FIXTURE_DATA_VALID: bool = false;
 static mut FIXTURE_DATA_TAIL_VALID: bool = false;
+static mut FIXTURE_DATA_GROWN_VALID: bool = false;
 static mut FIXTURE_FAT_PRIMARY_VALID: bool = false;
 static mut FIXTURE_FAT_SECONDARY_VALID: bool = false;
 
@@ -874,16 +1055,75 @@ fn fixture_check() -> bool {
         FIXTURE_DIRECTORY_VALID = false;
         FIXTURE_DATA_VALID = false;
         FIXTURE_DATA_TAIL_VALID = false;
+        FIXTURE_DATA_GROWN_VALID = false;
         FIXTURE_FAT_PRIMARY_VALID = false;
         FIXTURE_FAT_SECONDARY_VALID = false;
     }
     let Ok(read_only_volume) = Mount::open(fixture_read_sector) else {
         return false;
     };
+    if read_only_volume.stat("relative") != Err(Error::InvalidPath) {
+        return false;
+    }
+    let mut oversized_path = [b'a'; MAX_PATH_BYTES + 1];
+    oversized_path[0] = b'/';
+    let Ok(oversized_path) = core::str::from_utf8(&oversized_path) else {
+        return false;
+    };
+    if read_only_volume.stat(oversized_path) != Err(Error::InvalidPath) {
+        return false;
+    }
     if !read_only_volume
         .write_file("/Long Name.txt", b"rejected")
         .is_err_and(|error| error == Error::ReadOnly)
     {
+        return false;
+    }
+    let Ok(root) = read_only_volume.stat("/") else {
+        return false;
+    };
+    if !root.directory || root.cluster != 2 || root.size != 0 {
+        return false;
+    }
+    let Ok(long_info) = read_only_volume.stat("/Long Name.txt") else {
+        return false;
+    };
+    if long_info.directory || long_info.cluster != 3 || long_info.size != 14 {
+        return false;
+    }
+    let Ok(short_info) = read_only_volume.stat("/LONGNA~1.TXT") else {
+        return false;
+    };
+    if short_info != long_info {
+        return false;
+    }
+    let Ok(subdir_info) = read_only_volume.stat("/SUBDIR") else {
+        return false;
+    };
+    if !subdir_info.directory || subdir_info.cluster != 4 || subdir_info.size != 0 {
+        return false;
+    }
+    let mut entries = [DirectoryEntry::EMPTY; 2];
+    let Ok(entry_count) = read_only_volume.read_dir("/", &mut entries) else {
+        return false;
+    };
+    if entry_count != 2
+        || entries[0].name_bytes() != b"Long Name.txt"
+        || entries[0].directory
+        || entries[0].cluster != 3
+        || entries[0].size != 14
+        || entries[1].name_bytes() != b"SUBDIR"
+        || !entries[1].directory
+        || entries[1].cluster != 4
+    {
+        return false;
+    }
+    let mut bounded_entries = [DirectoryEntry::EMPTY; 1];
+    if read_only_volume.read_dir("/", &mut bounded_entries) != Ok(1) {
+        return false;
+    }
+    let mut empty_entries: [DirectoryEntry; 0] = [];
+    if read_only_volume.read_dir("/SUBDIR", &mut empty_entries) != Ok(0) {
         return false;
     }
     let Ok(volume) = Mount::open_rw(fixture_read_sector, fixture_write_sector) else {
@@ -941,7 +1181,13 @@ fn fixture_check() -> bool {
     if length != grown.len() || grown_output != grown {
         return false;
     }
-    if fixture_fat_entry(1, 4) != Some(EOC_MIN) || fixture_fat_entry(1025, 4) != Some(EOC_MIN) {
+    if fixture_fat_entry(1, 3) != Some(5)
+        || fixture_fat_entry(1, 4) != Some(EOC_MIN)
+        || fixture_fat_entry(1, 5) != Some(EOC_MIN)
+        || fixture_fat_entry(1025, 3) != Some(5)
+        || fixture_fat_entry(1025, 4) != Some(EOC_MIN)
+        || fixture_fat_entry(1025, 5) != Some(EOC_MIN)
+    {
         return false;
     }
 
@@ -955,7 +1201,7 @@ fn fixture_check() -> bool {
     if length != 6 || &shrunk_output[..length] != b"shrunk" {
         return false;
     }
-    if fixture_fat_entry(1, 4) != Some(0) || fixture_fat_entry(1025, 4) != Some(0) {
+    if fixture_fat_entry(1, 5) != Some(0) || fixture_fat_entry(1025, 5) != Some(0) {
         return false;
     }
 
@@ -1031,6 +1277,11 @@ fn fixture_read_sector(lba: u64, output: &mut [u8; BYTES_PER_SECTOR]) -> bool {
                 output.copy_from_slice(&*core::ptr::addr_of!(FIXTURE_DATA_TAIL));
             }
         },
+        2052 => unsafe {
+            if FIXTURE_DATA_GROWN_VALID {
+                output.copy_from_slice(&*core::ptr::addr_of!(FIXTURE_DATA_GROWN));
+            }
+        },
         _ => {}
     }
     true
@@ -1063,6 +1314,11 @@ fn fixture_write_sector(lba: u64, input: &[u8; BYTES_PER_SECTOR]) -> bool {
             FIXTURE_DATA_TAIL_VALID = true;
             true
         },
+        2052 => unsafe {
+            (&mut *core::ptr::addr_of_mut!(FIXTURE_DATA_GROWN)).copy_from_slice(input);
+            FIXTURE_DATA_GROWN_VALID = true;
+            true
+        },
         _ => false,
     }
 }
@@ -1080,6 +1336,7 @@ fn fixture_partition_write_sector(lba: u64, input: &[u8; BYTES_PER_SECTOR]) -> b
 fn fixture_fat(output: &mut [u8; BYTES_PER_SECTOR]) {
     write_u32(output, 8, EOC_MIN);
     write_u32(output, 12, EOC_MIN);
+    write_u32(output, 16, EOC_MIN);
 }
 
 fn fixture_fat_entry(lba: u64, cluster: u32) -> Option<u32> {
@@ -1110,11 +1367,15 @@ fn fixture_directory(output: &mut [u8; BYTES_PER_SECTOR]) {
     output[32 + 20..32 + 22].copy_from_slice(&0u16.to_le_bytes());
     output[32 + 26..32 + 28].copy_from_slice(&3u16.to_le_bytes());
     output[32 + 28..32 + 32].copy_from_slice(&14u32.to_le_bytes());
+    output[64..75].copy_from_slice(b"SUBDIR     ");
+    output[64 + 11] = 0x10;
+    output[64 + 20..64 + 22].copy_from_slice(&0u16.to_le_bytes());
+    output[64 + 26..64 + 28].copy_from_slice(&4u16.to_le_bytes());
 }
 
 fn components(path: &str) -> Result<([&str; MAX_COMPONENTS], usize), Error> {
     let bytes = path.as_bytes();
-    if !bytes.starts_with(b"/") {
+    if !bytes.starts_with(b"/") || bytes.len() > MAX_PATH_BYTES {
         return Err(Error::InvalidPath);
     }
     let mut result = [""; MAX_COMPONENTS];
@@ -1125,7 +1386,7 @@ fn components(path: &str) -> Result<([&str; MAX_COMPONENTS], usize), Error> {
             continue;
         }
         if index > start {
-            if count == MAX_COMPONENTS {
+            if count == MAX_COMPONENTS || index - start > MAX_COMPONENT_BYTES {
                 return Err(Error::InvalidPath);
             }
             result[count] = &path[start..index];
@@ -1134,7 +1395,7 @@ fn components(path: &str) -> Result<([&str; MAX_COMPONENTS], usize), Error> {
         start = index + 1;
     }
     if start < bytes.len() {
-        if count == MAX_COMPONENTS {
+        if count == MAX_COMPONENTS || bytes.len() - start > MAX_COMPONENT_BYTES {
             return Err(Error::InvalidPath);
         }
         result[count] = &path[start..];
@@ -1146,26 +1407,38 @@ fn components(path: &str) -> Result<([&str; MAX_COMPONENTS], usize), Error> {
     Ok((result, count))
 }
 
-fn short_name_matches(entry: &[u8; 32], target: &str) -> bool {
-    let mut short = [b' '; 12];
+fn components_allow_root(path: &str) -> Result<([&str; MAX_COMPONENTS], usize), Error> {
+    if path == "/" {
+        return Ok(([""; MAX_COMPONENTS], 0));
+    }
+    components(path)
+}
+
+fn encode_short_name(entry: &[u8; 32], output: &mut [u8]) -> Option<usize> {
     let mut length = 0;
     for byte in entry[..8].iter().copied() {
         if byte != b' ' {
-            short[length] = byte;
+            *output.get_mut(length)? = byte;
             length += 1;
         }
     }
     if entry[8..11].iter().any(|byte| *byte != b' ') {
-        short[length] = b'.';
+        *output.get_mut(length)? = b'.';
         length += 1;
         for byte in entry[8..11].iter().copied() {
             if byte != b' ' {
-                short[length] = byte;
+                *output.get_mut(length)? = byte;
                 length += 1;
             }
         }
     }
-    ascii_eq_ignore_case(&short[..length], target.as_bytes())
+    (length != 0).then_some(length)
+}
+
+fn short_name_matches(entry: &[u8; 32], target: &str) -> bool {
+    let mut short = [0u8; 12];
+    encode_short_name(entry, &mut short)
+        .is_some_and(|length| ascii_eq_ignore_case(&short[..length], target.as_bytes()))
 }
 
 fn ascii_eq_ignore_case(left: &[u8], right: &[u8]) -> bool {
@@ -1180,8 +1453,10 @@ fn short_checksum(name: &[u8]) -> u8 {
     })
 }
 
-fn encode_utf8(character: u16, output: &mut [u8], offset: usize) -> Option<usize> {
-    let character = character as u32;
+fn encode_utf8(character: u32, output: &mut [u8], offset: usize) -> Option<usize> {
+    if character > 0x10ffff || (0xd800..=0xdfff).contains(&character) {
+        return None;
+    }
     if character <= 0x7f {
         *output.get_mut(offset)? = character as u8;
         Some(offset + 1)
@@ -1191,13 +1466,21 @@ fn encode_utf8(character: u16, output: &mut [u8], offset: usize) -> Option<usize
             0x80 | (character & 0x3f) as u8,
         ]);
         Some(offset + 2)
-    } else {
+    } else if character <= 0xffff {
         output.get_mut(offset..offset + 3)?.copy_from_slice(&[
             0xe0 | (character >> 12) as u8,
             0x80 | ((character >> 6) & 0x3f) as u8,
             0x80 | (character & 0x3f) as u8,
         ]);
         Some(offset + 3)
+    } else {
+        output.get_mut(offset..offset + 4)?.copy_from_slice(&[
+            0xf0 | (character >> 18) as u8,
+            0x80 | ((character >> 12) & 0x3f) as u8,
+            0x80 | ((character >> 6) & 0x3f) as u8,
+            0x80 | (character & 0x3f) as u8,
+        ]);
+        Some(offset + 4)
     }
 }
 
