@@ -10,8 +10,10 @@ integrated staged QEMU smoke process/ELF/file/memory/dynamic/VM/fault/permission
 
 The marker covers these existing contracts:
 
-- VFS initialization performs ramfs file writes/reads, offsets, permissions,
-  mount-tree and unmount checks.
+- VFS initialization performs ramfs `/hello.txt` content readback, hard-link and
+  handle-lifetime checks, type-aware path traversal, mount-tree/namespace
+  isolation checks, permissions, and safe unmount checks. QEMU/CI gates the
+  versioned `ramfs /hello.txt readback passed` marker on both architectures.
 - The process contract creates a child and kernel thread, switches threads,
   checks credentials/FDs/capabilities, then exits and waits for the child.
 - `AddressSpace` maps executable/read-write pages and the guarded stack,

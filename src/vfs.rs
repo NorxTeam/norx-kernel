@@ -163,6 +163,18 @@ pub struct NamespaceId(u8);
 impl NamespaceId {
     pub const ROOT: Self = Self(0);
 
+    pub const fn from_raw(value: u8) -> Option<Self> {
+        if (value as usize) < MAX_NAMESPACES {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
+
     const fn index(self) -> usize {
         self.0 as usize
     }
@@ -233,10 +245,11 @@ pub struct Dentry {
     pub inode: u16,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct DentryHandle {
     dentry: Dentry,
     slot: u8,
+    generation: u16,
 }
 
 impl DentryHandle {
@@ -280,6 +293,31 @@ impl Name {
         bytes: [0; NAME_MAX],
         len: 0,
     };
+
+    const fn dot() -> Self {
+        let mut bytes = [0; NAME_MAX];
+        bytes[0] = b'.';
+        Self { bytes, len: 1 }
+    }
+
+    const fn dotdot() -> Self {
+        let mut bytes = [0; NAME_MAX];
+        bytes[0] = b'.';
+        bytes[1] = b'.';
+        Self { bytes, len: 2 }
+    }
+
+    fn is_dot(self) -> bool {
+        self == Self::dot()
+    }
+
+    fn is_dotdot(self) -> bool {
+        self == Self::dotdot()
+    }
+
+    fn is_special(self) -> bool {
+        self.is_dot() || self.is_dotdot()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -417,6 +455,7 @@ impl NamespaceSlot {
 struct DentrySlot {
     used: bool,
     dentry: Dentry,
+    generation: u16,
 }
 
 impl DentrySlot {
@@ -426,6 +465,7 @@ impl DentrySlot {
             mount: MountId::ROOT,
             inode: 0,
         },
+        generation: 0,
     };
 }
 
@@ -471,17 +511,22 @@ static mut DENTRIES: [DentrySlot; MAX_DENTRIES] = [DentrySlot::EMPTY; MAX_DENTRI
 
 pub fn contract_self_check() {
     assert!(MAX_CHILDREN.is_power_of_two());
+    assert!(MountId::from_raw((MAX_MOUNTS - 1) as u8).is_some());
+    assert!(MountId::from_raw(MAX_MOUNTS as u8).is_none());
+    assert!(NamespaceId::from_raw((MAX_NAMESPACES - 1) as u8).is_some());
+    assert!(NamespaceId::from_raw(MAX_NAMESPACES as u8).is_none());
     let options = OpenOptions::read();
     assert!(options.read);
     assert!(!options.write);
     assert!(!options.create);
     let (_, count) = parse_path("/a/../b").expect("valid ramfs path");
-    assert_eq!(count, 1);
+    assert_eq!(count, 3);
+    assert!(parse_path("relative").is_err());
+    assert!(parse_path("/a\0/b").is_err());
 }
 
 pub fn init() -> bool {
     crate::bootlog::start(1, "mounting ramfs");
-    unsafe { MOUNTED = false };
     if mount_ramfs().is_err() || mount_tests().is_err() {
         let _ = unmount_ramfs();
         crate::bootlog::fail("ramfs mount/self-check failed");
@@ -490,6 +535,11 @@ pub fn init() -> bool {
     if !write("/hello.txt", HELLO_TEXT) {
         let _ = unmount_ramfs();
         crate::bootlog::fail("ramfs initial file write failed");
+        return false;
+    }
+    if !readback("/hello.txt", HELLO_TEXT) {
+        let _ = unmount_ramfs();
+        crate::bootlog::fail("ramfs /hello.txt readback failed");
         return false;
     }
     if mkdir("/tmp").is_err() {
@@ -513,6 +563,7 @@ pub fn init() -> bool {
         stats().files,
         stats().bytes,
     ));
+    crate::bootlog::ok("ramfs /hello.txt readback passed");
     crate::bootlog::ok(
         "ramfs mount, offsets, permissions, rename, unlink, and unmount checks passed",
     );
@@ -552,7 +603,12 @@ fn unmount_ramfs() -> Result<(), Error> {
             return Err(Error::NotMounted);
         }
         let fs = &*core::ptr::addr_of!(FILE_SYSTEM);
-        if fs.open_count != 0 {
+        let mounts = &*core::ptr::addr_of!(MOUNTS);
+        let dentries = &*core::ptr::addr_of!(DENTRIES);
+        if fs.open_count != 0
+            || mounts.iter().skip(1).any(|mount| mount.used)
+            || dentries.iter().any(|dentry| dentry.used)
+        {
             return Err(Error::Busy);
         }
         MOUNTED = false;
@@ -591,7 +647,11 @@ pub fn mount_in_namespace(
         if source != MountSource::Ramfs {
             return Err(Error::InvalidMountTarget);
         }
-        let (parent, mountpoint) = resolve_mount(fs, target, namespace)?;
+        let (parent, parent_inode, name) = match parent_and_name_mount(fs, target, namespace) {
+            Err(Error::InvalidPath) if target == "/" => return Err(Error::InvalidMountTarget),
+            result => result?,
+        };
+        let mountpoint = find_child(fs, parent_inode, name).ok_or(Error::NotFound)?;
         if mountpoint == 0 || fs.inodes[mountpoint as usize].kind != NodeType::Directory {
             return Err(Error::InvalidMountTarget);
         }
@@ -692,16 +752,16 @@ pub fn destroy_namespace(namespace: NamespaceId) -> Result<(), Error> {
     with_fs(|fs| {
         let root = namespace_root(namespace)?;
         let mounts = unsafe { &*core::ptr::addr_of!(MOUNTS) };
-        if mounts
-            .iter()
-            .any(|node| node.used && node.namespace == namespace && node.dentry_references != 0)
-            || fs.handles.iter().any(|handle| {
-                handle.used
-                    && mounts
-                        .get(handle.mount.index())
-                        .is_some_and(|node| node.used && node.namespace == namespace)
-            })
-        {
+        if mounts.iter().any(|node| {
+            node.used
+                && node.namespace == namespace
+                && (node.parent.is_some() || node.dentry_references != 0)
+        }) || fs.handles.iter().any(|handle| {
+            handle.used
+                && mounts
+                    .get(handle.mount.index())
+                    .is_some_and(|node| node.used && node.namespace == namespace)
+        }) {
             return Err(Error::Busy);
         }
         unsafe {
@@ -765,12 +825,17 @@ pub fn lookup_in_namespace(namespace: NamespaceId, path: &str) -> Result<DentryH
         };
         entry.used = true;
         entry.dentry = Dentry { mount, inode };
+        entry.generation = entry.generation.wrapping_add(1);
+        if entry.generation == 0 {
+            entry.generation = 1;
+        }
         unsafe {
             (&mut *core::ptr::addr_of_mut!(MOUNTS))[mount.index()].dentry_references += 1;
         }
         Ok(DentryHandle {
             dentry: entry.dentry,
             slot: slot as u8,
+            generation: entry.generation,
         })
     })
 }
@@ -779,11 +844,20 @@ pub fn release_dentry(handle: DentryHandle) -> Result<(), Error> {
     with_fs(|_| {
         let dentries = unsafe { &mut *core::ptr::addr_of_mut!(DENTRIES) };
         let slot = handle.slot as usize;
-        if slot >= MAX_DENTRIES || !dentries[slot].used || dentries[slot].dentry != handle.dentry {
+        if slot >= MAX_DENTRIES
+            || !dentries[slot].used
+            || dentries[slot].dentry != handle.dentry
+            || dentries[slot].generation != handle.generation
+        {
             return Err(Error::InvalidHandle);
         }
         let mount = handle.dentry.mount;
-        dentries[slot] = DentrySlot::EMPTY;
+        let generation = dentries[slot].generation;
+        dentries[slot] = DentrySlot {
+            used: false,
+            generation,
+            ..DentrySlot::EMPTY
+        };
         unsafe {
             let mounts = &mut *core::ptr::addr_of_mut!(MOUNTS);
             mounts[mount.index()].dentry_references =
@@ -795,6 +869,10 @@ pub fn release_dentry(handle: DentryHandle) -> Result<(), Error> {
 
 pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
     with_fs(|fs| {
+        if options.truncate && !options.write {
+            return Err(Error::PermissionDenied);
+        }
+        let mut reserved_slot = None;
         let existed = resolve_mount(fs, path, NamespaceId::ROOT).is_ok();
         let (mount, inode) = match resolve_mount(fs, path, NamespaceId::ROOT) {
             Ok(result) => result,
@@ -803,6 +881,12 @@ pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
                 if mount_flags(mount)?.read_only {
                     return Err(Error::ReadOnly);
                 }
+                reserved_slot = Some(
+                    fs.handles
+                        .iter()
+                        .position(|handle| !handle.used)
+                        .ok_or(Error::NoSpace)?,
+                );
                 (
                     mount,
                     create_node_at(fs, parent, name, NodeType::Regular, options.mode & 0o777)?,
@@ -826,17 +910,13 @@ pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
         if options.write && node.mode & 0o222 == 0 {
             return Err(Error::PermissionDenied);
         }
+        let slot = reserved_slot
+            .or_else(|| fs.handles.iter().position(|handle| !handle.used))
+            .ok_or(Error::NoSpace)?;
         if options.truncate {
             fs.inodes[inode as usize].size = 0;
         }
-        let Some((slot, handle)) = fs
-            .handles
-            .iter_mut()
-            .enumerate()
-            .find(|(_, handle)| !handle.used)
-        else {
-            return Err(Error::NoSpace);
-        };
+        let handle = &mut fs.handles[slot];
         handle.used = true;
         handle.mount = mount;
         handle.inode = inode;
@@ -863,7 +943,11 @@ pub fn close(handle: FileHandle) -> Result<(), Error> {
         let description = &mut fs.handles[slot];
         description.references = description.references.saturating_sub(1);
         if description.references == 0 {
-            fs.handles[slot] = HandleSlot::EMPTY;
+            let generation = description.generation;
+            fs.handles[slot] = HandleSlot {
+                generation,
+                ..HandleSlot::EMPTY
+            };
             fs.open_count = fs.open_count.saturating_sub(1);
         }
         Ok(())
@@ -1017,11 +1101,16 @@ pub fn unlink(path: &str) -> Result<(), Error> {
         if fs.inodes[child as usize].kind == NodeType::Directory {
             return Err(Error::IsDirectory);
         }
+        if find_mount_child(NamespaceId::ROOT, mount, child).is_some() {
+            return Err(Error::Busy);
+        }
         if has_open_handle(fs, child) {
             return Err(Error::Busy);
         }
         remove_child(fs, parent, name)?;
-        fs.inodes[child as usize] = Inode::EMPTY;
+        if link_count(fs, child) == 0 {
+            fs.inodes[child as usize] = Inode::EMPTY;
+        }
         Ok(())
     })
 }
@@ -1037,6 +1126,9 @@ pub fn remove_dir(path: &str) -> Result<(), Error> {
         if inode.kind != NodeType::Directory {
             return Err(Error::NotDirectory);
         }
+        if find_mount_child(NamespaceId::ROOT, mount, child).is_some() {
+            return Err(Error::Busy);
+        }
         if inode.children.iter().any(|entry| entry.used) {
             return Err(Error::NotEmpty);
         }
@@ -1051,6 +1143,9 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), Error> {
         let (old_mount, old_parent, old_name) =
             parent_and_name_mount(fs, old_path, NamespaceId::ROOT)?;
         let inode = find_child(fs, old_parent, old_name).ok_or(Error::NotFound)?;
+        if find_mount_child(NamespaceId::ROOT, old_mount, inode).is_some() {
+            return Err(Error::Busy);
+        }
         let (new_mount, new_parent, new_name) =
             parent_and_name_mount(fs, new_path, NamespaceId::ROOT)?;
         if old_mount != new_mount {
@@ -1071,6 +1166,9 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), Error> {
         let new_slot = find_child_slot(fs, new_parent, new_name);
         let replaced = new_slot.map(|slot| fs.inodes[new_parent as usize].children[slot]);
         if let Some(child) = replaced {
+            if find_mount_child(NamespaceId::ROOT, new_mount, child.inode).is_some() {
+                return Err(Error::Busy);
+            }
             if fs.inodes[child.inode as usize].kind == NodeType::Directory {
                 return Err(Error::IsDirectory);
             }
@@ -1083,7 +1181,7 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), Error> {
             if let Some(slot) = new_slot {
                 let replaced = fs.inodes[new_parent as usize].children[slot];
                 fs.inodes[new_parent as usize].children[slot] = Child::EMPTY;
-                if replaced.inode != inode {
+                if replaced.inode != inode && link_count(fs, replaced.inode) == 0 {
                     fs.inodes[replaced.inode as usize] = Inode::EMPTY;
                 }
             }
@@ -1116,7 +1214,7 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), Error> {
             name: new_name,
         };
         if let Some(child) = replaced {
-            if child.inode != inode {
+            if child.inode != inode && link_count(fs, child.inode) == 0 {
                 fs.inodes[child.inode as usize] = Inode::EMPTY;
             }
         }
@@ -1251,6 +1349,14 @@ pub fn read(path: &str, output: &mut [u8; 255]) -> Option<usize> {
     result
 }
 
+fn readback(path: &str, expected: &[u8]) -> bool {
+    let mut output = [0; 255];
+    let Some(length) = read(path, &mut output) else {
+        return false;
+    };
+    length == expected.len() && output[..length] == *expected
+}
+
 pub fn write(path: &str, input: &[u8]) -> bool {
     let Ok(handle) = open(path, OpenOptions::write_create()) else {
         return false;
@@ -1276,6 +1382,9 @@ fn mount_tree_self_check() -> Result<(), Error> {
     if info.parent != Some(MountId::ROOT) || info.propagation != Propagation::Shared {
         return Err(Error::InvalidMountTarget);
     }
+    if mount(MountSource::Ramfs, "/mnt", MountFlags::defaults()) != Err(Error::MountPointBusy) {
+        return Err(Error::MountPointBusy);
+    }
     let dentry = lookup("/mnt/hello.txt")?;
     if dentry.dentry().mount != shared_mount {
         return Err(Error::InvalidMountTarget);
@@ -1292,6 +1401,10 @@ fn mount_tree_self_check() -> Result<(), Error> {
     unmount_mount(shared_mount)?;
 
     let read_only = mount(MountSource::Ramfs, "/mnt", MountFlags::read_only())?;
+    if remove_dir("/mnt") != Err(Error::Busy) || rename("/mnt", "/moved") != Err(Error::Busy) {
+        let _ = unmount_mount(read_only);
+        return Err(Error::Busy);
+    }
     if !matches!(
         open("/mnt/hello.txt", OpenOptions::write_create()),
         Err(Error::ReadOnly)
@@ -1302,6 +1415,42 @@ fn mount_tree_self_check() -> Result<(), Error> {
     unmount_mount(read_only)?;
 
     let namespace = create_namespace()?;
+    let namespace_mount = mount_in_namespace(
+        namespace,
+        MountSource::Ramfs,
+        "/mnt",
+        MountFlags::read_only(),
+        Propagation::Private,
+    )?;
+    let namespace_dentry = lookup_in_namespace(namespace, "/mnt/hello.txt")?;
+    if namespace_dentry.dentry().mount != namespace_mount {
+        let _ = release_dentry(namespace_dentry);
+        let _ = unmount_mount(namespace_mount);
+        let _ = destroy_namespace(namespace);
+        return Err(Error::InvalidMountTarget);
+    }
+    let root_dentry = lookup("/mnt/hello.txt")?;
+    if root_dentry.dentry().mount != MountId::ROOT {
+        let _ = release_dentry(root_dentry);
+        let _ = release_dentry(namespace_dentry);
+        let _ = unmount_mount(namespace_mount);
+        let _ = destroy_namespace(namespace);
+        return Err(Error::InvalidMountTarget);
+    }
+    release_dentry(root_dentry)?;
+    if destroy_namespace(namespace) != Err(Error::Busy) {
+        let _ = release_dentry(namespace_dentry);
+        let _ = unmount_mount(namespace_mount);
+        let _ = destroy_namespace(namespace);
+        return Err(Error::Busy);
+    }
+    release_dentry(namespace_dentry)?;
+    if destroy_namespace(namespace) != Err(Error::Busy) {
+        let _ = unmount_mount(namespace_mount);
+        let _ = destroy_namespace(namespace);
+        return Err(Error::Busy);
+    }
+    unmount_mount(namespace_mount)?;
     let dentry = lookup_in_namespace(namespace, "/hello.txt")?;
     release_dentry(dentry)?;
     destroy_namespace(namespace)?;
@@ -1335,6 +1484,40 @@ fn mount_tests() -> Result<(), Error> {
     mkdir("/self-test")?;
     let handle = open("/self-test/file", OpenOptions::read_write_create())?;
     write_handle(handle, b"abcdef")?;
+    if !matches!(lookup("/self-test/file/."), Err(Error::NotDirectory))
+        || !matches!(lookup("/self-test/file/.."), Err(Error::NotDirectory))
+    {
+        return Err(Error::NotDirectory);
+    }
+    let normalized = lookup("/self-test/../self-test/file")?;
+    release_dentry(normalized)?;
+    if !matches!(
+        open("/self-test/missing", OpenOptions::read()),
+        Err(Error::NotFound)
+    ) || !matches!(
+        open("/self-test", OpenOptions::read()),
+        Err(Error::IsDirectory)
+    ) {
+        return Err(Error::NotFound);
+    }
+    let mut entries = [DirectoryEntry {
+        kind: NodeType::Regular,
+        mode: 0,
+        size: 0,
+        links: 0,
+        name: [0; NAME_MAX],
+        name_length: 0,
+    }; MAX_CHILDREN];
+    let entry_count = read_dir("/self-test", &mut entries)?;
+    if !entries[..entry_count]
+        .iter()
+        .any(|entry| entry.name_length == 4 && entry.name[..4] == *b"file")
+    {
+        return Err(Error::NotFound);
+    }
+    if remove_dir("/self-test") != Err(Error::NotEmpty) {
+        return Err(Error::NotEmpty);
+    }
     seek(handle, -4)?;
     let mut output = [0u8; 3];
     if read_handle(handle, &mut output)? != 3 || output != *b"cde" {
@@ -1350,7 +1533,14 @@ fn mount_tests() -> Result<(), Error> {
         return Err(Error::OffsetOutOfRange);
     }
     close(duplicate)?;
+    let stale = handle.raw();
     close(handle)?;
+    let reopened = open("/self-test/file", OpenOptions::read())?;
+    if close_raw(stale).is_ok() {
+        let _ = close(reopened);
+        return Err(Error::InvalidHandle);
+    }
+    close(reopened)?;
     let truncated = open("/self-test/file", OpenOptions::write_truncate())?;
     write_handle(truncated, b"xy")?;
     close(truncated)?;
@@ -1370,8 +1560,23 @@ fn mount_tests() -> Result<(), Error> {
     ) {
         return Err(Error::PermissionDenied);
     }
+    let invalid_truncate = OpenOptions {
+        truncate: true,
+        ..OpenOptions::read()
+    };
+    if open("/self-test/file", invalid_truncate) != Err(Error::PermissionDenied) {
+        return Err(Error::PermissionDenied);
+    }
     chmod("/self-test/file", 0o644)?;
-    rename("/self-test/file", "/self-test/renamed")?;
+    link("/self-test/file", "/self-test/alias")?;
+    if stat("/self-test/file")?.links != 2 || stat("/self-test/alias")?.links != 2 {
+        return Err(Error::InvalidPath);
+    }
+    unlink("/self-test/file")?;
+    if stat("/self-test/alias")?.links != 1 || !readback("/self-test/alias", b"xyz") {
+        return Err(Error::InvalidPath);
+    }
+    rename("/self-test/alias", "/self-test/renamed")?;
     let replacement = open("/self-test/replacement", OpenOptions::read_write_create())?;
     write_handle(replacement, b"old")?;
     close(replacement)?;
@@ -1393,6 +1598,14 @@ fn mount_tests() -> Result<(), Error> {
         return Err(Error::Busy);
     }
     close(open_handle)?;
+    let stale_dentry = lookup("/self-test")?;
+    release_dentry(stale_dentry)?;
+    let live_dentry = lookup("/self-test")?;
+    if release_dentry(stale_dentry).is_ok() {
+        let _ = release_dentry(live_dentry);
+        return Err(Error::InvalidHandle);
+    }
+    release_dentry(live_dentry)?;
     unlink("/self-test/renamed")?;
     unlink("/self-test/replacement")?;
     remove_dir("/self-test")?;
@@ -1457,14 +1670,7 @@ fn resolve_mount(
     let mut mount = namespace_root(namespace)?;
     let mut inode = 0;
     for component in components.iter().take(count) {
-        if fs.inodes[inode as usize].kind != NodeType::Directory {
-            return Err(Error::NotDirectory);
-        }
-        inode = find_child(fs, inode, *component).ok_or(Error::NotFound)?;
-        if let Some(child_mount) = find_mount_child(namespace, mount, inode) {
-            mount = child_mount;
-            inode = mount_node(child_mount)?.root_inode;
-        }
+        walk_component(fs, namespace, &mut mount, &mut inode, *component)?;
     }
     Ok((mount, inode))
 }
@@ -1481,19 +1687,49 @@ fn parent_and_name_mount(
     let mut mount = namespace_root(namespace)?;
     let mut parent = 0;
     for component in components.iter().take(count - 1) {
-        if fs.inodes[parent as usize].kind != NodeType::Directory {
-            return Err(Error::NotDirectory);
-        }
-        parent = find_child(fs, parent, *component).ok_or(Error::NotFound)?;
-        if let Some(child_mount) = find_mount_child(namespace, mount, parent) {
-            mount = child_mount;
-            parent = mount_node(child_mount)?.root_inode;
-        }
+        walk_component(fs, namespace, &mut mount, &mut parent, *component)?;
     }
     if fs.inodes[parent as usize].kind != NodeType::Directory {
         return Err(Error::NotDirectory);
     }
-    Ok((mount, parent, components[count - 1]))
+    let name = components[count - 1];
+    if name.is_special() {
+        return Err(Error::InvalidPath);
+    }
+    Ok((mount, parent, name))
+}
+
+fn walk_component(
+    fs: &FileSystem,
+    namespace: NamespaceId,
+    mount: &mut MountId,
+    inode: &mut u16,
+    component: Name,
+) -> Result<(), Error> {
+    if fs.inodes[*inode as usize].kind != NodeType::Directory {
+        return Err(Error::NotDirectory);
+    }
+    if component.is_dot() {
+        return Ok(());
+    }
+    if component.is_dotdot() {
+        let node = mount_node(*mount)?;
+        if let Some(parent_mount) = node.parent {
+            if *inode == node.root_inode {
+                *mount = parent_mount;
+                *inode = fs.inodes[node.mountpoint_inode as usize].parent;
+                return Ok(());
+            }
+        }
+        *inode = fs.inodes[*inode as usize].parent;
+        return Ok(());
+    }
+    *inode = find_child(fs, *inode, component).ok_or(Error::NotFound)?;
+    if let Some(child_mount) = find_mount_child(namespace, *mount, *inode) {
+        *mount = child_mount;
+        *inode = mount_node(child_mount)?.root_inode;
+    }
+    Ok(())
 }
 
 fn create_node_at(
@@ -1546,13 +1782,6 @@ fn parse_path(path: &str) -> Result<([Name; MAX_COMPONENTS], usize), Error> {
             position += 1;
         }
         let part = &bytes[start..position];
-        if part == b"." {
-            continue;
-        }
-        if part == b".." {
-            count = count.saturating_sub(1);
-            continue;
-        }
         if part.len() > NAME_MAX {
             return Err(Error::NameTooLong);
         }

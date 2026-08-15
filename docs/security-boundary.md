@@ -10,7 +10,7 @@ untrusted input at every syscall, loader, VM host call, and IPC endpoint.
 | --- | --- |
 | User pointer/length | validate canonicality, overflow, range, and ownership before copying |
 | Process/thread/FD ID | validate slot and generation; never use the ID as a raw array index |
-| VFS path | resolve only inside the process namespace; never consult a host path |
+| VFS path | resolve only inside the selected kernel namespace; current pathname syscalls select the root namespace until process namespace attachment is added; never consult a host path |
 | Device/resource handle | use an owning, generation-checked kernel object with explicit rights |
 | Capability request | authorize effective credentials; UID 0 alone never bypasses the bitset |
 | Wasm import | expose only the versioned host signature and bounded instance handles |

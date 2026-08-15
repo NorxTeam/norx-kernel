@@ -941,7 +941,7 @@ fn vfs(debugger: &mut SerialDebugger, args: &[&str]) {
         }
         Some("namespace") => match crate::vfs::create_namespace() {
             Ok(namespace) => {
-                debugger.write_fmt(format_args!("namespace created {:?}\n", namespace))
+                debugger.write_fmt(format_args!("namespace created id={}\n", namespace.raw()))
             }
             Err(error) => debugger.write_fmt(format_args!("vfs namespace: {:?}\n", error)),
         },

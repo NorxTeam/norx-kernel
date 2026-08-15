@@ -88,6 +88,7 @@ jobs:
             marker="$2"
             display="$3"
             early_uart_marker="$4"
+            vfs_marker="$5"
             log="$RUNNER_TEMP/norx-$arch.serial.log"
             stable_log="$RUNNER_TEMP/norx-$arch.stable.log"
             screenshot="$RUNNER_TEMP/norx-$arch.ppm"
@@ -115,6 +116,7 @@ jobs:
             done
             grep -F "$marker" "$log"
             grep -F "$early_uart_marker" "$log"
+            grep -F "$vfs_marker" "$log"
 
             python3 - "$qmp" "$screenshot" <<'PY'
           import json
@@ -160,12 +162,13 @@ jobs:
 
             grep -F "$marker" "$stable_log"
             grep -F "$early_uart_marker" "$stable_log"
+            grep -F "$vfs_marker" "$stable_log"
             kill "$qemu_pid" 2>/dev/null || true
             wait "$qemu_pid" 2>/dev/null || true
           }
 
-          smoke x86_64 "x86_64 lazy page faults allocate, zero, and map through the direct map" "vnc=127.0.0.1:0" "NORX_EARLY_UART_READY v=1 backend=ns16550 poll-limit=4096"
-          smoke aarch64 "persistent warm-reboot status committed" "vnc=127.0.0.1:1" "NORX_EARLY_UART_READY v=1 backend=pl011 poll-limit=4096"
+          smoke x86_64 "x86_64 lazy page faults allocate, zero, and map through the direct map" "vnc=127.0.0.1:0" "NORX_EARLY_UART_READY v=1 backend=ns16550 poll-limit=4096" "ramfs /hello.txt readback passed"
+          smoke aarch64 "persistent warm-reboot status committed" "vnc=127.0.0.1:1" "NORX_EARLY_UART_READY v=1 backend=pl011 poll-limit=4096" "ramfs /hello.txt readback passed"
           grep -F "NORX_SERIAL_DEBUGGER_READY v=1" "$RUNNER_TEMP/norx-aarch64.stable.log"
 
       - name: Upload QEMU smoke logs and framebuffer screenshots

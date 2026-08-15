@@ -530,16 +530,18 @@ paths, capacity, permissions, directories, and open handles. `mkdir`, `open`,
 `remove_dir` are the core operations; the existing serial `ls`, `cat`, and
 `write` commands are compatibility wrappers over handles.
 
-Mount and unmount are explicit. Unmount refuses while a handle is open, and
-the boot self-check exercises nested directory creation, offset readback,
-permission denial, rename, unlink, busy unmount, clean unmount, and remount
-before creating `/hello.txt`. Persistence, page cache, and on-disk filesystem
-formats remain separate follow-up work.
+Mount and unmount are explicit. Unmount refuses while a handle, dentry, child
+mount, or namespace root is live, and the boot self-check exercises nested
+directory creation, offset readback, hard-link lifetime, stale-handle
+rejection, type-aware traversal, mountpoint protection, duplicate-target
+rejection, namespace visibility, permission denial, rename, unlink, busy
+unmount, clean unmount, and remount before creating `/hello.txt`. Persistence,
+page cache, and on-disk filesystem formats remain separate follow-up work.
 
-The x86_64 QEMU bootlog reached `ramfs mounted root directories=1 files=1
-bytes=20`, followed by the ramfs self-check message and `vfs initialized`
-without an exception. The architecture-neutral implementation also passes
-the aarch64 build and clippy checks.
+The x86_64 and aarch64 QEMU bootlogs reach `ramfs /hello.txt readback passed`,
+the ramfs/VFS self-check messages, and `vfs initialized` without an exception.
+The architecture-neutral implementation passes both target builds; repository
+wide clippy still reports pre-existing warnings outside this VFS pass.
 
 ### FAT32 follow-up
 
@@ -601,14 +603,17 @@ writable root` and complete kernel initialization on x86_64 and aarch64.
 
 `src/vfs.rs` now owns the common bounded mount contract: `MountId` and
 `NamespaceId` identify a mount tree, `mount_in_namespace` resolves targets,
-and `lookup_in_namespace` returns a tracked dentry whose release is required
-before unmount. Mount nodes carry source, parent, flags, and propagation
-metadata. Read-only mounts reject all mutating operations, and unmount rejects
-the root, child mounts, open handles, and live dentries. Namespace creation
-gets an independent root mount over the same validated ramfs backend; the
-fixed-capacity model is deliberate. Process-visible tables now hold bounded
-local VFS/pipe descriptors, while descriptor inheritance across concurrent
-processes remains part of the scheduler/spawn2 follow-up.
+and `lookup_in_namespace` returns a generation-checked dentry whose release is
+required before unmount. Mount nodes carry source, parent, flags, and
+propagation metadata. Read-only mounts reject all mutating operations, mount
+points cannot be removed or renamed while attached, duplicate targets are
+rejected, and unmount rejects the root, child mounts, open handles, and live
+dentries. Namespace destruction is transactional with respect to child mounts
+and live references. Namespace creation gets an independent root mount over
+the same validated ramfs backend; the fixed-capacity model is deliberate.
+Process pathname operations currently select the root namespace; attaching a
+process namespace and adding mount namespace syscalls remain a later ABI
+follow-up rather than an undocumented claim of process isolation.
 
 The serial debugger exposes `vfs` inspection plus `vfs mount <target>`,
 `vfs umount <id>`, `vfs lookup <path>`, and `vfs namespace`. Thus mount sources
