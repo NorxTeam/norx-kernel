@@ -541,6 +541,12 @@ two-boot smoke asserts the sequence survives a QEMU process restart. FAT32
 allocation, mount-tree publication, ext4/btrfs write paths, journal recovery,
 and a complete persistent POSIX namespace remain later roadmap work.
 
+The three staged readers now accept an explicit bounded partition view
+(`base_lba`, `available_sectors`) and the boot probes use the block layer's
+first discovered partition. Reader callbacks are still read-only for ext4 and
+btrfs, and the FAT32 writer remains fixed-file-only; this is a boundary check,
+not mount-tree publication.
+
 ### Ramfs follow-up
 
 The first writable filesystem is now an in-memory ramfs mounted through the
@@ -571,7 +577,7 @@ wide clippy still reports pre-existing warnings outside this VFS pass.
 validates the FAT32 BPB, derives bounded data geometry, walks FAT cluster
 chains, resolves both short names and checked UTF-16 long names, and reads
 regular files through the block-sector contract. The boot path probes the active
-block backend read-only and leaves ramfs as the writable root when no FAT32
+block partition through a bounded relative-LBA view and leaves ramfs as the writable root when no FAT32
 volume is present. When a persistent virtio-blk image is attached, the bounded
 `/NORX.PST` check uses `Mount::open_rw`, the existing fixed chain, and
 the block flush boundary.
@@ -592,7 +598,8 @@ fallback messages remain in the normal kernel boot log.
 
 ### Ext4 staged follow-up
 
-`src/ext4.rs` adds a read-only ext4 mount path after the FAT32 probe. It checks
+`src/ext4.rs` adds a read-only ext4 reader over the active bounded block
+partition. It checks
 the superblock geometry, group descriptor size, inode layout, extents feature,
 and journal recovery boundary before exposing a volume. The current staged
 reader supports depth-0 extents, inode reads, bounded directory records,
@@ -609,7 +616,8 @@ remains the writable root` and reach `kernel initialization complete`.
 
 ### Btrfs staged follow-up
 
-`src/btrfs.rs` adds a conservative read-only Btrfs bootstrap. It verifies the
+`src/btrfs.rs` adds a conservative read-only Btrfs bootstrap over the active
+bounded block partition. It verifies the
 CRC32C superblock, parses the system chunk array, maps logical addresses through
 the chunk tree, validates checksummed tree blocks, traverses bounded internal
 and leaf nodes, and discovers root items for subvolumes and snapshots. The

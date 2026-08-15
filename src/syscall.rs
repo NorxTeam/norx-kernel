@@ -53,6 +53,9 @@ pub enum Number {
     ReadDir = 426,
     Fsync = 427,
     SyncPath = 428,
+    Seek = 429,
+    Fstat = 430,
+    Fchmod = 431,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -69,7 +72,7 @@ pub struct Metadata {
     pub restart: RestartPolicy,
 }
 
-pub const TABLE: [Metadata; 34] = [
+pub const TABLE: [Metadata; 37] = [
     Metadata {
         number: Number::Read,
         name: "read",
@@ -271,6 +274,24 @@ pub const TABLE: [Metadata; 34] = [
     Metadata {
         number: Number::SyncPath,
         name: "sync_path",
+        arguments: 2,
+        restart: RestartPolicy::Never,
+    },
+    Metadata {
+        number: Number::Seek,
+        name: "lseek",
+        arguments: 3,
+        restart: RestartPolicy::Never,
+    },
+    Metadata {
+        number: Number::Fstat,
+        name: "fstat",
+        arguments: 2,
+        restart: RestartPolicy::Never,
+    },
+    Metadata {
+        number: Number::Fchmod,
+        name: "fchmod",
         arguments: 2,
         restart: RestartPolicy::Never,
     },
@@ -744,20 +765,24 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Ok(path) if !path.as_bytes().contains(&0) => path,
                 _ => return Errno::Einval.return_value(),
             };
-            let child = match crate::service::spawn_user_path_resumable_with_args_and_flags(
-                path,
-                &arguments[..argument_count],
-                &environment[..environment_count],
-                spec.flags,
-            ) {
-                Ok(child) => child,
-                Err(crate::service::SpawnError::NotFound) => {
-                    crate::bootlog::warn_fmt(format_args!("spawn2 path not found: {path}"));
-                    return Errno::Enoent.return_value();
-                }
-                Err(crate::service::SpawnError::Capacity) => return Errno::Eagain.return_value(),
-                Err(_) => return Errno::Einval.return_value(),
-            };
+            let transaction =
+                match crate::service::spawn_user_path_resumable_with_args_and_flags_transaction(
+                    path,
+                    &arguments[..argument_count],
+                    &environment[..environment_count],
+                    spec.flags,
+                ) {
+                    Ok(child) => child,
+                    Err(crate::service::SpawnError::NotFound) => {
+                        crate::bootlog::warn_fmt(format_args!("spawn2 path not found: {path}"));
+                        return Errno::Enoent.return_value();
+                    }
+                    Err(crate::service::SpawnError::Capacity) => {
+                        return Errno::Eagain.return_value()
+                    }
+                    Err(_) => return Errno::Einval.return_value(),
+                };
+            let child_id = transaction.child;
             let source_fds = [spec.stdin_fd, spec.stdout_fd, spec.stderr_fd];
             let source_fds = match (
                 u32::try_from(source_fds[0]),
@@ -766,59 +791,31 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
             ) {
                 (Ok(stdin), Ok(stdout), Ok(stderr)) => [stdin, stdout, stderr],
                 _ => {
-                    let parent = crate::process::current_process_id();
-                    if let Some(parent) = parent {
-                        let _ = crate::process::discard_child(
-                            parent,
-                            crate::process::ProcessId::from_raw(child),
-                        );
-                    }
-                    let _ =
-                        crate::user_runtime::discard(crate::process::ProcessId::from_raw(child));
+                    discard_spawn(transaction);
                     return Errno::Ebadf.return_value();
                 }
             };
-            if crate::process::inherit_current_standard_fds(
-                crate::process::ProcessId::from_raw(child),
-                source_fds,
-            )
-            .is_err()
-            {
-                let parent = crate::process::current_process_id();
-                if let Some(parent) = parent {
-                    let _ = crate::process::discard_child(
-                        parent,
-                        crate::process::ProcessId::from_raw(child),
-                    );
-                }
-                let _ = crate::user_runtime::discard(crate::process::ProcessId::from_raw(child));
+            if crate::process::inherit_spawn_standard_fds(transaction, source_fds).is_err() {
+                discard_spawn(transaction);
                 return Errno::Ebadf.return_value();
             }
-            let child_id = crate::process::ProcessId::from_raw(child);
             let requested_group = if spec.flags & SPAWN_NEW_PROCESS_GROUP != 0 {
                 child_id
             } else {
                 crate::process::ProcessId::from_raw(spec.process_group as u32)
             };
             if (spec.flags & SPAWN_NEW_PROCESS_GROUP != 0 || spec.process_group != 0)
-                && crate::process::set_process_group_for_child(child_id, requested_group).is_err()
+                && crate::process::set_process_group_for_spawn(transaction, requested_group)
+                    .is_err()
             {
-                let parent = crate::process::current_process_id();
-                if let Some(parent) = parent {
-                    let _ = crate::process::discard_child(parent, child_id);
-                }
-                let _ = crate::user_runtime::discard(child_id);
+                discard_spawn(transaction);
                 return Errno::Eperm.return_value();
             }
-            if crate::process::publish_child(child_id).is_err() {
-                let parent = crate::process::current_process_id();
-                if let Some(parent) = parent {
-                    let _ = crate::process::discard_child(parent, child_id);
-                }
-                let _ = crate::user_runtime::discard(child_id);
+            if crate::process::publish_spawn(transaction).is_err() {
+                discard_spawn(transaction);
                 return Errno::Eagain.return_value();
             }
-            child as UserWord
+            child_id.get() as UserWord
         }
         value if value == Number::SpawnDelegated as UserWord => {
             if crate::usercopy::validate(args.values[0], core::mem::size_of::<DelegatedSpawnSpec>())
@@ -892,20 +889,25 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 saved_gid: spec.target_gid,
                 capabilities: spec.capabilities,
             };
-            let child = match crate::service::spawn_delegated_user_path_resumable_with_args(
-                path,
-                &arguments[..argument_count],
-                &environment[..environment_count],
-                spec.flags,
-                credentials,
-            ) {
-                Ok(child) => child,
-                Err(crate::service::SpawnError::NotFound) => return Errno::Enoent.return_value(),
-                Err(crate::service::SpawnError::Capacity) => return Errno::Eagain.return_value(),
-                Err(_) => return Errno::Einval.return_value(),
-            };
+            let transaction =
+                match crate::service::spawn_delegated_user_path_resumable_with_args_transaction(
+                    path,
+                    &arguments[..argument_count],
+                    &environment[..environment_count],
+                    spec.flags,
+                    credentials,
+                ) {
+                    Ok(child) => child,
+                    Err(crate::service::SpawnError::NotFound) => {
+                        return Errno::Enoent.return_value()
+                    }
+                    Err(crate::service::SpawnError::Capacity) => {
+                        return Errno::Eagain.return_value()
+                    }
+                    Err(_) => return Errno::Einval.return_value(),
+                };
             if finalize_spawn(
-                child,
+                transaction,
                 spec.stdin_fd,
                 spec.stdout_fd,
                 spec.stderr_fd,
@@ -916,7 +918,7 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
             {
                 return Errno::Eperm.return_value();
             }
-            child as UserWord
+            transaction.child.get() as UserWord
         }
         value if value == Number::SetSession as UserWord => {
             if crate::usercopy::validate(args.values[0], core::mem::size_of::<SessionSpec>())
@@ -1234,6 +1236,88 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
             };
             match crate::vfs::sync_path(path) {
                 Ok(()) => Errno::Enotsup.return_value(),
+                Err(error) => vfs_errno(error).return_value(),
+            }
+        }
+        value if value == Number::Seek as UserWord => {
+            let fd = match u32::try_from(args.values[0]) {
+                Ok(fd) => fd,
+                Err(_) => return Errno::Ebadf.return_value(),
+            };
+            let (open_file, _, _, _) = match current_fd_info(fd) {
+                Ok(info) => info,
+                Err(errno) => return errno.return_value(),
+            };
+            let Some(handle) = crate::vfs::FileHandle::from_raw(open_file) else {
+                return Errno::Einval.return_value();
+            };
+            let whence = match u32::try_from(args.values[2]) {
+                Ok(whence) => whence,
+                Err(_) => return Errno::Einval.return_value(),
+            };
+            match crate::vfs::seek_from(handle, args.values[1] as i64, whence) {
+                Ok(offset) => offset as UserWord,
+                Err(error) => vfs_errno(error).return_value(),
+            }
+        }
+        value if value == Number::Fstat as UserWord => {
+            let fd = match u32::try_from(args.values[0]) {
+                Ok(fd) => fd,
+                Err(_) => return Errno::Ebadf.return_value(),
+            };
+            if crate::usercopy::validate(args.values[1], core::mem::size_of::<Stat>()).is_err() {
+                return Errno::Efault.return_value();
+            }
+            let (open_file, _, _, _) = match current_fd_info(fd) {
+                Ok(info) => info,
+                Err(errno) => return errno.return_value(),
+            };
+            let Some(handle) = crate::vfs::FileHandle::from_raw(open_file) else {
+                return Errno::Ebadf.return_value();
+            };
+            let value = match crate::vfs::stat_handle(handle) {
+                Ok(value) => value,
+                Err(error) => return vfs_errno(error).return_value(),
+            };
+            let stat = Stat {
+                inode: value.inode,
+                kind: match value.kind {
+                    crate::vfs::NodeType::Regular => STAT_REGULAR,
+                    crate::vfs::NodeType::Directory => STAT_DIRECTORY,
+                },
+                mode: value.mode as u32,
+                size: value.size as u64,
+                links: value.links,
+            };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&stat as *const Stat).cast::<u8>(),
+                    core::mem::size_of::<Stat>(),
+                )
+            };
+            match crate::usercopy::copy_to_user(args.values[1], bytes) {
+                Ok(_) => 0,
+                Err(_) => Errno::Efault.return_value(),
+            }
+        }
+        value if value == Number::Fchmod as UserWord => {
+            let fd = match u32::try_from(args.values[0]) {
+                Ok(fd) => fd,
+                Err(_) => return Errno::Ebadf.return_value(),
+            };
+            let mode = match u16::try_from(args.values[1]) {
+                Ok(mode) => mode,
+                Err(_) => return Errno::Einval.return_value(),
+            };
+            let (open_file, _, _, _) = match current_fd_info(fd) {
+                Ok(info) => info,
+                Err(errno) => return errno.return_value(),
+            };
+            let Some(handle) = crate::vfs::FileHandle::from_raw(open_file) else {
+                return Errno::Ebadf.return_value();
+            };
+            match crate::vfs::fchmod(handle, mode) {
+                Ok(()) => 0,
                 Err(error) => vfs_errno(error).return_value(),
             }
         }
@@ -1561,14 +1645,13 @@ fn copy_user_string_vector<'a>(
 }
 
 fn finalize_spawn(
-    child: u32,
+    transaction: crate::process::SpawnTransaction,
     stdin_fd: UserWord,
     stdout_fd: UserWord,
     stderr_fd: UserWord,
     process_group: UserWord,
     flags: UserWord,
 ) -> Result<(), ()> {
-    let child_id = crate::process::ProcessId::from_raw(child);
     let source_fds = [stdin_fd, stdout_fd, stderr_fd];
     let source_fds = match (
         u32::try_from(source_fds[0]),
@@ -1577,37 +1660,35 @@ fn finalize_spawn(
     ) {
         (Ok(stdin), Ok(stdout), Ok(stderr)) => [stdin, stdout, stderr],
         _ => {
-            discard_spawn(child_id);
+            discard_spawn(transaction);
             return Err(());
         }
     };
-    if crate::process::inherit_current_standard_fds(child_id, source_fds).is_err() {
-        discard_spawn(child_id);
+    if crate::process::inherit_spawn_standard_fds(transaction, source_fds).is_err() {
+        discard_spawn(transaction);
         return Err(());
     }
     let requested_group = if flags & SPAWN_NEW_PROCESS_GROUP != 0 {
-        child_id
+        transaction.child
     } else {
         crate::process::ProcessId::from_raw(process_group as u32)
     };
     if (flags & SPAWN_NEW_PROCESS_GROUP != 0 || process_group != 0)
-        && crate::process::set_process_group_for_child(child_id, requested_group).is_err()
+        && crate::process::set_process_group_for_spawn(transaction, requested_group).is_err()
     {
-        discard_spawn(child_id);
+        discard_spawn(transaction);
         return Err(());
     }
-    if crate::process::publish_child(child_id).is_err() {
-        discard_spawn(child_id);
+    if crate::process::publish_spawn(transaction).is_err() {
+        discard_spawn(transaction);
         return Err(());
     }
     Ok(())
 }
 
-fn discard_spawn(child: crate::process::ProcessId) {
-    if let Some(parent) = crate::process::current_process_id() {
-        let _ = crate::process::discard_child(parent, child);
-    }
-    let _ = crate::user_runtime::discard(child);
+fn discard_spawn(transaction: crate::process::SpawnTransaction) {
+    let _ = crate::process::discard_child(transaction.parent, transaction.child);
+    let _ = crate::user_runtime::discard(transaction.child);
 }
 
 fn current_fd_info(fd: u32) -> Result<(u32, bool, bool, bool), Errno> {
@@ -1656,7 +1737,7 @@ pub fn contract_self_check() {
     assert!(!is_error(EXIT_TO_KERNEL));
     assert!(!is_error(SWITCH_TO_USER));
     assert_ne!(EXIT_TO_KERNEL, SWITCH_TO_USER);
-    assert_eq!(TABLE.len(), 34);
+    assert_eq!(TABLE.len(), 37);
     assert!(TABLE.iter().all(|entry| entry.arguments <= MAX_ARGS as u8));
     assert_eq!(TABLE[0].number as UserWord, Number::Read as UserWord);
     assert!(TABLE.iter().all(|entry| !entry.name.is_empty()));

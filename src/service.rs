@@ -1050,6 +1050,16 @@ pub fn spawn_user_path_resumable_with_args_and_flags(
     environment: &[&[u8]],
     flags: u64,
 ) -> Result<u32, SpawnError> {
+    spawn_user_path_resumable_with_args_and_flags_transaction(path, arguments, environment, flags)
+        .map(|transaction| transaction.child.get())
+}
+
+pub fn spawn_user_path_resumable_with_args_and_flags_transaction(
+    path: &str,
+    arguments: &[&[u8]],
+    environment: &[&[u8]],
+    flags: u64,
+) -> Result<crate::process::SpawnTransaction, SpawnError> {
     spawn_user_path_resumable_with_args_and_credentials(path, arguments, environment, flags, None)
 }
 
@@ -1060,6 +1070,23 @@ pub fn spawn_delegated_user_path_resumable_with_args(
     flags: u64,
     credentials: Credentials,
 ) -> Result<u32, SpawnError> {
+    spawn_delegated_user_path_resumable_with_args_transaction(
+        path,
+        arguments,
+        environment,
+        flags,
+        credentials,
+    )
+    .map(|transaction| transaction.child.get())
+}
+
+pub fn spawn_delegated_user_path_resumable_with_args_transaction(
+    path: &str,
+    arguments: &[&[u8]],
+    environment: &[&[u8]],
+    flags: u64,
+    credentials: Credentials,
+) -> Result<crate::process::SpawnTransaction, SpawnError> {
     spawn_user_path_resumable_with_args_and_credentials(
         path,
         arguments,
@@ -1075,12 +1102,11 @@ fn spawn_user_path_resumable_with_args_and_credentials(
     environment: &[&[u8]],
     flags: u64,
     credentials_override: Option<Credentials>,
-) -> Result<u32, SpawnError> {
+) -> Result<crate::process::SpawnTransaction, SpawnError> {
     let (image, _label) = image_for_user_path(path)?;
     if path.as_bytes().contains(&0) {
         return Err(SpawnError::InvalidPath);
     }
-    let parent = crate::process::current_process_id().ok_or(SpawnError::InvalidState)?;
     let credentials = match credentials_override {
         Some(credentials) => credentials,
         None if flags & SPAWN_INHERIT_CREDENTIALS != 0 => {
@@ -1091,18 +1117,19 @@ fn spawn_user_path_resumable_with_args_and_credentials(
             ..Credentials::BOOTSTRAP
         },
     };
-    let (child, thread) =
+    let transaction =
         crate::process::spawn_child_current_staged(credentials).map_err(|error| match error {
             crate::process::Error::ProcessCapacity | crate::process::Error::ThreadCapacity => {
                 SpawnError::Capacity
             }
             _ => SpawnError::InvalidState,
         })?;
+    let child = transaction.child;
     let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE, 53);
     let plan = match crate::elf::parse(image, crate::elf::Machine::current(), load_bias) {
         Ok(plan) => plan,
         Err(_) => {
-            let _ = crate::process::discard_child(parent, child);
+            let _ = crate::process::discard_child(transaction.parent, child);
             return Err(SpawnError::Elf);
         }
     };
@@ -1116,20 +1143,20 @@ fn spawn_user_path_resumable_with_args_and_credentials(
     ) {
         Ok(runtime) => runtime,
         Err(_) => {
-            let _ = crate::process::discard_child(parent, child);
+            let _ = crate::process::discard_child(transaction.parent, child);
             return Err(SpawnError::Runtime);
         }
     };
     let Some(root) = runtime.root_frame() else {
         let mut runtime = runtime;
         let _ = runtime.discard();
-        let _ = crate::process::discard_child(parent, child);
+        let _ = crate::process::discard_child(transaction.parent, child);
         return Err(SpawnError::Runtime);
     };
     if runtime.activate_for_resumable().is_err() {
         let mut runtime = runtime;
         let _ = runtime.discard();
-        let _ = crate::process::discard_child(parent, child);
+        let _ = crate::process::discard_child(transaction.parent, child);
         return Err(SpawnError::Runtime);
     }
     if crate::process::attach_address_space(child, root).is_err()
@@ -1137,7 +1164,7 @@ fn spawn_user_path_resumable_with_args_and_credentials(
     {
         let _ = crate::user_runtime::discard(child);
         let _ = crate::process::clear_address_space(child);
-        let _ = crate::process::discard_child(parent, child);
+        let _ = crate::process::discard_child(transaction.parent, child);
         return Err(SpawnError::Runtime);
     }
     let registers = match crate::user_runtime::start(child) {
@@ -1145,17 +1172,17 @@ fn spawn_user_path_resumable_with_args_and_credentials(
         Err(_) => {
             let _ = crate::user_runtime::discard(child);
             let _ = crate::process::clear_address_space(child);
-            let _ = crate::process::discard_child(parent, child);
+            let _ = crate::process::discard_child(transaction.parent, child);
             return Err(SpawnError::Runtime);
         }
     };
-    if crate::process::install_user_context(thread.get(), registers).is_err() {
+    if crate::process::install_user_context(transaction.thread.get(), registers).is_err() {
         let _ = crate::user_runtime::discard(child);
         let _ = crate::process::clear_address_space(child);
-        let _ = crate::process::discard_child(parent, child);
+        let _ = crate::process::discard_child(transaction.parent, child);
         return Err(SpawnError::Runtime);
     }
-    Ok(child.get())
+    Ok(transaction)
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

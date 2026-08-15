@@ -144,59 +144,10 @@ pub extern "C" fn kernel_start() -> ! {
     bootlog::start(1, "checking virtual filesystem");
     fat32::contract_self_check();
     bootlog::ok("FAT32 parser, long-name, and safe-write checks passed");
-    bootlog::start(2, "checking FAT32 volumes");
-    match fat32::probe_ramdisk() {
-        Ok(volume) => bootlog::ok_fmt(format_args!(
-            "FAT32 read-only volume sectors={} clusters={} root={}",
-            volume.geometry().total_sectors,
-            volume.geometry().cluster_count,
-            volume.geometry().root_cluster,
-        )),
-        Err(fat32::Error::InvalidBpb) => {
-            bootlog::warn("FAT32 volume absent; ramfs remains the writable root")
-        }
-        Err(error) => bootlog::warn_fmt(format_args!(
-            "FAT32 probe failed: {:?}; ramfs remains the writable root",
-            error
-        )),
-    }
     ext4::contract_self_check();
     bootlog::ok("ext4 superblock, extent, directory, permission, and journal checks passed");
-    bootlog::start(3, "checking ext4 volumes");
-    match ext4::probe_ramdisk() {
-        Ok(volume) => bootlog::ok_fmt(format_args!(
-            "ext4 read-only volume blocks={} block_size={} groups={} journal={}",
-            volume.geometry().blocks,
-            volume.geometry().block_size,
-            volume.geometry().groups,
-            volume.geometry().has_journal,
-        )),
-        Err(ext4::Error::InvalidSuperblock) => {
-            bootlog::warn("ext4 volume absent; ramfs remains the writable root")
-        }
-        Err(error) => bootlog::warn_fmt(format_args!(
-            "ext4 probe failed: {:?}; ramfs remains the writable root",
-            error
-        )),
-    }
     btrfs::contract_self_check();
     bootlog::ok("btrfs superblock, checksum, tree, and subvolume checks passed");
-    bootlog::start(0, "checking btrfs volumes");
-    match btrfs::probe_ramdisk() {
-        Ok(volume) => bootlog::ok_fmt(format_args!(
-            "btrfs read-only volume bytes={} nodesize={} chunks={}",
-            volume.geometry().total_bytes,
-            volume.geometry().nodesize,
-            volume.geometry().chunks,
-        )),
-        Err(btrfs::Error::InvalidSuperblock) => {
-            bootlog::warn("btrfs volume absent; ramfs remains the writable root")
-        }
-        Err(error) => bootlog::warn_fmt(format_args!(
-            "btrfs probe failed: {:?}; ramfs remains the writable root",
-            error
-        )),
-    }
     vfs::contract_self_check();
     if vfs::init() {
         bootlog::ok("vfs initialized");
@@ -463,6 +414,56 @@ pub extern "C" fn kernel_start() -> ! {
         bootlog::ok("runtime bus probing complete");
     } else {
         bootlog::fail("runtime bus registry capacity exhausted");
+    }
+    bootlog::start(2, "checking persistent filesystem volumes");
+    match fat32::probe_block() {
+        Ok(volume) => bootlog::ok_fmt(format_args!(
+            "FAT32 block volume sectors={} clusters={} root={} readonly={}",
+            volume.geometry().total_sectors,
+            volume.geometry().cluster_count,
+            volume.geometry().root_cluster,
+            volume.geometry().read_only,
+        )),
+        Err(fat32::Error::InvalidBpb) => {
+            bootlog::warn("FAT32 volume absent; ramfs remains the writable root")
+        }
+        Err(error) => bootlog::warn_fmt(format_args!(
+            "FAT32 block probe failed: {:?}; ramfs remains the writable root",
+            error
+        )),
+    }
+    match ext4::probe_block() {
+        Ok(volume) => bootlog::ok_fmt(format_args!(
+            "ext4 block volume blocks={} block_size={} groups={} journal={} readonly={}",
+            volume.geometry().blocks,
+            volume.geometry().block_size,
+            volume.geometry().groups,
+            volume.geometry().has_journal,
+            volume.geometry().read_only,
+        )),
+        Err(ext4::Error::InvalidSuperblock) => {
+            bootlog::warn("ext4 volume absent; ramfs remains the writable root")
+        }
+        Err(error) => bootlog::warn_fmt(format_args!(
+            "ext4 block probe failed: {:?}; ramfs remains the writable root",
+            error
+        )),
+    }
+    match btrfs::probe_block() {
+        Ok(volume) => bootlog::ok_fmt(format_args!(
+            "btrfs block volume bytes={} nodesize={} chunks={} readonly={}",
+            volume.geometry().total_bytes,
+            volume.geometry().nodesize,
+            volume.geometry().chunks,
+            volume.geometry().read_only,
+        )),
+        Err(btrfs::Error::InvalidSuperblock) => {
+            bootlog::warn("btrfs volume absent; ramfs remains the writable root")
+        }
+        Err(error) => bootlog::warn_fmt(format_args!(
+            "btrfs block probe failed: {:?}; ramfs remains the writable root",
+            error
+        )),
     }
     if drivers::block::persistent() && !drivers::block::read_only() {
         match fat32::fixed_file_persistence_check() {

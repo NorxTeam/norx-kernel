@@ -21,6 +21,8 @@ pub enum Error {
     InvalidRequest,
     OutOfRange,
     ReadOnly,
+    #[cfg(target_arch = "x86_64")]
+    Device,
     Busy,
     Timeout,
     Unsupported,
@@ -245,6 +247,13 @@ pub fn partitions(output: &mut [Partition]) -> usize {
     count
 }
 
+pub fn partition(index: usize) -> Option<Partition> {
+    if index >= partition_count() || index >= MAX_PARTITIONS {
+        return None;
+    }
+    unsafe { (&*core::ptr::addr_of!(PARTITIONS))[index] }
+}
+
 pub fn set_read_only(read_only: bool) {
     unsafe { READ_ONLY = read_only || HARDWARE_READ_ONLY };
 }
@@ -268,7 +277,7 @@ pub fn set_cache_mode(mode: CacheMode) -> Result<(), Error> {
 pub fn flush_cache() -> Result<(), Error> {
     if persistent() {
         #[cfg(target_arch = "x86_64")]
-        return crate::drivers::virtio_blk::flush().map_err(|_| Error::Unsupported);
+        return crate::drivers::virtio_blk::flush().map_err(map_virtio_error);
     }
     match cache_mode() {
         CacheMode::WriteThrough => Ok(()),
@@ -431,12 +440,12 @@ fn process(request: Request) -> Result<(), Error> {
                             request.lba + index as u64,
                             buffer,
                         )
-                        .map_err(|_| Error::Unsupported)?,
+                        .map_err(map_virtio_error)?,
                         Operation::Write => crate::drivers::virtio_blk::write_sector(
                             request.lba + index as u64,
                             &*buffer,
                         )
-                        .map_err(|_| Error::Unsupported)?,
+                        .map_err(map_virtio_error)?,
                     }
                 }
                 Ok(())
@@ -444,6 +453,19 @@ fn process(request: Request) -> Result<(), Error> {
             #[cfg(not(target_arch = "x86_64"))]
             Err(Error::Unsupported)
         }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn map_virtio_error(error: crate::drivers::virtio_blk::Error) -> Error {
+    match error {
+        crate::drivers::virtio_blk::Error::Timeout => Error::Timeout,
+        crate::drivers::virtio_blk::Error::OutOfRange => Error::OutOfRange,
+        crate::drivers::virtio_blk::Error::Busy => Error::Busy,
+        crate::drivers::virtio_blk::Error::NotReady => Error::NotReady,
+        crate::drivers::virtio_blk::Error::FlushUnsupported
+        | crate::drivers::virtio_blk::Error::UnsupportedFeatures => Error::Unsupported,
+        _ => Error::Device,
     }
 }
 

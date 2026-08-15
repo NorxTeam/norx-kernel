@@ -1024,17 +1024,25 @@ pub fn write_handle(handle: FileHandle, input: &[u8]) -> Result<usize, Error> {
 }
 
 pub fn seek(handle: FileHandle, offset: isize) -> Result<usize, Error> {
+    seek_from(handle, offset as i64, 1)
+}
+
+pub fn seek_from(handle: FileHandle, offset: i64, whence: u32) -> Result<usize, Error> {
     with_fs(|fs| {
         let slot = validate_handle(fs, &handle)?;
-        let current_offset = fs.handles[slot].offset;
+        let base = match whence {
+            0 => 0,
+            1 => fs.handles[slot].offset,
+            2 => fs.inodes[fs.handles[slot].inode as usize].size,
+            _ => return Err(Error::InvalidPath),
+        };
         let next = if offset.is_negative() {
-            current_offset
-                .checked_sub(offset.unsigned_abs())
-                .ok_or(Error::OffsetOutOfRange)?
+            let distance =
+                usize::try_from(offset.unsigned_abs()).map_err(|_| Error::OffsetOutOfRange)?;
+            base.checked_sub(distance).ok_or(Error::OffsetOutOfRange)?
         } else {
-            current_offset
-                .checked_add(offset as usize)
-                .ok_or(Error::OffsetOutOfRange)?
+            let distance = usize::try_from(offset).map_err(|_| Error::OffsetOutOfRange)?;
+            base.checked_add(distance).ok_or(Error::OffsetOutOfRange)?
         };
         if next > FILE_MAX {
             return Err(Error::OffsetOutOfRange);
@@ -1066,6 +1074,21 @@ pub fn write_raw(raw: u32, input: &[u8]) -> Result<usize, Error> {
     )
 }
 
+pub fn stat_handle(handle: FileHandle) -> Result<FileStat, Error> {
+    with_fs(|fs| {
+        let slot = validate_handle(fs, &handle)?;
+        let inode = fs.handles[slot].inode;
+        let node = fs.inodes[inode as usize];
+        Ok(FileStat {
+            inode: inode as u32,
+            kind: node.kind,
+            mode: node.mode,
+            size: node.size,
+            links: link_count(fs, inode),
+        })
+    })
+}
+
 pub fn chmod(path: &str, mode: u16) -> Result<(), Error> {
     with_fs(|fs| {
         let (mount, inode) = resolve_mount(fs, path, NamespaceId::ROOT)?;
@@ -1073,6 +1096,18 @@ pub fn chmod(path: &str, mode: u16) -> Result<(), Error> {
             return Err(Error::ReadOnly);
         }
         fs.inodes[inode as usize].mode = mode & 0o777;
+        Ok(())
+    })
+}
+
+pub fn fchmod(handle: FileHandle, mode: u16) -> Result<(), Error> {
+    with_fs(|fs| {
+        let slot = validate_handle(fs, &handle)?;
+        let mount = fs.handles[slot].mount;
+        if mount_flags(mount)?.read_only {
+            return Err(Error::ReadOnly);
+        }
+        fs.inodes[fs.handles[slot].inode as usize].mode = mode & 0o777;
         Ok(())
     })
 }
@@ -1484,6 +1519,15 @@ fn mount_tests() -> Result<(), Error> {
     mkdir("/self-test")?;
     let handle = open("/self-test/file", OpenOptions::read_write_create())?;
     write_handle(handle, b"abcdef")?;
+    if stat_handle(handle)?.size != 6 {
+        return Err(Error::OffsetOutOfRange);
+    }
+    fchmod(handle, 0o600)?;
+    if stat_handle(handle)?.mode != 0o600 {
+        return Err(Error::PermissionDenied);
+    }
+    seek_from(handle, 0, 0)?;
+    seek_from(handle, 0, 2)?;
     if !matches!(lookup("/self-test/file/."), Err(Error::NotDirectory))
         || !matches!(lookup("/self-test/file/.."), Err(Error::NotDirectory))
     {

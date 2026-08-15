@@ -50,7 +50,9 @@ share the open-file description and offset; `close` drops one reference. The
 VFS mount/dentry reference is held by the description, so unmount remains
 `Busy` until all descriptions and dentries are released. `exec` closes only
 entries with `close_on_exec`; process exit closes the entire table before the
-zombie record is published.
+zombie record is published. `dup2` duplicates the open-file description but
+clears the destination's `close_on_exec` flag, matching the POSIX descriptor
+rule.
 
 The first implementation is fixed-capacity and does not expose host paths.
 Descriptors are the only process-visible route to VFS handles; raw `FileHandle`
@@ -58,8 +60,11 @@ slots never cross the syscall boundary. Process-table insertion accepts only the
 three serial endpoints, a live VFS handle, or a live pipe endpoint; unknown raw
 values are rejected. `spawn2` creates a `Creating` child and keeps its thread
 unschedulable while the runtime and explicitly requested standard descriptors are
-installed. Only then does it publish `Running/Ready`; arbitrary parent FD-table
-entries are not inherited by this bounded ABI.
+installed. The staged path carries an explicit `{parent, child, thread}`
+transaction through FD inheritance, process-group setup, publication, and
+rollback; it never re-derives the parent from a later current-process lookup.
+Only then does it publish `Running/Ready`; arbitrary parent FD-table entries are
+not inherited by this bounded ABI.
 
 ## Credentials and events
 

@@ -38,6 +38,7 @@ pub struct Geometry {
 pub struct Mount {
     reader: ReadSector,
     writer: Option<WriteSector>,
+    base_lba: u64,
     reserved_sectors: u16,
     fat_size: u32,
     total_sectors: u64,
@@ -137,16 +138,21 @@ impl LongName {
 
 impl Mount {
     pub fn open(reader: ReadSector) -> Result<Self, Error> {
-        Self::open_with_writer(reader, None)
+        Self::open_at(reader, None, 0, u64::MAX)
     }
 
     pub fn open_rw(reader: ReadSector, writer: WriteSector) -> Result<Self, Error> {
-        Self::open_with_writer(reader, Some(writer))
+        Self::open_at(reader, Some(writer), 0, u64::MAX)
     }
 
-    fn open_with_writer(reader: ReadSector, writer: Option<WriteSector>) -> Result<Self, Error> {
+    pub fn open_at(
+        reader: ReadSector,
+        writer: Option<WriteSector>,
+        base_lba: u64,
+        available_sectors: u64,
+    ) -> Result<Self, Error> {
         let mut bpb = [0u8; BYTES_PER_SECTOR];
-        if !reader(0, &mut bpb) {
+        if !reader(base_lba, &mut bpb) {
             return Err(Error::Io);
         }
         if bpb[510] != 0x55 || bpb[511] != 0xaa {
@@ -188,7 +194,10 @@ impl Mount {
                     .ok_or(Error::InvalidBpb)?,
             )
             .ok_or(Error::InvalidBpb)?;
-        if total_sectors <= first_data_sector {
+        if total_sectors <= first_data_sector
+            || total_sectors > available_sectors
+            || base_lba.checked_add(total_sectors).is_none()
+        {
             return Err(Error::InvalidBpb);
         }
         let cluster_count = ((total_sectors - first_data_sector) / sectors_per_cluster as u64)
@@ -203,6 +212,7 @@ impl Mount {
         Ok(Self {
             reader,
             writer,
+            base_lba,
             reserved_sectors,
             fat_size,
             total_sectors,
@@ -245,7 +255,7 @@ impl Mount {
     }
 
     pub fn write_file(self, path: &str, input: &[u8]) -> Result<usize, Error> {
-        let Some(writer) = self.writer else {
+        let Some(_writer) = self.writer else {
             return Err(Error::ReadOnly);
         };
         let (components, count) = components(path)?;
@@ -268,12 +278,12 @@ impl Mount {
         }
         self.write_chain(location.entry.cluster, input)?;
         let mut data = [0u8; BYTES_PER_SECTOR];
-        if !(self.reader)(location.sector, &mut data) {
+        if !self.read_sector(location.sector, &mut data) {
             return Err(Error::Io);
         }
         data[location.offset + 28..location.offset + 32]
             .copy_from_slice(&(input.len() as u32).to_le_bytes());
-        if !writer(location.sector, &data) {
+        if !self.write_sector(location.sector, &data) {
             return Err(Error::Io);
         }
         Ok(input.len())
@@ -293,7 +303,7 @@ impl Mount {
         for _ in 0..self.cluster_count {
             for sector in 0..self.sectors_per_cluster as u64 {
                 let mut data = [0u8; BYTES_PER_SECTOR];
-                if !(self.reader)(self.cluster_sector(cluster) + sector, &mut data) {
+                if !self.read_sector(self.cluster_sector(cluster) + sector, &mut data) {
                     return Err(Error::Io);
                 }
                 for entry_offset in (0..BYTES_PER_SECTOR).step_by(32) {
@@ -359,7 +369,7 @@ impl Mount {
                     return Ok(copied);
                 }
                 let mut data = [0u8; BYTES_PER_SECTOR];
-                if !(self.reader)(self.cluster_sector(cluster) + sector, &mut data) {
+                if !self.read_sector(self.cluster_sector(cluster) + sector, &mut data) {
                     return Err(Error::Io);
                 }
                 let length = (size - copied).min(BYTES_PER_SECTOR);
@@ -396,7 +406,7 @@ impl Mount {
     }
 
     fn write_chain(self, start: u32, input: &[u8]) -> Result<(), Error> {
-        let Some(writer) = self.writer else {
+        let Some(_writer) = self.writer else {
             return Err(Error::ReadOnly);
         };
         let mut cluster = start;
@@ -412,7 +422,7 @@ impl Mount {
                 let length = (input.len() - copied).min(BYTES_PER_SECTOR);
                 let mut data = [0u8; BYTES_PER_SECTOR];
                 data[..length].copy_from_slice(&input[copied..copied + length]);
-                if !writer(self.cluster_sector(cluster) + sector, &data) {
+                if !self.write_sector(self.cluster_sector(cluster) + sector, &data) {
                     return Err(Error::Io);
                 }
                 copied += length;
@@ -434,7 +444,7 @@ impl Mount {
             return Err(Error::BadClusterChain);
         }
         let mut data = [0u8; BYTES_PER_SECTOR];
-        if !(self.reader)(sector, &mut data) {
+        if !self.read_sector(sector, &mut data) {
             return Err(Error::Io);
         }
         let value = le_u32(&data, (fat_offset as usize) % BYTES_PER_SECTOR) & 0x0fff_ffff;
@@ -450,14 +460,42 @@ impl Mount {
     fn cluster_sector(self, cluster: u32) -> u64 {
         self.first_data_sector + (cluster as u64 - 2) * self.sectors_per_cluster as u64
     }
+
+    fn read_sector(self, lba: u64, output: &mut [u8; BYTES_PER_SECTOR]) -> bool {
+        self.base_lba
+            .checked_add(lba)
+            .is_some_and(|absolute| (self.reader)(absolute, output))
+    }
+
+    fn write_sector(self, lba: u64, input: &[u8; BYTES_PER_SECTOR]) -> bool {
+        self.writer
+            .and_then(|writer| {
+                self.base_lba
+                    .checked_add(lba)
+                    .map(|absolute| writer(absolute, input))
+            })
+            .unwrap_or(false)
+    }
 }
 
-pub fn probe_ramdisk() -> Result<Mount, Error> {
-    Mount::open(ramdisk_read_sector)
+pub fn probe_block() -> Result<Mount, Error> {
+    let partition = block::partition(0).ok_or(Error::InvalidBpb)?;
+    Mount::open_at(
+        ramdisk_read_sector,
+        None,
+        partition.start_lba,
+        partition.sectors,
+    )
 }
 
 pub fn probe_block_rw() -> Result<Mount, Error> {
-    Mount::open_rw(ramdisk_read_sector, ramdisk_write_sector)
+    let partition = block::partition(0).ok_or(Error::InvalidBpb)?;
+    Mount::open_at(
+        ramdisk_read_sector,
+        Some(ramdisk_write_sector),
+        partition.start_lba,
+        partition.sectors,
+    )
 }
 
 pub const PERSISTENCE_FILE: &str = "/NORX.PST";
@@ -518,6 +556,8 @@ static mut FIXTURE_DATA: [u8; BYTES_PER_SECTOR] = [0; BYTES_PER_SECTOR];
 static mut FIXTURE_DIRECTORY_VALID: bool = false;
 static mut FIXTURE_DATA_VALID: bool = false;
 
+const FIXTURE_PARTITION_BASE: u64 = 100;
+
 fn fixture_check() -> bool {
     unsafe {
         FIXTURE_DIRECTORY_VALID = false;
@@ -556,6 +596,24 @@ fn fixture_check() -> bool {
         return false;
     };
     if length != 13 || &updated[..length] != b"FAT32 update\n" {
+        return false;
+    }
+    let Ok(partitioned) = Mount::open_at(
+        fixture_partition_read_sector,
+        Some(fixture_partition_write_sector),
+        FIXTURE_PARTITION_BASE,
+        131_072,
+    ) else {
+        return false;
+    };
+    if partitioned.geometry().read_only {
+        return false;
+    }
+    let mut partitioned_output = [0u8; 32];
+    if partitioned
+        .read_file("/Long Name.txt", &mut partitioned_output)
+        .is_err()
+    {
         return false;
     }
     let too_large = [0u8; BYTES_PER_SECTOR + 1];
@@ -620,6 +678,16 @@ fn fixture_write_sector(lba: u64, input: &[u8; BYTES_PER_SECTOR]) -> bool {
         },
         _ => false,
     }
+}
+
+fn fixture_partition_read_sector(lba: u64, output: &mut [u8; BYTES_PER_SECTOR]) -> bool {
+    lba.checked_sub(FIXTURE_PARTITION_BASE)
+        .is_some_and(|relative| fixture_read_sector(relative, output))
+}
+
+fn fixture_partition_write_sector(lba: u64, input: &[u8; BYTES_PER_SECTOR]) -> bool {
+    lba.checked_sub(FIXTURE_PARTITION_BASE)
+        .is_some_and(|relative| fixture_write_sector(relative, input))
 }
 
 fn fixture_directory(output: &mut [u8; BYTES_PER_SECTOR]) {

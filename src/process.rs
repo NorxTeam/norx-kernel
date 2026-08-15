@@ -107,6 +107,13 @@ pub struct ContextSwitch {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpawnTransaction {
+    pub parent: ProcessId,
+    pub child: ProcessId,
+    pub thread: ThreadId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Credentials {
     pub real_uid: u32,
     pub effective_uid: u32,
@@ -591,7 +598,8 @@ impl ProcessTable {
             self.process(process)?.fds[old_slot].ok_or(Error::InvalidFd)?;
             return Ok(new_fd);
         }
-        let entry = self.process(process)?.fds[old_slot].ok_or(Error::InvalidFd)?;
+        let mut entry = self.process(process)?.fds[old_slot].ok_or(Error::InvalidFd)?;
+        entry.close_on_exec = false;
         duplicate_open_file(entry.open_file)?;
         let replaced = {
             let record = self.process_mut(process)?;
@@ -752,6 +760,27 @@ impl ProcessTable {
             return Err(Error::InvalidId);
         }
         self.process_mut(process)?.pgid = pgid;
+        Ok(())
+    }
+
+    pub fn set_process_group_for_child(
+        &mut self,
+        parent: ProcessId,
+        child: ProcessId,
+        pgid: ProcessId,
+    ) -> Result<(), Error> {
+        let parent_record = *self.process(parent)?;
+        let child_record = *self.process(child)?;
+        if parent_record.state != ProcessState::Running
+            || child_record.parent != Some(parent)
+            || child_record.state != ProcessState::Creating
+        {
+            return Err(Error::InvalidState);
+        }
+        if pgid.get() == 0 || (pgid != child && pgid != parent_record.pgid) {
+            return Err(Error::PermissionDenied);
+        }
+        self.process_mut(child)?.pgid = pgid;
         Ok(())
     }
 
@@ -1274,13 +1303,16 @@ pub fn spawn_child_current(credentials: Credentials) -> Result<(ProcessId, Threa
     })
 }
 
-pub fn spawn_child_current_staged(
-    credentials: Credentials,
-) -> Result<(ProcessId, ThreadId), Error> {
+pub fn spawn_child_current_staged(credentials: Credentials) -> Result<SpawnTransaction, Error> {
     crate::arch::without_interrupts(|| unsafe {
         let runtime = &mut *RUNTIME.0.get();
         let parent = runtime.current_process.ok_or(Error::InvalidState)?;
-        runtime.table.spawn_child_staged(parent, credentials)
+        let (child, thread) = runtime.table.spawn_child_staged(parent, credentials)?;
+        Ok(SpawnTransaction {
+            parent,
+            child,
+            thread,
+        })
     })
 }
 
@@ -1720,32 +1752,38 @@ pub fn install_user_context(
     }
 }
 
-pub fn inherit_current_standard_fds(child: ProcessId, source_fds: [u32; 3]) -> Result<(), Error> {
+pub fn inherit_spawn_standard_fds(
+    transaction: SpawnTransaction,
+    source_fds: [u32; 3],
+) -> Result<(), Error> {
     crate::arch::without_interrupts(|| unsafe {
         let runtime = &mut *RUNTIME.0.get();
-        let parent = runtime.current_process.ok_or(Error::InvalidState)?;
-        runtime
-            .table
-            .inherit_standard_fds(parent, child, source_fds.map(FileDescriptor::from_raw))
+        runtime.table.inherit_standard_fds(
+            transaction.parent,
+            transaction.child,
+            source_fds.map(FileDescriptor::from_raw),
+        )
     })
 }
 
-pub fn publish_child(child: ProcessId) -> Result<(), Error> {
+pub fn publish_spawn(transaction: SpawnTransaction) -> Result<(), Error> {
     crate::arch::without_interrupts(|| unsafe {
         let runtime = &mut *RUNTIME.0.get();
-        let thread = runtime.table.process_thread(child)?;
-        runtime.table.publish_child(child, thread)
+        runtime
+            .table
+            .publish_child(transaction.child, transaction.thread)
     })
 }
 
-pub fn set_process_group_for_child(process: ProcessId, pgid: ProcessId) -> Result<(), Error> {
+pub fn set_process_group_for_spawn(
+    transaction: SpawnTransaction,
+    pgid: ProcessId,
+) -> Result<(), Error> {
     crate::arch::without_interrupts(|| unsafe {
         let runtime = &mut *RUNTIME.0.get();
-        let caller = runtime.current_process.ok_or(Error::InvalidState)?;
         runtime
             .table
-            .authorize_process_group_change(caller, process, pgid)?;
-        runtime.table.set_process_group(process, pgid)
+            .set_process_group_for_child(transaction.parent, transaction.child, pgid)
     })
 }
 
@@ -1869,6 +1907,7 @@ pub fn contract_self_check() {
     assert_eq!(table.open_fd(child, 7, true, false), Err(Error::InvalidFd));
     let fd = table.open_fd(child, 1, true, false).unwrap();
     assert_eq!(fd.get(), 3);
+    table.set_close_on_exec(child, fd, true).unwrap();
     assert_eq!(
         table.fd_info(child, fd).unwrap(),
         (1, false, false, true, false)
@@ -1878,6 +1917,7 @@ pub fn contract_self_check() {
         .unwrap();
     assert_eq!(duplicate.get(), 4);
     assert_eq!(table.fd_info(child, duplicate).unwrap().0, 1);
+    assert!(!table.fd_info(child, duplicate).unwrap().1);
     table.raise_signal(child, 2).unwrap();
     table.raise_event(child, 3).unwrap();
     assert!(table.signal_pending(child, 2).unwrap());
@@ -1935,8 +1975,20 @@ pub fn contract_self_check() {
             .0,
         1
     );
+    let transaction = SpawnTransaction {
+        parent: child,
+        child: inherited_child,
+        thread: inherited_thread,
+    };
+    assert_eq!(
+        table.set_process_group_for_child(init, transaction.child, transaction.child),
+        Err(Error::InvalidState)
+    );
     table
-        .publish_child(inherited_child, inherited_thread)
+        .set_process_group_for_child(transaction.parent, transaction.child, transaction.child)
+        .unwrap();
+    table
+        .publish_child(transaction.child, transaction.thread)
         .unwrap();
     table.exit(inherited_child, 0).unwrap();
     assert_eq!(

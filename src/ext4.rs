@@ -51,6 +51,7 @@ pub struct FileInfo {
 #[derive(Clone, Copy)]
 pub struct Mount {
     reader: ReadSector,
+    base_lba: u64,
     block_size: u32,
     blocks: u64,
     inodes_per_group: u32,
@@ -70,13 +71,22 @@ struct Inode {
 
 impl Mount {
     pub fn open(reader: ReadSector) -> Result<Self, Error> {
+        Self::open_at(reader, 0, u64::MAX)
+    }
+
+    pub fn open_at(
+        reader: ReadSector,
+        base_lba: u64,
+        available_sectors: u64,
+    ) -> Result<Self, Error> {
         let mut superblock = [0u8; 1024];
         let mut sector = [0u8; SECTOR_SIZE];
-        if !reader(2, &mut sector) {
+        let sector_lba = |relative: u64| base_lba.checked_add(relative);
+        if !sector_lba(2).is_some_and(|lba| reader(lba, &mut sector)) {
             return Err(Error::Io);
         }
         superblock[..SECTOR_SIZE].copy_from_slice(&sector);
-        if !reader(3, &mut sector) {
+        if !sector_lba(3).is_some_and(|lba| reader(lba, &mut sector)) {
             return Err(Error::Io);
         }
         superblock[SECTOR_SIZE..].copy_from_slice(&sector);
@@ -127,8 +137,18 @@ impl Mount {
         if inode_count < 2 {
             return Err(Error::InvalidSuperblock);
         }
+        if blocks
+            .checked_mul(block_size as u64)
+            .is_none_or(|bytes| bytes.div_ceil(SECTOR_SIZE as u64) > available_sectors)
+            || base_lba
+                .checked_add(blocks * block_size as u64 / SECTOR_SIZE as u64)
+                .is_none()
+        {
+            return Err(Error::InvalidSuperblock);
+        }
         Ok(Self {
             reader,
+            base_lba,
             block_size,
             blocks,
             inodes_per_group,
@@ -327,7 +347,7 @@ impl Mount {
             let position = offset.checked_add(copied as u64).ok_or(Error::Io)?;
             let sector_offset = position as usize % SECTOR_SIZE;
             let mut sector = [0u8; SECTOR_SIZE];
-            if !(self.reader)(position / SECTOR_SIZE as u64, &mut sector) {
+            if !self.read_sector(position / SECTOR_SIZE as u64, &mut sector) {
                 return Err(Error::Io);
             }
             let length = (output.len() - copied).min(SECTOR_SIZE - sector_offset);
@@ -337,10 +357,17 @@ impl Mount {
         }
         Ok(())
     }
+
+    fn read_sector(self, lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
+        self.base_lba
+            .checked_add(lba)
+            .is_some_and(|absolute| (self.reader)(absolute, output))
+    }
 }
 
-pub fn probe_ramdisk() -> Result<Mount, Error> {
-    Mount::open(ramdisk_read_sector)
+pub fn probe_block() -> Result<Mount, Error> {
+    let partition = block::partition(0).ok_or(Error::InvalidSuperblock)?;
+    Mount::open_at(ramdisk_read_sector, partition.start_lba, partition.sectors)
 }
 
 pub fn contract_self_check() {
@@ -386,6 +413,16 @@ fn fixture_check() -> bool {
     {
         return false;
     }
+    let Ok(partitioned) = Mount::open_at(fixture_partition_read_sector, 100, 16_384) else {
+        return false;
+    };
+    let mut partitioned_output = [0u8; 32];
+    if partitioned
+        .read_file("/hello.txt", &mut partitioned_output)
+        .is_err()
+    {
+        return false;
+    }
     volume
         .write_file("/hello.txt", b"rejected")
         .is_err_and(|error| error == Error::ReadOnly)
@@ -402,6 +439,11 @@ fn fixture_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
         _ => {}
     }
     true
+}
+
+fn fixture_partition_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
+    lba.checked_sub(100)
+        .is_some_and(|relative| fixture_read_sector(relative, output))
 }
 
 fn fixture_superblock(output: &mut [u8; SECTOR_SIZE]) {

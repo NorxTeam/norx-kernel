@@ -117,6 +117,7 @@ struct RootItem {
 #[derive(Clone, Copy)]
 pub struct Mount {
     reader: ReadSector,
+    base_lba: u64,
     fsid: [u8; 16],
     sectorsize: u32,
     nodesize: u32,
@@ -131,8 +132,16 @@ pub struct Mount {
 
 impl Mount {
     pub fn open(reader: ReadSector) -> Result<Self, Error> {
+        Self::open_at(reader, 0, u64::MAX)
+    }
+
+    pub fn open_at(
+        reader: ReadSector,
+        base_lba: u64,
+        available_sectors: u64,
+    ) -> Result<Self, Error> {
         let mut superblock = [0u8; SUPERBLOCK_SIZE];
-        read_sectors(reader, SUPERBLOCK_OFFSET, &mut superblock)?;
+        read_sectors(reader, base_lba, SUPERBLOCK_OFFSET, &mut superblock)?;
         if &superblock[0x40..0x48] != MAGIC {
             return Err(Error::InvalidSuperblock);
         }
@@ -152,6 +161,10 @@ impl Mount {
             || nodesize != MAX_NODE_SIZE as u32
             || sectorsize > nodesize
             || total_bytes < SUPERBLOCK_OFFSET + SUPERBLOCK_SIZE as u64
+            || total_bytes.div_ceil(SECTOR_SIZE as u64) > available_sectors
+            || base_lba
+                .checked_add(total_bytes.div_ceil(SECTOR_SIZE as u64))
+                .is_none()
             || incompat != 0
         {
             return Err(Error::UnsupportedFeature);
@@ -171,6 +184,7 @@ impl Mount {
         )?;
         let mut mount = Self {
             reader,
+            base_lba,
             fsid: copy_array(&superblock[0x20..0x30]),
             sectorsize,
             nodesize,
@@ -502,7 +516,7 @@ impl Mount {
         }
         for index in 0..output.len() / SECTOR_SIZE {
             let mut sector = [0u8; SECTOR_SIZE];
-            if !(self.reader)(offset / SECTOR_SIZE as u64 + index as u64, &mut sector) {
+            if !self.read_sector(offset / SECTOR_SIZE as u64 + index as u64, &mut sector) {
                 return Err(Error::Io);
             }
             let start = index * SECTOR_SIZE;
@@ -510,14 +524,17 @@ impl Mount {
         }
         Ok(())
     }
+
+    fn read_sector(self, lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
+        self.base_lba
+            .checked_add(lba)
+            .is_some_and(|absolute| (self.reader)(absolute, output))
+    }
 }
 
-pub fn probe_ramdisk() -> Result<Mount, Error> {
-    let geometry = block::geometry();
-    if geometry.sectors * (SECTOR_SIZE as u64) < SUPERBLOCK_OFFSET + SUPERBLOCK_SIZE as u64 {
-        return Err(Error::InvalidSuperblock);
-    }
-    Mount::open(ramdisk_read_sector)
+pub fn probe_block() -> Result<Mount, Error> {
+    let partition = block::partition(0).ok_or(Error::InvalidSuperblock)?;
+    Mount::open_at(ramdisk_read_sector, partition.start_lba, partition.sectors)
 }
 
 pub fn contract_self_check() {
@@ -577,6 +594,16 @@ fn fixture_check() -> bool {
     {
         return false;
     }
+    let Ok(partitioned) = Mount::open_at(fixture_partition_read_sector, 100, 256) else {
+        return false;
+    };
+    let mut partitioned_output = [0u8; 32];
+    if partitioned
+        .read_file("/hello.txt", &mut partitioned_output)
+        .is_err()
+    {
+        return false;
+    }
     if !volume
         .write_file("/hello.txt", b"rejected")
         .is_err_and(|error| error == Error::ReadOnly)
@@ -612,6 +639,11 @@ fn fixture_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
         }
     }
     true
+}
+
+fn fixture_partition_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
+    lba.checked_sub(100)
+        .is_some_and(|relative| fixture_read_sector(relative, output))
 }
 
 fn corrupt_fixture_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
@@ -938,13 +970,21 @@ fn components(path: &str) -> Result<([&str; MAX_COMPONENTS], usize), Error> {
     Ok((result, count))
 }
 
-fn read_sectors(reader: ReadSector, offset: u64, output: &mut [u8]) -> Result<(), Error> {
+fn read_sectors(
+    reader: ReadSector,
+    base_lba: u64,
+    offset: u64,
+    output: &mut [u8],
+) -> Result<(), Error> {
     if !offset.is_multiple_of(SECTOR_SIZE as u64) || !output.len().is_multiple_of(SECTOR_SIZE) {
         return Err(Error::Io);
     }
     for index in 0..output.len() / SECTOR_SIZE {
         let mut sector = [0u8; SECTOR_SIZE];
-        if !reader(offset / SECTOR_SIZE as u64 + index as u64, &mut sector) {
+        let lba = base_lba
+            .checked_add(offset / SECTOR_SIZE as u64 + index as u64)
+            .ok_or(Error::Io)?;
+        if !reader(lba, &mut sector) {
             return Err(Error::Io);
         }
         let start = index * SECTOR_SIZE;
