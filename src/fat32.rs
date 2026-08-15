@@ -5,6 +5,9 @@ const MAX_LFN_CHARS: usize = 260;
 const MAX_COMPONENTS: usize = 16;
 const EOC_MIN: u32 = 0x0fff_fff8;
 const BAD_CLUSTER: u32 = 0x0fff_fff7;
+const FAT_VALUE_MASK: u32 = 0x0fff_ffff;
+const FAT_HIGH_BITS: u32 = 0xf000_0000;
+const MAX_DATA_CLUSTER: u32 = 0x0fff_ffef;
 
 pub type ReadSector = fn(u64, &mut [u8; BYTES_PER_SECTOR]) -> bool;
 pub type WriteSector = fn(u64, &[u8; BYTES_PER_SECTOR]) -> bool;
@@ -20,6 +23,8 @@ pub enum Error {
     BadClusterChain,
     BufferTooSmall,
     NoSpace,
+    FileTooLarge,
+    FatMismatch,
     ReadOnly,
     InvalidPersistenceRecord,
 }
@@ -40,6 +45,7 @@ pub struct Mount {
     writer: Option<WriteSector>,
     base_lba: u64,
     reserved_sectors: u16,
+    fat_count: u8,
     fat_size: u32,
     total_sectors: u64,
     first_data_sector: u64,
@@ -204,6 +210,7 @@ impl Mount {
             .try_into()
             .map_err(|_| Error::InvalidBpb)?;
         if cluster_count < 65_525
+            || cluster_count > MAX_DATA_CLUSTER - 1
             || (cluster_count as u64 + 2) * 4 > fat_size as u64 * BYTES_PER_SECTOR as u64
             || root_cluster > cluster_count + 1
         {
@@ -214,6 +221,7 @@ impl Mount {
             writer,
             base_lba,
             reserved_sectors,
+            fat_count,
             fat_size,
             total_sectors,
             first_data_sector,
@@ -258,6 +266,11 @@ impl Mount {
         let Some(_writer) = self.writer else {
             return Err(Error::ReadOnly);
         };
+        // ponytail: Ceiling: this bounded slice resizes only an existing directory entry;
+        // directory-slot allocation, create, and rename remain out of scope.
+        if input.len() > u32::MAX as usize {
+            return Err(Error::FileTooLarge);
+        }
         let (components, count) = components(path)?;
         let mut directory_cluster = self.root_cluster;
         for component in components.iter().take(count - 1) {
@@ -271,22 +284,115 @@ impl Mount {
         if location.entry.directory {
             return Err(Error::IsDirectory);
         }
-        // ponytail: reuse the existing chain; add allocation/free-list work with file creation.
-        let capacity = self.chain_capacity(location.entry.cluster)?;
-        if input.len() > capacity {
+        let cluster_bytes = self.sectors_per_cluster as usize * BYTES_PER_SECTOR;
+        let required_clusters = input.len() / cluster_bytes
+            + if input.len() % cluster_bytes == 0 {
+                0
+            } else {
+                1
+            };
+        if required_clusters > self.cluster_count as usize {
             return Err(Error::NoSpace);
         }
-        self.write_chain(location.entry.cluster, input)?;
+        let old_start = location.entry.cluster;
+        let (old_count, old_last) = self.chain_length_and_last(old_start)?;
+        if old_start == 0 && location.entry.size != 0 {
+            return Err(Error::BadClusterChain);
+        }
+        if old_start != 0 {
+            let capacity = old_count
+                .checked_mul(cluster_bytes)
+                .ok_or(Error::BadClusterChain)?;
+            if location.entry.size as usize > capacity {
+                return Err(Error::BadClusterChain);
+            }
+        }
+
+        if required_clusters < old_count {
+            if required_clusters == 0 {
+                // Publish an empty file before releasing its old chain. If a later
+                // FAT write fails, the result is a valid file with leaked clusters.
+                self.update_directory_entry(location, 0, 0)?;
+                self.free_chain(old_start)?;
+                return Ok(0);
+            }
+            self.write_chain(old_start, input)?;
+            self.update_directory_entry(location, old_start, input.len() as u32)?;
+            let (keep_last, tail_start) = self.chain_split(old_start, required_clusters)?;
+            self.write_fat_entry(keep_last, EOC_MIN)?;
+            if let Some(tail) = tail_start {
+                self.free_chain(tail)?;
+            }
+            return Ok(input.len());
+        }
+
+        if required_clusters > old_count {
+            let (new_first, _) = self.allocate_chain(required_clusters - old_count)?;
+            if let Some(last) = old_last {
+                if let Err(error) = self.write_fat_entry(last, new_first) {
+                    let _ = self.free_chain(new_first);
+                    return Err(error);
+                }
+            }
+            let new_start = old_last.map_or(new_first, |_| old_start);
+            if let Err(error) = self.write_chain(new_start, input) {
+                self.rollback_extension(old_last, new_first);
+                return Err(error);
+            }
+            if let Err(error) = self.update_directory_entry(location, new_start, input.len() as u32)
+            {
+                self.rollback_extension(old_last, new_first);
+                return Err(error);
+            }
+            return Ok(input.len());
+        }
+
+        if !input.is_empty() {
+            self.write_chain(old_start, input)?;
+        }
+        self.update_directory_entry(location, old_start, input.len() as u32)?;
+        Ok(input.len())
+    }
+
+    fn update_directory_entry(
+        self,
+        location: EntryLocation,
+        cluster: u32,
+        size: u32,
+    ) -> Result<(), Error> {
+        if cluster != 0 && !self.valid_cluster(cluster) {
+            return Err(Error::BadClusterChain);
+        }
+        let Some(_writer) = self.writer else {
+            return Err(Error::ReadOnly);
+        };
+        let Some(end) = location.offset.checked_add(32) else {
+            return Err(Error::Io);
+        };
+        if end > BYTES_PER_SECTOR {
+            return Err(Error::Io);
+        }
         let mut data = [0u8; BYTES_PER_SECTOR];
         if !self.read_sector(location.sector, &mut data) {
             return Err(Error::Io);
         }
-        data[location.offset + 28..location.offset + 32]
-            .copy_from_slice(&(input.len() as u32).to_le_bytes());
+        let low = (cluster as u16).to_le_bytes();
+        let high = ((cluster >> 16) as u16).to_le_bytes();
+        data[location.offset + 20..location.offset + 22].copy_from_slice(&high);
+        data[location.offset + 26..location.offset + 28].copy_from_slice(&low);
+        data[location.offset + 28..location.offset + 32].copy_from_slice(&size.to_le_bytes());
         if !self.write_sector(location.sector, &data) {
             return Err(Error::Io);
         }
-        Ok(input.len())
+        let mut verify = [0u8; BYTES_PER_SECTOR];
+        if !self.read_sector(location.sector, &mut verify)
+            || le_u16(&verify, location.offset + 20) != (cluster >> 16) as u16
+            || le_u16(&verify, location.offset + 26) != cluster as u16
+            || le_u32(&verify, location.offset + 28) != size
+        {
+            return Err(Error::Io);
+        }
+        Ok(())
     }
 
     fn find_entry(self, directory_cluster: u32, target: &str) -> Result<DirectoryEntry, Error> {
@@ -386,23 +492,106 @@ impl Mount {
         Err(Error::BadClusterChain)
     }
 
-    fn chain_capacity(self, start: u32) -> Result<usize, Error> {
+    fn valid_cluster(self, cluster: u32) -> bool {
+        (2..=self.cluster_count + 1).contains(&cluster)
+    }
+
+    fn chain_length_and_last(self, start: u32) -> Result<(usize, Option<u32>), Error> {
+        if start == 0 {
+            return Ok((0, None));
+        }
         let mut cluster = start;
-        let cluster_bytes = self.sectors_per_cluster as usize * BYTES_PER_SECTOR;
-        let mut capacity = 0usize;
-        for _ in 0..self.cluster_count {
-            if cluster < 2 || cluster > self.cluster_count + 1 {
+        for count in 0..self.cluster_count as usize {
+            if !self.valid_cluster(cluster) {
                 return Err(Error::BadClusterChain);
             }
-            capacity = capacity
-                .checked_add(cluster_bytes)
-                .ok_or(Error::BadClusterChain)?;
             let Some(next) = self.next_cluster(cluster)? else {
-                return Ok(capacity);
+                return Ok((count + 1, Some(cluster)));
             };
             cluster = next;
         }
         Err(Error::BadClusterChain)
+    }
+
+    fn chain_split(self, start: u32, keep: usize) -> Result<(u32, Option<u32>), Error> {
+        if keep == 0 || !self.valid_cluster(start) || keep > self.cluster_count as usize {
+            return Err(Error::BadClusterChain);
+        }
+        let mut cluster = start;
+        for index in 1..=keep {
+            if !self.valid_cluster(cluster) {
+                return Err(Error::BadClusterChain);
+            }
+            let next = self.next_cluster(cluster)?;
+            if index == keep {
+                return Ok((cluster, next));
+            }
+            cluster = next.ok_or(Error::BadClusterChain)?;
+        }
+        Err(Error::BadClusterChain)
+    }
+
+    fn free_chain(self, start: u32) -> Result<(), Error> {
+        if start == 0 {
+            return Ok(());
+        }
+        let mut cluster = start;
+        for _ in 0..self.cluster_count {
+            if !self.valid_cluster(cluster) {
+                return Err(Error::BadClusterChain);
+            }
+            let next = self.next_cluster(cluster)?;
+            self.write_fat_entry(cluster, 0)?;
+            let Some(next) = next else {
+                return Ok(());
+            };
+            cluster = next;
+        }
+        Err(Error::BadClusterChain)
+    }
+
+    fn allocate_chain(self, count: usize) -> Result<(u32, u32), Error> {
+        if count == 0 || count > self.cluster_count as usize {
+            return Err(Error::NoSpace);
+        }
+        let mut first = 0;
+        let mut previous = 0;
+        let mut allocated = 0;
+        for offset in 0..self.cluster_count {
+            let cluster = offset + 2;
+            if self.read_fat_entry(cluster)? != 0 {
+                continue;
+            }
+            if let Err(error) = self.write_fat_entry(cluster, EOC_MIN) {
+                if first != 0 {
+                    let _ = self.free_chain(first);
+                }
+                return Err(error);
+            }
+            if first == 0 {
+                first = cluster;
+            } else if let Err(error) = self.write_fat_entry(previous, cluster) {
+                let _ = self.free_chain(first);
+                let _ = self.write_fat_entry(cluster, 0);
+                return Err(error);
+            }
+            previous = cluster;
+            allocated += 1;
+            if allocated == count {
+                return Ok((first, previous));
+            }
+        }
+        if first != 0 {
+            let _ = self.free_chain(first);
+        }
+        Err(Error::NoSpace)
+    }
+
+    fn rollback_extension(self, old_last: Option<u32>, new_first: u32) {
+        if let Some(last) = old_last {
+            let _ = self.write_fat_entry(last, EOC_MIN);
+        }
+        let _ = self.free_chain(new_first);
     }
 
     fn write_chain(self, start: u32, input: &[u8]) -> Result<(), Error> {
@@ -438,23 +627,139 @@ impl Mount {
     }
 
     fn next_cluster(self, cluster: u32) -> Result<Option<u32>, Error> {
-        let fat_offset = cluster as u64 * 4;
-        let sector = self.reserved_sectors as u64 + fat_offset / BYTES_PER_SECTOR as u64;
-        if sector >= self.reserved_sectors as u64 + self.fat_size as u64 {
-            return Err(Error::BadClusterChain);
-        }
-        let mut data = [0u8; BYTES_PER_SECTOR];
-        if !self.read_sector(sector, &mut data) {
-            return Err(Error::Io);
-        }
-        let value = le_u32(&data, (fat_offset as usize) % BYTES_PER_SECTOR) & 0x0fff_ffff;
+        let value = self.read_fat_entry(cluster)?;
         if value >= EOC_MIN {
             return Ok(None);
         }
-        if value == 0 || value == BAD_CLUSTER || value > self.cluster_count + 1 {
+        if value == 0 || value == BAD_CLUSTER || !self.valid_cluster(value) {
             return Err(Error::BadClusterChain);
         }
         Ok(Some(value))
+    }
+
+    fn fat_entry_location(self, fat_index: u8, cluster: u32) -> Result<(u64, usize), Error> {
+        if fat_index >= self.fat_count || !self.valid_cluster(cluster) {
+            return Err(Error::BadClusterChain);
+        }
+        let fat_offset = (cluster as u64)
+            .checked_mul(4)
+            .ok_or(Error::BadClusterChain)?;
+        let sector_offset = fat_offset / BYTES_PER_SECTOR as u64;
+        if sector_offset >= self.fat_size as u64 {
+            return Err(Error::BadClusterChain);
+        }
+        let sector = (self.reserved_sectors as u64)
+            .checked_add(
+                (fat_index as u64)
+                    .checked_mul(self.fat_size as u64)
+                    .ok_or(Error::BadClusterChain)?,
+            )
+            .and_then(|value| value.checked_add(sector_offset))
+            .ok_or(Error::BadClusterChain)?;
+        Ok((sector, (fat_offset % BYTES_PER_SECTOR as u64) as usize))
+    }
+
+    fn read_fat_entry(self, cluster: u32) -> Result<u32, Error> {
+        let mut data = [0u8; BYTES_PER_SECTOR];
+        let (sector, offset) = self.fat_entry_location(0, cluster)?;
+        if !self.read_sector(sector, &mut data) {
+            return Err(Error::Io);
+        }
+        let expected = le_u32(&data, offset) & FAT_VALUE_MASK;
+        for fat_index in 1..self.fat_count {
+            let (sector, offset) = self.fat_entry_location(fat_index, cluster)?;
+            if !self.read_sector(sector, &mut data) {
+                return Err(Error::Io);
+            }
+            if le_u32(&data, offset) & FAT_VALUE_MASK != expected {
+                return Err(Error::FatMismatch);
+            }
+        }
+        Ok(expected)
+    }
+
+    fn write_fat_entry(self, cluster: u32, value: u32) -> Result<(), Error> {
+        let Some(_writer) = self.writer else {
+            return Err(Error::ReadOnly);
+        };
+        if value != 0
+            && value < EOC_MIN
+            && (value == 1 || value == BAD_CLUSTER || !self.valid_cluster(value))
+        {
+            return Err(Error::BadClusterChain);
+        }
+        let mut old_high = [0u32; 256];
+        let mut old_value = None;
+        let mut data = [0u8; BYTES_PER_SECTOR];
+        for fat_index in 0..self.fat_count {
+            let (sector, offset) = self.fat_entry_location(fat_index, cluster)?;
+            if !self.read_sector(sector, &mut data) {
+                return Err(Error::Io);
+            }
+            let raw = le_u32(&data, offset);
+            old_high[fat_index as usize] = raw & FAT_HIGH_BITS;
+            let current = raw & FAT_VALUE_MASK;
+            if let Some(expected) = old_value {
+                if current != expected {
+                    return Err(Error::FatMismatch);
+                }
+            } else {
+                old_value = Some(current);
+            }
+        }
+        let old_value = old_value.ok_or(Error::BadClusterChain)?;
+        if old_value == value {
+            return Ok(());
+        }
+
+        for fat_index in 0..self.fat_count {
+            let (sector, offset) = self.fat_entry_location(fat_index, cluster)?;
+            if !self.read_sector(sector, &mut data) {
+                let _ = self.restore_fat_entry(cluster, old_value, &old_high, fat_index);
+                return Err(Error::Io);
+            }
+            let raw = (le_u32(&data, offset) & FAT_HIGH_BITS) | value;
+            data[offset..offset + 4].copy_from_slice(&raw.to_le_bytes());
+            if !self.write_sector(sector, &data) {
+                let _ = self.restore_fat_entry(cluster, old_value, &old_high, fat_index + 1);
+                return Err(Error::Io);
+            }
+            let mut verify = [0u8; BYTES_PER_SECTOR];
+            if !self.read_sector(sector, &mut verify)
+                || le_u32(&verify, offset) & FAT_VALUE_MASK != value
+            {
+                let _ = self.restore_fat_entry(cluster, old_value, &old_high, fat_index + 1);
+                return Err(Error::Io);
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_fat_entry(
+        self,
+        cluster: u32,
+        value: u32,
+        old_high: &[u32; 256],
+        copies: u8,
+    ) -> bool {
+        let mut success = true;
+        let mut data = [0u8; BYTES_PER_SECTOR];
+        for fat_index in 0..copies.min(self.fat_count) {
+            let Ok((sector, offset)) = self.fat_entry_location(fat_index, cluster) else {
+                success = false;
+                continue;
+            };
+            if !self.read_sector(sector, &mut data) {
+                success = false;
+                continue;
+            }
+            let raw = old_high[fat_index as usize] | value;
+            data[offset..offset + 4].copy_from_slice(&raw.to_le_bytes());
+            if !self.write_sector(sector, &data) {
+                success = false;
+            }
+        }
+        success
     }
 
     fn cluster_sector(self, cluster: u32) -> u64 {
@@ -553,8 +858,14 @@ fn ramdisk_write_sector(lba: u64, input: &[u8; BYTES_PER_SECTOR]) -> bool {
 
 static mut FIXTURE_DIRECTORY: [u8; BYTES_PER_SECTOR] = [0; BYTES_PER_SECTOR];
 static mut FIXTURE_DATA: [u8; BYTES_PER_SECTOR] = [0; BYTES_PER_SECTOR];
+static mut FIXTURE_DATA_TAIL: [u8; BYTES_PER_SECTOR] = [0; BYTES_PER_SECTOR];
+static mut FIXTURE_FAT_PRIMARY: [u8; BYTES_PER_SECTOR] = [0; BYTES_PER_SECTOR];
+static mut FIXTURE_FAT_SECONDARY: [u8; BYTES_PER_SECTOR] = [0; BYTES_PER_SECTOR];
 static mut FIXTURE_DIRECTORY_VALID: bool = false;
 static mut FIXTURE_DATA_VALID: bool = false;
+static mut FIXTURE_DATA_TAIL_VALID: bool = false;
+static mut FIXTURE_FAT_PRIMARY_VALID: bool = false;
+static mut FIXTURE_FAT_SECONDARY_VALID: bool = false;
 
 const FIXTURE_PARTITION_BASE: u64 = 100;
 
@@ -562,6 +873,9 @@ fn fixture_check() -> bool {
     unsafe {
         FIXTURE_DIRECTORY_VALID = false;
         FIXTURE_DATA_VALID = false;
+        FIXTURE_DATA_TAIL_VALID = false;
+        FIXTURE_FAT_PRIMARY_VALID = false;
+        FIXTURE_FAT_SECONDARY_VALID = false;
     }
     let Ok(read_only_volume) = Mount::open(fixture_read_sector) else {
         return false;
@@ -616,10 +930,55 @@ fn fixture_check() -> bool {
     {
         return false;
     }
-    let too_large = [0u8; BYTES_PER_SECTOR + 1];
+    let grown = [0xa5u8; BYTES_PER_SECTOR + 37];
+    if volume.write_file("/Long Name.txt", &grown).is_err() {
+        return false;
+    }
+    let mut grown_output = [0u8; BYTES_PER_SECTOR + 37];
+    let Ok(length) = volume.read_file("/Long Name.txt", &mut grown_output) else {
+        return false;
+    };
+    if length != grown.len() || grown_output != grown {
+        return false;
+    }
+    if fixture_fat_entry(1, 4) != Some(EOC_MIN) || fixture_fat_entry(1025, 4) != Some(EOC_MIN) {
+        return false;
+    }
+
+    if volume.write_file("/Long Name.txt", b"shrunk").is_err() {
+        return false;
+    }
+    let mut shrunk_output = [0u8; 16];
+    let Ok(length) = volume.read_file("/Long Name.txt", &mut shrunk_output) else {
+        return false;
+    };
+    if length != 6 || &shrunk_output[..length] != b"shrunk" {
+        return false;
+    }
+    if fixture_fat_entry(1, 4) != Some(0) || fixture_fat_entry(1025, 4) != Some(0) {
+        return false;
+    }
+
+    if volume.write_file("/Long Name.txt", &[]).is_err() {
+        return false;
+    }
+    let mut empty_output = [0u8; 1];
+    let Ok(length) = volume.read_file("/Long Name.txt", &mut empty_output) else {
+        return false;
+    };
+    if length != 0 || fixture_fat_entry(1, 3) != Some(0) || fixture_fat_entry(1025, 3) != Some(0) {
+        return false;
+    }
+    if volume.write_file("/Long Name.txt", b"again").is_err() {
+        return false;
+    }
+
+    unsafe {
+        write_u32(&mut *core::ptr::addr_of_mut!(FIXTURE_FAT_SECONDARY), 12, 0);
+    }
     volume
-        .write_file("/Long Name.txt", &too_large)
-        .is_err_and(|error| error == Error::NoSpace)
+        .read_file("/Long Name.txt", &mut output)
+        .is_err_and(|error| error == Error::FatMismatch)
 }
 
 fn fixture_read_sector(lba: u64, output: &mut [u8; BYTES_PER_SECTOR]) -> bool {
@@ -629,7 +988,7 @@ fn fixture_read_sector(lba: u64, output: &mut [u8; BYTES_PER_SECTOR]) -> bool {
             output[11..13].copy_from_slice(&512u16.to_le_bytes());
             output[13] = 1;
             output[14..16].copy_from_slice(&1u16.to_le_bytes());
-            output[16] = 1;
+            output[16] = 2;
             output[17..19].copy_from_slice(&0u16.to_le_bytes());
             output[19..21].copy_from_slice(&0u16.to_le_bytes());
             output[21] = 0xf8;
@@ -639,24 +998,37 @@ fn fixture_read_sector(lba: u64, output: &mut [u8; BYTES_PER_SECTOR]) -> bool {
             output[44..48].copy_from_slice(&2u32.to_le_bytes());
             output[510..512].copy_from_slice(&[0x55, 0xaa]);
         }
-        1 => {
-            write_u32(output, 8, 0x0fff_fff8);
-            write_u32(output, 12, 0x0fff_ffff);
-            write_u32(output, 16, 0x0fff_ffff);
-            write_u32(output, 20, 0x0fff_ffff);
-        }
+        1 => unsafe {
+            if FIXTURE_FAT_PRIMARY_VALID {
+                output.copy_from_slice(&*core::ptr::addr_of!(FIXTURE_FAT_PRIMARY));
+            } else {
+                fixture_fat(output);
+            }
+        },
         1025 => unsafe {
+            if FIXTURE_FAT_SECONDARY_VALID {
+                output.copy_from_slice(&*core::ptr::addr_of!(FIXTURE_FAT_SECONDARY));
+            } else {
+                fixture_fat(output);
+            }
+        },
+        2049 => unsafe {
             if FIXTURE_DIRECTORY_VALID {
                 output.copy_from_slice(&*core::ptr::addr_of!(FIXTURE_DIRECTORY));
             } else {
                 fixture_directory(output);
             }
         },
-        1026 => unsafe {
+        2050 => unsafe {
             if FIXTURE_DATA_VALID {
                 output.copy_from_slice(&*core::ptr::addr_of!(FIXTURE_DATA));
             } else {
                 output[..14].copy_from_slice(b"FAT32 fixture\n");
+            }
+        },
+        2051 => unsafe {
+            if FIXTURE_DATA_TAIL_VALID {
+                output.copy_from_slice(&*core::ptr::addr_of!(FIXTURE_DATA_TAIL));
             }
         },
         _ => {}
@@ -666,14 +1038,29 @@ fn fixture_read_sector(lba: u64, output: &mut [u8; BYTES_PER_SECTOR]) -> bool {
 
 fn fixture_write_sector(lba: u64, input: &[u8; BYTES_PER_SECTOR]) -> bool {
     match lba {
+        1 => unsafe {
+            (&mut *core::ptr::addr_of_mut!(FIXTURE_FAT_PRIMARY)).copy_from_slice(input);
+            FIXTURE_FAT_PRIMARY_VALID = true;
+            true
+        },
         1025 => unsafe {
+            (&mut *core::ptr::addr_of_mut!(FIXTURE_FAT_SECONDARY)).copy_from_slice(input);
+            FIXTURE_FAT_SECONDARY_VALID = true;
+            true
+        },
+        2049 => unsafe {
             (&mut *core::ptr::addr_of_mut!(FIXTURE_DIRECTORY)).copy_from_slice(input);
             FIXTURE_DIRECTORY_VALID = true;
             true
         },
-        1026 => unsafe {
+        2050 => unsafe {
             (&mut *core::ptr::addr_of_mut!(FIXTURE_DATA)).copy_from_slice(input);
             FIXTURE_DATA_VALID = true;
+            true
+        },
+        2051 => unsafe {
+            (&mut *core::ptr::addr_of_mut!(FIXTURE_DATA_TAIL)).copy_from_slice(input);
+            FIXTURE_DATA_TAIL_VALID = true;
             true
         },
         _ => false,
@@ -688,6 +1075,19 @@ fn fixture_partition_read_sector(lba: u64, output: &mut [u8; BYTES_PER_SECTOR]) 
 fn fixture_partition_write_sector(lba: u64, input: &[u8; BYTES_PER_SECTOR]) -> bool {
     lba.checked_sub(FIXTURE_PARTITION_BASE)
         .is_some_and(|relative| fixture_write_sector(relative, input))
+}
+
+fn fixture_fat(output: &mut [u8; BYTES_PER_SECTOR]) {
+    write_u32(output, 8, EOC_MIN);
+    write_u32(output, 12, EOC_MIN);
+}
+
+fn fixture_fat_entry(lba: u64, cluster: u32) -> Option<u32> {
+    let mut data = [0u8; BYTES_PER_SECTOR];
+    fixture_read_sector(lba, &mut data).then(|| {
+        let offset = cluster as usize * 4;
+        le_u32(&data, offset) & FAT_VALUE_MASK
+    })
 }
 
 fn fixture_directory(output: &mut [u8; BYTES_PER_SECTOR]) {
