@@ -392,6 +392,9 @@ impl Mount {
             }
             .or_else(|| encode_short_name(raw, &mut name))
             .ok_or(Error::BadDirectory)?;
+            if (name_len == 1 && name[0] == b'.') || (name_len == 2 && name[..2] == *b"..") {
+                return Ok(false);
+            }
             output[count] = DirectoryEntry {
                 name,
                 name_len: name_len as u16,

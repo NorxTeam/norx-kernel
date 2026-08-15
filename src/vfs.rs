@@ -12,6 +12,7 @@ const MAX_COMPONENTS: usize = 16;
 const MAX_PATH: usize = 256;
 const NAME_MAX: usize = 31;
 const FILE_MAX: usize = 4096;
+const MAX_PERSISTENT_ENTRIES: usize = 16;
 const HELLO_TEXT: &[u8] = b"Welcome to Norx VFS\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,11 +225,55 @@ impl PersistentBackendKind {
     }
 
     pub const fn supports_stat(self) -> bool {
-        !matches!(self, Self::Fat32)
+        true
     }
 
     pub const fn read_only(self) -> bool {
         true
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PersistentPath {
+    bytes: [u8; MAX_PATH],
+    length: u16,
+}
+
+impl PersistentPath {
+    const ROOT: Self = {
+        let mut bytes = [0; MAX_PATH];
+        bytes[0] = b'/';
+        Self { bytes, length: 1 }
+    };
+
+    fn as_str(&self) -> Result<&str, Error> {
+        // The bytes are copied only from `&str` path components, so this conversion
+        // is a bounded reconstruction of already-valid UTF-8.
+        let bytes = &self.bytes[..self.length as usize];
+        core::str::from_utf8(bytes).map_err(|_| Error::InvalidPath)
+    }
+
+    fn push(&mut self, component: Name) -> Result<(), Error> {
+        if component.is_special() {
+            return Err(Error::InvalidPath);
+        }
+        let length = self.length as usize;
+        let component_length = component.len as usize;
+        let separator_length = usize::from(length != 1);
+        let end = length
+            .checked_add(separator_length)
+            .and_then(|value| value.checked_add(component_length))
+            .ok_or(Error::InvalidPath)?;
+        if end > MAX_PATH {
+            return Err(Error::InvalidPath);
+        }
+        if separator_length != 0 {
+            self.bytes[length] = b'/';
+        }
+        self.bytes[length + separator_length..end]
+            .copy_from_slice(&component.bytes[..component_length]);
+        self.length = end as u16;
+        Ok(())
     }
 }
 
@@ -290,6 +335,9 @@ pub struct MountInfo {
 pub struct Dentry {
     pub mount: MountId,
     pub inode: u16,
+    persistent: bool,
+    path: [u8; MAX_PATH],
+    path_length: u16,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -422,6 +470,9 @@ struct HandleSlot {
     used: bool,
     mount: MountId,
     inode: u16,
+    persistent: bool,
+    path: [u8; MAX_PATH],
+    path_length: u16,
     generation: u16,
     references: u16,
     offset: usize,
@@ -435,6 +486,9 @@ impl HandleSlot {
         used: false,
         mount: MountId::ROOT,
         inode: 0,
+        persistent: false,
+        path: [0; MAX_PATH],
+        path_length: 0,
         generation: 0,
         references: 0,
         offset: 0,
@@ -449,6 +503,25 @@ pub struct PersistentFileInfo {
     pub kind: NodeType,
     pub mode: u32,
     pub size: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PersistentDirectoryEntry {
+    kind: NodeType,
+    mode: u32,
+    size: u64,
+    name: [u8; NAME_MAX],
+    name_length: usize,
+}
+
+impl PersistentDirectoryEntry {
+    const EMPTY: Self = Self {
+        kind: NodeType::Regular,
+        mode: 0,
+        size: 0,
+        name: [0; NAME_MAX],
+        name_length: 0,
+    };
 }
 
 #[derive(Clone, Copy)]
@@ -491,7 +564,18 @@ impl PersistentBackend {
 
     fn stat(self, path: &str) -> Result<PersistentFileInfo, Error> {
         match self {
-            Self::Fat32(_) => Err(Error::BackendUnsupported),
+            Self::Fat32(mount) => {
+                let info = mount.stat(path).map_err(map_fat32_error)?;
+                Ok(PersistentFileInfo {
+                    kind: if info.directory {
+                        NodeType::Directory
+                    } else {
+                        NodeType::Regular
+                    },
+                    mode: if info.directory { 0o755 } else { 0o644 },
+                    size: info.size,
+                })
+            }
             Self::Ext4(mount) => {
                 let info = mount.stat(path).map_err(map_ext4_error)?;
                 Ok(PersistentFileInfo {
@@ -515,6 +599,80 @@ impl PersistentBackend {
                     mode: info.mode,
                     size: info.size,
                 })
+            }
+        }
+    }
+
+    fn read_dir(self, path: &str, output: &mut [PersistentDirectoryEntry]) -> Result<usize, Error> {
+        if output.len() > MAX_PERSISTENT_ENTRIES {
+            return Err(Error::NoSpace);
+        }
+        match self {
+            Self::Fat32(mount) => {
+                let mut entries = [fat32::DirectoryEntry::EMPTY; MAX_PERSISTENT_ENTRIES];
+                let count = mount
+                    .read_dir(path, &mut entries[..output.len()])
+                    .map_err(map_fat32_error)?;
+                for (destination, source) in output.iter_mut().zip(entries.iter()).take(count) {
+                    let name_length = usize::from(source.name_len);
+                    if name_length > NAME_MAX {
+                        return Err(Error::NameTooLong);
+                    }
+                    destination.kind = if source.directory {
+                        NodeType::Directory
+                    } else {
+                        NodeType::Regular
+                    };
+                    destination.mode = if source.directory { 0o755 } else { 0o644 };
+                    destination.size = source.size;
+                    destination.name[..name_length].copy_from_slice(&source.name[..name_length]);
+                    destination.name_length = name_length;
+                }
+                Ok(count)
+            }
+            Self::Ext4(mount) => {
+                let mut entries = [ext4::DirectoryEntry::EMPTY; MAX_PERSISTENT_ENTRIES];
+                let count = mount
+                    .read_dir(path, &mut entries[..output.len()])
+                    .map_err(map_ext4_error)?;
+                for (destination, source) in output.iter_mut().zip(entries.iter()).take(count) {
+                    if source.name_length > NAME_MAX {
+                        return Err(Error::NameTooLong);
+                    }
+                    destination.kind = if source.directory {
+                        NodeType::Directory
+                    } else {
+                        NodeType::Regular
+                    };
+                    destination.mode = source.mode as u32;
+                    destination.size = source.size;
+                    destination.name[..source.name_length]
+                        .copy_from_slice(&source.name[..source.name_length]);
+                    destination.name_length = source.name_length;
+                }
+                Ok(count)
+            }
+            Self::Btrfs(mount) => {
+                let mut entries = [btrfs::DirectoryEntry::EMPTY; MAX_PERSISTENT_ENTRIES];
+                let count = mount
+                    .read_dir(path, &mut entries[..output.len()])
+                    .map_err(map_btrfs_error)?;
+                for (destination, source) in output.iter_mut().zip(entries.iter()).take(count) {
+                    if source.name_length > NAME_MAX {
+                        return Err(Error::NameTooLong);
+                    }
+                    destination.kind = if source.directory {
+                        NodeType::Directory
+                    } else {
+                        NodeType::Regular
+                    };
+                    destination.mode = source.mode as u32;
+                    destination.size = source.size;
+                    destination.name[..source.name_length]
+                        .copy_from_slice(&source.name[..source.name_length]);
+                    destination.name_length = source.name_length;
+                }
+                Ok(count)
             }
         }
     }
@@ -554,6 +712,11 @@ impl PersistentMount {
     pub fn stat(self, path: &str) -> Result<PersistentFileInfo, Error> {
         validate_persistent_path(path)?;
         self.backend.stat(path)
+    }
+
+    fn read_dir(self, path: &str, output: &mut [PersistentDirectoryEntry]) -> Result<usize, Error> {
+        validate_persistent_path(path)?;
+        self.backend.read_dir(path, output)
     }
 
     pub fn write_file(self, _path: &str, _input: &[u8]) -> Result<usize, Error> {
@@ -646,6 +809,9 @@ impl DentrySlot {
         dentry: Dentry {
             mount: MountId::ROOT,
             inode: 0,
+            persistent: false,
+            path: [0; MAX_PATH],
+            path_length: 0,
         },
         generation: 0,
     };
@@ -719,7 +885,7 @@ pub fn contract_self_check() {
         Some(PersistentBackendKind::Btrfs)
     );
     assert_eq!(PersistentBackendKind::Ext4.source(), MountSource::Ext4);
-    assert!(!PersistentBackendKind::Fat32.supports_stat());
+    assert!(PersistentBackendKind::Fat32.supports_stat());
     assert!(PersistentBackendKind::Ext4.supports_stat());
     assert!(PersistentBackendKind::Btrfs.supports_stat());
     assert!(validate_persistent_path("/bounded/path").is_ok());
@@ -728,6 +894,13 @@ pub fn contract_self_check() {
     assert!(PersistentBackendKind::Fat32.read_only());
     assert!(PersistentBackendKind::Ext4.read_only());
     assert!(PersistentBackendKind::Btrfs.read_only());
+    let mut persistent_path = PersistentPath::ROOT;
+    assert_eq!(persistent_path.as_str(), Ok("/"));
+    let mut component = Name::EMPTY;
+    component.bytes[..4].copy_from_slice(b"file");
+    component.len = 4;
+    persistent_path.push(component).unwrap();
+    assert_eq!(persistent_path.as_str(), Ok("/file"));
 }
 
 pub fn init() -> bool {
@@ -833,8 +1006,8 @@ pub fn mount(source: MountSource, target: &str, flags: MountFlags) -> Result<Mou
 
 /// Mount a persistent reader and return its backend-scoped read-only handle.
 ///
-/// The existing namespace file resolver remains RAMFS-only; callers use the returned
-/// handle for direct reader operations until namespace path/handle dispatch is added.
+/// The mount is exposed through the bounded namespace resolver without copying
+/// persistent file contents into the RAMFS inode table.
 pub fn mount_persistent(source: MountSource, target: &str) -> Result<PersistentMount, Error> {
     if !source.is_persistent() {
         return Err(Error::InvalidMountTarget);
@@ -1044,7 +1217,15 @@ pub fn lookup(path: &str) -> Result<DentryHandle, Error> {
 
 pub fn lookup_in_namespace(namespace: NamespaceId, path: &str) -> Result<DentryHandle, Error> {
     with_fs(|fs| {
-        let (mount, inode) = resolve_mount(fs, path, namespace)?;
+        let (mount, inode, persistent_path) =
+            if let Some((mount, persistent_path)) = locate_persistent_path(fs, path, namespace)? {
+                let path_str = persistent_path.as_str()?;
+                let _ = persistent_backend(mount)?.stat(path_str)?;
+                (mount, 0, Some(persistent_path))
+            } else {
+                let (mount, inode) = resolve_mount(fs, path, namespace)?;
+                (mount, inode, None)
+            };
         let dentries = unsafe { &mut *core::ptr::addr_of_mut!(DENTRIES) };
         let Some((slot, entry)) = dentries
             .iter_mut()
@@ -1054,7 +1235,17 @@ pub fn lookup_in_namespace(namespace: NamespaceId, path: &str) -> Result<DentryH
             return Err(Error::NoSpace);
         };
         entry.used = true;
-        entry.dentry = Dentry { mount, inode };
+        let (persistent, path, path_length) = match persistent_path {
+            Some(path) => (true, path.bytes, path.length),
+            None => (false, [0; MAX_PATH], 0),
+        };
+        entry.dentry = Dentry {
+            mount,
+            inode,
+            persistent,
+            path,
+            path_length,
+        };
         entry.generation = entry.generation.wrapping_add(1);
         if entry.generation == 0 {
             entry.generation = 1;
@@ -1101,6 +1292,51 @@ pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
     with_fs(|fs| {
         if options.truncate && !options.write {
             return Err(Error::PermissionDenied);
+        }
+        if let Some((mount, persistent_path)) = locate_persistent_path(fs, path, NamespaceId::ROOT)?
+        {
+            if options.write
+                || options.create
+                || options.truncate
+                || options.append
+                || !options.read
+            {
+                return Err(Error::ReadOnly);
+            }
+            let path_str = persistent_path.as_str()?;
+            let info = persistent_backend(mount)?.stat(path_str)?;
+            if info.kind == NodeType::Directory {
+                return Err(Error::IsDirectory);
+            }
+            if info.mode & 0o444 == 0 {
+                return Err(Error::PermissionDenied);
+            }
+            let slot = fs
+                .handles
+                .iter()
+                .position(|handle| !handle.used)
+                .ok_or(Error::NoSpace)?;
+            let handle = &mut fs.handles[slot];
+            handle.used = true;
+            handle.mount = mount;
+            handle.inode = 0;
+            handle.persistent = true;
+            handle.path = persistent_path.bytes;
+            handle.path_length = persistent_path.length;
+            handle.generation = (handle.generation.wrapping_add(1)) & 0x7fff;
+            if handle.generation == 0 {
+                handle.generation = 1;
+            }
+            handle.references = 1;
+            handle.offset = 0;
+            handle.readable = true;
+            handle.writable = false;
+            handle.append = false;
+            fs.open_count += 1;
+            return Ok(FileHandle {
+                slot: slot as u8,
+                generation: handle.generation,
+            });
         }
         let mut reserved_slot = None;
         let existed = resolve_mount(fs, path, NamespaceId::ROOT).is_ok();
@@ -1150,6 +1386,9 @@ pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
         handle.used = true;
         handle.mount = mount;
         handle.inode = inode;
+        handle.persistent = false;
+        handle.path = [0; MAX_PATH];
+        handle.path_length = 0;
         handle.generation = (handle.generation.wrapping_add(1)) & 0x7fff;
         if handle.generation == 0 {
             handle.generation = 1;
@@ -1186,8 +1425,25 @@ pub fn close(handle: FileHandle) -> Result<(), Error> {
 
 pub fn sync_path(path: &str) -> Result<(), Error> {
     with_fs(|fs| {
+        if let Some((mount, persistent_path)) = locate_persistent_path(fs, path, NamespaceId::ROOT)?
+        {
+            let path_str = persistent_path.as_str()?;
+            let _ = persistent_backend(mount)?.stat(path_str)?;
+            return crate::drivers::block::flush_cache().map_err(map_block_error);
+        }
         let _ = resolve_mount(fs, path, NamespaceId::ROOT)?;
-        Ok(())
+        Err(Error::BackendUnsupported)
+    })
+}
+
+pub fn sync_handle(handle: FileHandle) -> Result<(), Error> {
+    with_fs(|fs| {
+        let slot = validate_handle(fs, &handle)?;
+        if !fs.handles[slot].persistent {
+            return Err(Error::BackendUnsupported);
+        }
+        let _ = persistent_backend(fs.handles[slot].mount)?;
+        crate::drivers::block::flush_cache().map_err(map_block_error)
     })
 }
 
@@ -1207,6 +1463,32 @@ pub fn read_handle(handle: FileHandle, output: &mut [u8]) -> Result<usize, Error
         let slot = validate_handle(fs, &handle)?;
         if !fs.handles[slot].readable {
             return Err(Error::PermissionDenied);
+        }
+        if fs.handles[slot].persistent {
+            let description = fs.handles[slot];
+            let path = PersistentPath {
+                bytes: description.path,
+                length: description.path_length,
+            };
+            let path_str = path.as_str()?;
+            let backend = persistent_backend(description.mount)?;
+            let info = backend.stat(path_str)?;
+            if info.kind == NodeType::Directory {
+                return Err(Error::IsDirectory);
+            }
+            if output.is_empty() {
+                return Ok(0);
+            }
+            let mut data = [0u8; FILE_MAX];
+            let length = backend.read_file(path_str, &mut data)?;
+            let available = length.saturating_sub(description.offset);
+            let read_length = available.min(output.len());
+            if read_length != 0 {
+                output[..read_length]
+                    .copy_from_slice(&data[description.offset..description.offset + read_length]);
+            }
+            fs.handles[slot].offset = description.offset + read_length;
+            return Ok(read_length);
         }
         let inode_id = fs.handles[slot].inode;
         let offset = fs.handles[slot].offset;
@@ -1260,11 +1542,30 @@ pub fn seek(handle: FileHandle, offset: isize) -> Result<usize, Error> {
 pub fn seek_from(handle: FileHandle, offset: i64, whence: u32) -> Result<usize, Error> {
     with_fs(|fs| {
         let slot = validate_handle(fs, &handle)?;
-        let base = match whence {
-            0 => 0,
-            1 => fs.handles[slot].offset,
-            2 => fs.inodes[fs.handles[slot].inode as usize].size,
-            _ => return Err(Error::InvalidPath),
+        let persistent = fs.handles[slot].persistent;
+        let base = if persistent {
+            let description = fs.handles[slot];
+            let path = PersistentPath {
+                bytes: description.path,
+                length: description.path_length,
+            };
+            let info = persistent_backend(description.mount)?.stat(path.as_str()?)?;
+            if info.kind == NodeType::Directory {
+                return Err(Error::IsDirectory);
+            }
+            match whence {
+                0 => 0,
+                1 => description.offset,
+                2 => usize::try_from(info.size).map_err(|_| Error::OffsetOutOfRange)?,
+                _ => return Err(Error::InvalidPath),
+            }
+        } else {
+            match whence {
+                0 => 0,
+                1 => fs.handles[slot].offset,
+                2 => fs.inodes[fs.handles[slot].inode as usize].size,
+                _ => return Err(Error::InvalidPath),
+            }
         };
         let next = if offset.is_negative() {
             let distance =
@@ -1307,6 +1608,21 @@ pub fn write_raw(raw: u32, input: &[u8]) -> Result<usize, Error> {
 pub fn stat_handle(handle: FileHandle) -> Result<FileStat, Error> {
     with_fs(|fs| {
         let slot = validate_handle(fs, &handle)?;
+        if fs.handles[slot].persistent {
+            let description = fs.handles[slot];
+            let path = PersistentPath {
+                bytes: description.path,
+                length: description.path_length,
+            };
+            let info = persistent_backend(description.mount)?.stat(path.as_str()?)?;
+            return Ok(FileStat {
+                inode: persistent_inode(path.as_str()?),
+                kind: info.kind,
+                mode: info.mode as u16,
+                size: usize::try_from(info.size).map_err(|_| Error::OffsetOutOfRange)?,
+                links: 1,
+            });
+        }
         let inode = fs.handles[slot].inode;
         let node = fs.inodes[inode as usize];
         Ok(FileStat {
@@ -1321,6 +1637,9 @@ pub fn stat_handle(handle: FileHandle) -> Result<FileStat, Error> {
 
 pub fn chmod(path: &str, mode: u16) -> Result<(), Error> {
     with_fs(|fs| {
+        if locate_persistent_path(fs, path, NamespaceId::ROOT)?.is_some() {
+            return Err(Error::ReadOnly);
+        }
         let (mount, inode) = resolve_mount(fs, path, NamespaceId::ROOT)?;
         if mount_flags(mount)?.read_only {
             return Err(Error::ReadOnly);
@@ -1348,6 +1667,9 @@ pub fn mkdir(path: &str) -> Result<(), Error> {
 
 pub fn mkdir_with_mode(path: &str, mode: u16) -> Result<(), Error> {
     with_fs(|fs| {
+        if locate_persistent_path(fs, path, NamespaceId::ROOT)?.is_some() {
+            return Err(Error::ReadOnly);
+        }
         let (mount, parent, name) = parent_and_name_mount(fs, path, NamespaceId::ROOT)?;
         if mount_flags(mount)?.read_only {
             return Err(Error::ReadOnly);
@@ -1358,6 +1680,9 @@ pub fn mkdir_with_mode(path: &str, mode: u16) -> Result<(), Error> {
 
 pub fn unlink(path: &str) -> Result<(), Error> {
     with_fs(|fs| {
+        if locate_persistent_path(fs, path, NamespaceId::ROOT)?.is_some() {
+            return Err(Error::ReadOnly);
+        }
         let (mount, parent, name) = parent_and_name_mount(fs, path, NamespaceId::ROOT)?;
         if mount_flags(mount)?.read_only {
             return Err(Error::ReadOnly);
@@ -1382,6 +1707,9 @@ pub fn unlink(path: &str) -> Result<(), Error> {
 
 pub fn remove_dir(path: &str) -> Result<(), Error> {
     with_fs(|fs| {
+        if locate_persistent_path(fs, path, NamespaceId::ROOT)?.is_some() {
+            return Err(Error::ReadOnly);
+        }
         let (mount, parent, name) = parent_and_name_mount(fs, path, NamespaceId::ROOT)?;
         if mount_flags(mount)?.read_only {
             return Err(Error::ReadOnly);
@@ -1405,6 +1733,11 @@ pub fn remove_dir(path: &str) -> Result<(), Error> {
 
 pub fn rename(old_path: &str, new_path: &str) -> Result<(), Error> {
     with_fs(|fs| {
+        if locate_persistent_path(fs, old_path, NamespaceId::ROOT)?.is_some()
+            || locate_persistent_path(fs, new_path, NamespaceId::ROOT)?.is_some()
+        {
+            return Err(Error::ReadOnly);
+        }
         let (old_mount, old_parent, old_name) =
             parent_and_name_mount(fs, old_path, NamespaceId::ROOT)?;
         let inode = find_child(fs, old_parent, old_name).ok_or(Error::NotFound)?;
@@ -1490,6 +1823,11 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), Error> {
 
 pub fn link(old_path: &str, new_path: &str) -> Result<(), Error> {
     with_fs(|fs| {
+        if locate_persistent_path(fs, old_path, NamespaceId::ROOT)?.is_some()
+            || locate_persistent_path(fs, new_path, NamespaceId::ROOT)?.is_some()
+        {
+            return Err(Error::ReadOnly);
+        }
         let (old_mount, old_inode) = resolve_mount(fs, old_path, NamespaceId::ROOT)?;
         if fs.inodes[old_inode as usize].kind == NodeType::Directory {
             return Err(Error::IsDirectory);
@@ -1511,6 +1849,18 @@ pub fn link(old_path: &str, new_path: &str) -> Result<(), Error> {
 
 pub fn stat(path: &str) -> Result<FileStat, Error> {
     with_fs(|fs| {
+        if let Some((mount, persistent_path)) = locate_persistent_path(fs, path, NamespaceId::ROOT)?
+        {
+            let path_str = persistent_path.as_str()?;
+            let info = persistent_backend(mount)?.stat(path_str)?;
+            return Ok(FileStat {
+                inode: persistent_inode(path_str),
+                kind: info.kind,
+                mode: info.mode as u16,
+                size: usize::try_from(info.size).map_err(|_| Error::OffsetOutOfRange)?,
+                links: 1,
+            });
+        }
         let (_mount, inode) = resolve_mount(fs, path, NamespaceId::ROOT)?;
         let node = fs.inodes[inode as usize];
         Ok(FileStat {
@@ -1525,6 +1875,42 @@ pub fn stat(path: &str) -> Result<FileStat, Error> {
 
 pub fn read_dir(path: &str, output: &mut [DirectoryEntry]) -> Result<usize, Error> {
     with_fs(|fs| {
+        if let Some((mount, persistent_path)) = locate_persistent_path(fs, path, NamespaceId::ROOT)?
+        {
+            if output.len() > MAX_PERSISTENT_ENTRIES {
+                return Err(Error::NoSpace);
+            }
+            let path_str = persistent_path.as_str()?;
+            let backend = persistent_backend(mount)?;
+            let info = backend.stat(path_str)?;
+            if info.kind != NodeType::Directory {
+                return Err(Error::NotDirectory);
+            }
+            let capacity = output.len().saturating_add(2).min(MAX_PERSISTENT_ENTRIES);
+            let mut entries = [PersistentDirectoryEntry::EMPTY; MAX_PERSISTENT_ENTRIES];
+            let backend_count = backend.read_dir(path_str, &mut entries[..capacity])?;
+            let mut count = 0;
+            for entry in entries.iter().take(backend_count) {
+                if entry.name_length == 1 && entry.name[0] == b'.'
+                    || entry.name_length == 2 && entry.name[0] == b'.' && entry.name[1] == b'.'
+                {
+                    continue;
+                }
+                if count == output.len() {
+                    break;
+                }
+                output[count] = DirectoryEntry {
+                    kind: entry.kind,
+                    mode: entry.mode as u16,
+                    size: usize::try_from(entry.size).map_err(|_| Error::OffsetOutOfRange)?,
+                    links: 1,
+                    name: entry.name,
+                    name_length: entry.name_length,
+                };
+                count += 1;
+            }
+            return Ok(count);
+        }
         let (_mount, inode) = resolve_mount(fs, path, NamespaceId::ROOT)?;
         if fs.inodes[inode as usize].kind != NodeType::Directory {
             return Err(Error::NotDirectory);
@@ -1916,6 +2302,29 @@ fn validate_persistent_path(path: &str) -> Result<(), Error> {
     Ok(())
 }
 
+fn persistent_inode(path: &str) -> u32 {
+    let mut hash = 2_166_136_261u32;
+    for byte in path.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    hash
+}
+
+fn map_block_error(error: crate::drivers::block::Error) -> Error {
+    match error {
+        crate::drivers::block::Error::ReadOnly => Error::ReadOnly,
+        crate::drivers::block::Error::NotReady
+        | crate::drivers::block::Error::InvalidRequest
+        | crate::drivers::block::Error::OutOfRange
+        | crate::drivers::block::Error::Busy
+        | crate::drivers::block::Error::Unsupported => Error::BackendUnsupported,
+        crate::drivers::block::Error::Timeout => Error::BackendError,
+        #[cfg(target_arch = "x86_64")]
+        crate::drivers::block::Error::Device => Error::BackendError,
+    }
+}
+
 fn map_fat32_error(error: crate::fat32::Error) -> Error {
     match error {
         crate::fat32::Error::InvalidPath => Error::InvalidPath,
@@ -2021,6 +2430,47 @@ fn resolve_mount(
         walk_component(fs, namespace, &mut mount, &mut inode, *component)?;
     }
     Ok((mount, inode))
+}
+
+fn locate_persistent_path(
+    fs: &FileSystem,
+    path: &str,
+    namespace: NamespaceId,
+) -> Result<Option<(MountId, PersistentPath)>, Error> {
+    let (components, count) = parse_path(path)?;
+    let mut mount = namespace_root(namespace)?;
+    let mut inode = 0;
+    for (index, component) in components.iter().take(count).enumerate() {
+        if component.is_special() {
+            walk_component(fs, namespace, &mut mount, &mut inode, *component)?;
+            continue;
+        }
+        if fs.inodes[inode as usize].kind != NodeType::Directory {
+            return Err(Error::NotDirectory);
+        }
+        let Some(next_inode) = find_child(fs, inode, *component) else {
+            // A path that never reaches a persistent mount belongs to the
+            // ordinary resolver, which may still create its final component.
+            return Ok(None);
+        };
+        inode = next_inode;
+        if let Some(child_mount) = find_mount_child(namespace, mount, inode) {
+            let child = mount_node(child_mount)?;
+            if child.backend.persistent().is_some() {
+                if components.iter().take(count).any(|part| part.is_special()) {
+                    return Err(Error::InvalidPath);
+                }
+                let mut relative = PersistentPath::ROOT;
+                for part in components.iter().skip(index + 1).take(count - index - 1) {
+                    relative.push(*part)?;
+                }
+                return Ok(Some((child_mount, relative)));
+            }
+            mount = child_mount;
+            inode = child.root_inode;
+        }
+    }
+    Ok(None)
 }
 
 fn parent_and_name_mount(
@@ -2200,7 +2650,7 @@ fn remove_child(fs: &mut FileSystem, parent: u16, name: Name) -> Result<u16, Err
 fn has_open_handle(fs: &FileSystem, inode: u16) -> bool {
     fs.handles
         .iter()
-        .any(|handle| handle.used && handle.inode == inode)
+        .any(|handle| handle.used && !handle.persistent && handle.inode == inode)
 }
 
 fn validate_handle(fs: &FileSystem, handle: &FileHandle) -> Result<usize, Error> {
@@ -2210,7 +2660,7 @@ fn validate_handle(fs: &FileSystem, handle: &FileHandle) -> Result<usize, Error>
     }
     let description = fs.handles[slot];
     if description.generation != handle.generation
-        || !fs.inodes[description.inode as usize].used
+        || (!description.persistent && !fs.inodes[description.inode as usize].used)
         || mount_node(description.mount).is_err()
     {
         return Err(Error::InvalidHandle);

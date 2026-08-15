@@ -1245,10 +1245,10 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Ok(info) => info,
                 Err(errno) => return errno.return_value(),
             };
-            if !writable {
-                return Errno::Ebadf.return_value();
-            }
             let Some(handle) = crate::vfs::FileHandle::from_raw(open_file) else {
+                if !writable {
+                    return Errno::Ebadf.return_value();
+                }
                 return Errno::Enotsup.return_value();
             };
             match crate::vfs::sync_handle(handle) {

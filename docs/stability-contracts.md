@@ -43,11 +43,17 @@ QEMU smoke, not that the subsystem is production-ready.
 | Warm reboot and panic context | `crash` owns the four-record ring and checksum validation; EFI variables or x86 CMOS are backing stores; serial is fallback. | Corrupt records are ignored; failed durable writes are reported and panic context remains serial-only; panic always halts. | 64-byte record format, states `BOOTING/READY/PANIC/CHECKPOINT`, four-slot sequence ordering, and the separate bounded FAT32 `/NORX.PST` smoke record. | OVMF/UEFI variable persistence across QEMU process restart; x86 CMOS fallback; x86 virtio-blk/FAT32 two-boot smoke for the file path. | RAM disk persistence, cross-firmware variable migration, arbitrary persistent namespaces, and guaranteed persistence after power loss are not promised. |
 
 The current storage increment adds bounded FAT32 allocation/free-chain updates for
-existing files, mirrored-FAT consistency checks, and an explicit read-only
-`PersistentMount` reader boundary. Persistent namespace path/handle dispatch,
-directory creation/deletion/rename, journaling, and ext4/btrfs writes remain
-deferred; the existing RAMFS and fixed-file persistence smoke are still the
-only published VFS/runtime paths.
+existing files, mirrored-FAT consistency checks, metadata enumeration for all
+three persistent readers, and an explicit read-only `PersistentMount` reader
+boundary. Mounted persistent paths now dispatch through VFS for lookup,
+read-only open/read/lseek/stat/fstat/read_dir, and block-backed fsync/flush;
+contents are not imported into RAMFS. Directory creation/deletion/rename,
+journaling, writes for ext4/btrfs, partial I/O for files larger than the bounded
+`FILE_MAX`, and SMP-grade concurrent spawn execution remain deferred.
+
+The table's deferred persistent-storage item refers to process-attached mount
+namespaces and the write-capable POSIX filesystem surface; the read-only mounted
+path/handle dispatch and block flush boundary described above are published.
 
 ## Cross-cutting release rules
 

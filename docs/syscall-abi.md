@@ -84,6 +84,12 @@ handles; pipes and serial descriptors reject filesystem-only operations.
 `fcntl` currently exposes only `F_GETFD` and `F_SETFD` with the bounded
 `FD_CLOEXEC` flag; unsupported commands or flags return `-EINVAL`.
 
+When a read-only persistent mount is present, `open`, `read`, `lseek`, `stat`,
+`fstat`, `read_dir`, and `fsync` dispatch to the bounded filesystem reader and
+block flush boundary; persistent mutations return read-only errors. `spawn2`
+accepts `NORX_SPAWN_INHERIT_OPEN_FDS`/`SPAWN_INHERIT_OPEN_FDS` for bounded
+inheritance of the parent's open descriptor table while preserving `FD_CLOEXEC`.
+
 `Timespec` is explicitly two signed 64-bit fields; user pointers and words are
 64-bit at this stage. `RestartPolicy` is metadata for the blocking boundary.
 The ABI and runtime self-checks verify table size, argument width, error
