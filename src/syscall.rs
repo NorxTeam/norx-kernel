@@ -56,6 +56,7 @@ pub enum Number {
     Seek = 429,
     Fstat = 430,
     Fchmod = 431,
+    Fcntl = 432,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,7 +73,7 @@ pub struct Metadata {
     pub restart: RestartPolicy,
 }
 
-pub const TABLE: [Metadata; 37] = [
+pub const TABLE: [Metadata; 38] = [
     Metadata {
         number: Number::Read,
         name: "read",
@@ -295,6 +296,12 @@ pub const TABLE: [Metadata; 37] = [
         arguments: 2,
         restart: RestartPolicy::Never,
     },
+    Metadata {
+        number: Number::Fcntl,
+        name: "fcntl",
+        arguments: 3,
+        restart: RestartPolicy::Never,
+    },
 ];
 
 #[repr(C)]
@@ -471,6 +478,9 @@ pub const OPEN_TRUNCATE: UserWord = 1 << 3;
 pub const OPEN_APPEND: UserWord = 1 << 4;
 pub const OPEN_EXCLUSIVE: UserWord = 1 << 5;
 pub const PIPE_NONBLOCK: UserWord = 1 << 0;
+pub const F_GETFD: UserWord = 1;
+pub const F_SETFD: UserWord = 2;
+pub const FD_CLOEXEC: UserWord = 1 << 0;
 pub const SPAWN_NEW_PROCESS_GROUP: UserWord = 1 << 0;
 pub const SPAWN_FOREGROUND: UserWord = 1 << 1;
 pub const WAIT_NONBLOCK: UserWord = 1 << 0;
@@ -1321,6 +1331,39 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Err(error) => vfs_errno(error).return_value(),
             }
         }
+        value if value == Number::Fcntl as UserWord => {
+            let fd = match u32::try_from(args.values[0]) {
+                Ok(fd) => fd,
+                Err(_) => return Errno::Ebadf.return_value(),
+            };
+            let command = args.values[1];
+            match command {
+                F_GETFD => match crate::process::current_fd_info(fd) {
+                    Ok((_, close_on_exec, _, _, _)) => {
+                        if close_on_exec {
+                            FD_CLOEXEC
+                        } else {
+                            0
+                        }
+                    }
+                    Err(_) => Errno::Ebadf.return_value(),
+                },
+                F_SETFD => {
+                    let flags = args.values[2];
+                    if flags & !FD_CLOEXEC != 0 {
+                        return Errno::Einval.return_value();
+                    }
+                    match crate::process::set_close_on_exec_current(fd, flags & FD_CLOEXEC != 0) {
+                        Ok(()) => 0,
+                        Err(
+                            crate::process::Error::InvalidFd | crate::process::Error::InvalidId,
+                        ) => Errno::Ebadf.return_value(),
+                        Err(_) => Errno::Einval.return_value(),
+                    }
+                }
+                _ => Errno::Einval.return_value(),
+            }
+        }
         value if value == Number::Pipe as UserWord => {
             let address = args.values[0];
             if args.values[1] & !PIPE_NONBLOCK != 0 {
@@ -1737,10 +1780,13 @@ pub fn contract_self_check() {
     assert!(!is_error(EXIT_TO_KERNEL));
     assert!(!is_error(SWITCH_TO_USER));
     assert_ne!(EXIT_TO_KERNEL, SWITCH_TO_USER);
-    assert_eq!(TABLE.len(), 37);
+    assert_eq!(TABLE.len(), 38);
     assert!(TABLE.iter().all(|entry| entry.arguments <= MAX_ARGS as u8));
     assert_eq!(TABLE[0].number as UserWord, Number::Read as UserWord);
     assert!(TABLE.iter().all(|entry| !entry.name.is_empty()));
+    assert_eq!(Number::Fcntl as UserWord, 432);
+    assert_eq!(TABLE[37].number as UserWord, Number::Fcntl as UserWord);
+    assert_eq!(TABLE[37].arguments, 3);
     assert!(TABLE
         .iter()
         .any(|entry| entry.restart == RestartPolicy::Restartable));
@@ -1773,6 +1819,9 @@ pub fn contract_self_check() {
     assert_eq!(SPAWN_NEW_PROCESS_GROUP | SPAWN_FOREGROUND, 3);
     assert_eq!(SPAWN_INHERIT_CREDENTIALS, 4);
     assert_eq!(WAIT_NONBLOCK, 1);
+    assert_eq!(F_GETFD, 1);
+    assert_eq!(F_SETFD, 2);
+    assert_eq!(FD_CLOEXEC, 1);
     let _pointer: UserPointer = 0;
     let _errno_values = [
         Errno::Eperm,
@@ -1839,6 +1888,51 @@ pub fn runtime_contract_self_check() {
             },
         ),
         4
+    );
+    assert_eq!(
+        dispatch(
+            Number::Fcntl as UserWord,
+            Args {
+                values: [source_fd as UserWord, F_GETFD, 0, 0, 0, 0],
+            },
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            Number::Fcntl as UserWord,
+            Args {
+                values: [source_fd as UserWord, F_SETFD, FD_CLOEXEC, 0, 0, 0],
+            },
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            Number::Fcntl as UserWord,
+            Args {
+                values: [source_fd as UserWord, F_GETFD, 0, 0, 0, 0],
+            },
+        ),
+        FD_CLOEXEC
+    );
+    assert_eq!(
+        dispatch(
+            Number::Fcntl as UserWord,
+            Args {
+                values: [source_fd as UserWord, F_SETFD, FD_CLOEXEC | 2, 0, 0, 0],
+            },
+        ),
+        Errno::Einval.return_value()
+    );
+    assert_eq!(
+        dispatch(
+            Number::Fcntl as UserWord,
+            Args {
+                values: [4, F_GETFD, 0, 0, 0, 0],
+            },
+        ),
+        0
     );
     assert_eq!(crate::process::close_current(source_fd), Ok(()));
     assert_eq!(crate::process::close_current(4), Ok(()));

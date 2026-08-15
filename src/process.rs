@@ -1622,6 +1622,16 @@ pub fn current_fd_info(fd: u32) -> Result<(u32, bool, bool, bool, bool), Error> 
     })
 }
 
+pub fn set_close_on_exec_current(fd: u32, enabled: bool) -> Result<(), Error> {
+    crate::arch::without_interrupts(|| unsafe {
+        let runtime = &mut *RUNTIME.0.get();
+        let process = runtime.current_process.ok_or(Error::InvalidState)?;
+        runtime
+            .table
+            .set_close_on_exec(process, FileDescriptor::from_raw(fd), enabled)
+    })
+}
+
 pub fn duplicate_fd_current(old_fd: u32, new_fd: u32) -> Result<u32, Error> {
     crate::arch::without_interrupts(|| unsafe {
         let runtime = &mut *RUNTIME.0.get();
@@ -1910,7 +1920,7 @@ pub fn contract_self_check() {
     table.set_close_on_exec(child, fd, true).unwrap();
     assert_eq!(
         table.fd_info(child, fd).unwrap(),
-        (1, false, false, true, false)
+        (1, true, false, true, false)
     );
     let duplicate = table
         .duplicate_fd(child, fd, FileDescriptor::from_raw(4))

@@ -54,6 +54,7 @@ are frozen so kernel, Rust, and C implementations cannot drift:
 | `lseek` | 429 | fd, signed offset, `SEEK_SET`/`SEEK_CUR`/`SEEK_END` |
 | `fstat` | 430 | fd, `Stat*` |
 | `fchmod` | 431 | fd, mode |
+| `fcntl` | 432 | fd, `F_GETFD`/`F_SETFD`, descriptor flags |
 
 `PipeFds` is two 64-bit words. `WaitStatus` is four C-layout words: a kind
 (`exited`, `signaled`, `stopped`, or `continued`), signed exit code, signal,
@@ -80,6 +81,8 @@ and directories, fixed-size metadata, hard links, and bounded directory
 records. Symlink nodes, locale state, and host I/O are not part of this ABI.
 `lseek`, `fstat`, and `fchmod` operate on VFS-backed regular-file and directory
 handles; pipes and serial descriptors reject filesystem-only operations.
+`fcntl` currently exposes only `F_GETFD` and `F_SETFD` with the bounded
+`FD_CLOEXEC` flag; unsupported commands or flags return `-EINVAL`.
 
 `Timespec` is explicitly two signed 64-bit fields; user pointers and words are
 64-bit at this stage. `RestartPolicy` is metadata for the blocking boundary.

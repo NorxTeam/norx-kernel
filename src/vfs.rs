@@ -1,5 +1,7 @@
 use core::ptr;
 
+use crate::{btrfs, ext4, fat32};
+
 const MAX_INODES: usize = 32;
 const MAX_CHILDREN: usize = 16;
 const MAX_OPEN_HANDLES: usize = 32;
@@ -34,6 +36,8 @@ pub enum Error {
     NamespaceNotFound,
     InvalidMountTarget,
     PropagationDenied,
+    BackendError,
+    BackendUnsupported,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +187,49 @@ impl NamespaceId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MountSource {
     Ramfs,
+    Fat32,
+    Ext4,
+    Btrfs,
+}
+
+impl MountSource {
+    pub const fn persistent_kind(self) -> Option<PersistentBackendKind> {
+        match self {
+            Self::Ramfs => None,
+            Self::Fat32 => Some(PersistentBackendKind::Fat32),
+            Self::Ext4 => Some(PersistentBackendKind::Ext4),
+            Self::Btrfs => Some(PersistentBackendKind::Btrfs),
+        }
+    }
+
+    pub const fn is_persistent(self) -> bool {
+        self.persistent_kind().is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersistentBackendKind {
+    Fat32,
+    Ext4,
+    Btrfs,
+}
+
+impl PersistentBackendKind {
+    pub const fn source(self) -> MountSource {
+        match self {
+            Self::Fat32 => MountSource::Fat32,
+            Self::Ext4 => MountSource::Ext4,
+            Self::Btrfs => MountSource::Btrfs,
+        }
+    }
+
+    pub const fn supports_stat(self) -> bool {
+        !matches!(self, Self::Fat32)
+    }
+
+    pub const fn read_only(self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,6 +444,138 @@ impl HandleSlot {
     };
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PersistentFileInfo {
+    pub kind: NodeType,
+    pub mode: u32,
+    pub size: u64,
+}
+
+#[derive(Clone, Copy)]
+enum PersistentBackend {
+    Fat32(fat32::Mount),
+    Ext4(ext4::Mount),
+    Btrfs(btrfs::Mount),
+}
+
+impl PersistentBackend {
+    fn probe(source: PersistentBackendKind) -> Result<Self, Error> {
+        match source {
+            PersistentBackendKind::Fat32 => fat32::probe_block()
+                .map(Self::Fat32)
+                .map_err(map_fat32_error),
+            PersistentBackendKind::Ext4 => {
+                ext4::probe_block().map(Self::Ext4).map_err(map_ext4_error)
+            }
+            PersistentBackendKind::Btrfs => btrfs::probe_block()
+                .map(Self::Btrfs)
+                .map_err(map_btrfs_error),
+        }
+    }
+
+    const fn kind(self) -> PersistentBackendKind {
+        match self {
+            Self::Fat32(_) => PersistentBackendKind::Fat32,
+            Self::Ext4(_) => PersistentBackendKind::Ext4,
+            Self::Btrfs(_) => PersistentBackendKind::Btrfs,
+        }
+    }
+
+    fn read_file(self, path: &str, output: &mut [u8]) -> Result<usize, Error> {
+        match self {
+            Self::Fat32(mount) => mount.read_file(path, output).map_err(map_fat32_error),
+            Self::Ext4(mount) => mount.read_file(path, output).map_err(map_ext4_error),
+            Self::Btrfs(mount) => mount.read_file(path, output).map_err(map_btrfs_error),
+        }
+    }
+
+    fn stat(self, path: &str) -> Result<PersistentFileInfo, Error> {
+        match self {
+            Self::Fat32(_) => Err(Error::BackendUnsupported),
+            Self::Ext4(mount) => {
+                let info = mount.stat(path).map_err(map_ext4_error)?;
+                Ok(PersistentFileInfo {
+                    kind: if info.directory {
+                        NodeType::Directory
+                    } else {
+                        NodeType::Regular
+                    },
+                    mode: info.mode as u32,
+                    size: info.size,
+                })
+            }
+            Self::Btrfs(mount) => {
+                let info = mount.stat(path).map_err(map_btrfs_error)?;
+                Ok(PersistentFileInfo {
+                    kind: if info.directory {
+                        NodeType::Directory
+                    } else {
+                        NodeType::Regular
+                    },
+                    mode: info.mode,
+                    size: info.size,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct PersistentMount {
+    backend: PersistentBackend,
+}
+
+impl PersistentMount {
+    /// Open a bounded first partition through an existing filesystem reader.
+    /// No persistent inode or file contents are copied into the RAMFS tables.
+    fn open(source: PersistentBackendKind) -> Result<Self, Error> {
+        Ok(Self {
+            backend: PersistentBackend::probe(source)?,
+        })
+    }
+
+    pub const fn kind(self) -> PersistentBackendKind {
+        self.backend.kind()
+    }
+
+    pub const fn source(self) -> MountSource {
+        self.kind().source()
+    }
+
+    pub const fn read_only(self) -> bool {
+        true
+    }
+
+    pub fn read_file(self, path: &str, output: &mut [u8]) -> Result<usize, Error> {
+        validate_persistent_path(path)?;
+        self.backend.read_file(path, output)
+    }
+
+    pub fn stat(self, path: &str) -> Result<PersistentFileInfo, Error> {
+        validate_persistent_path(path)?;
+        self.backend.stat(path)
+    }
+
+    pub fn write_file(self, _path: &str, _input: &[u8]) -> Result<usize, Error> {
+        Err(Error::ReadOnly)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MountedBackend {
+    Ramfs,
+    Persistent(PersistentMount),
+}
+
+impl MountedBackend {
+    const fn persistent(self) -> Option<PersistentMount> {
+        match self {
+            Self::Ramfs => None,
+            Self::Persistent(backend) => Some(backend),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct MountNode {
     used: bool,
@@ -408,6 +587,7 @@ struct MountNode {
     flags: MountFlags,
     propagation: Propagation,
     dentry_references: usize,
+    backend: MountedBackend,
 }
 
 impl MountNode {
@@ -421,6 +601,7 @@ impl MountNode {
         flags: MountFlags::defaults(),
         propagation: Propagation::Private,
         dentry_references: 0,
+        backend: MountedBackend::Ramfs,
     };
 
     const fn root(namespace: NamespaceId) -> Self {
@@ -434,6 +615,7 @@ impl MountNode {
             flags: MountFlags::defaults(),
             propagation: Propagation::Private,
             dentry_references: 0,
+            backend: MountedBackend::Ramfs,
         }
     }
 }
@@ -523,6 +705,29 @@ pub fn contract_self_check() {
     assert_eq!(count, 3);
     assert!(parse_path("relative").is_err());
     assert!(parse_path("/a\0/b").is_err());
+    assert!(!MountSource::Ramfs.is_persistent());
+    assert_eq!(
+        MountSource::Fat32.persistent_kind(),
+        Some(PersistentBackendKind::Fat32)
+    );
+    assert_eq!(
+        MountSource::Ext4.persistent_kind(),
+        Some(PersistentBackendKind::Ext4)
+    );
+    assert_eq!(
+        MountSource::Btrfs.persistent_kind(),
+        Some(PersistentBackendKind::Btrfs)
+    );
+    assert_eq!(PersistentBackendKind::Ext4.source(), MountSource::Ext4);
+    assert!(!PersistentBackendKind::Fat32.supports_stat());
+    assert!(PersistentBackendKind::Ext4.supports_stat());
+    assert!(PersistentBackendKind::Btrfs.supports_stat());
+    assert!(validate_persistent_path("/bounded/path").is_ok());
+    assert!(validate_persistent_path("relative").is_err());
+    assert_eq!(validate_persistent_path("/a/../b"), Err(Error::InvalidPath));
+    assert!(PersistentBackendKind::Fat32.read_only());
+    assert!(PersistentBackendKind::Ext4.read_only());
+    assert!(PersistentBackendKind::Btrfs.read_only());
 }
 
 pub fn init() -> bool {
@@ -626,6 +831,24 @@ pub fn mount(source: MountSource, target: &str, flags: MountFlags) -> Result<Mou
     )
 }
 
+/// Mount a persistent reader and return its backend-scoped read-only handle.
+///
+/// The existing namespace file resolver remains RAMFS-only; callers use the returned
+/// handle for direct reader operations until namespace path/handle dispatch is added.
+pub fn mount_persistent(source: MountSource, target: &str) -> Result<PersistentMount, Error> {
+    if !source.is_persistent() {
+        return Err(Error::InvalidMountTarget);
+    }
+    let id = mount(source, target, MountFlags::read_only())?;
+    match persistent_backend(id) {
+        Ok(backend) => Ok(backend),
+        Err(error) => {
+            let _ = unmount_mount(id);
+            Err(error)
+        }
+    }
+}
+
 pub fn mount_with_propagation(
     namespace: NamespaceId,
     source: MountSource,
@@ -644,8 +867,8 @@ pub fn mount_in_namespace(
     propagation: Propagation,
 ) -> Result<MountId, Error> {
     with_fs(|fs| {
-        if source != MountSource::Ramfs {
-            return Err(Error::InvalidMountTarget);
+        if source.is_persistent() && !flags.read_only {
+            return Err(Error::ReadOnly);
         }
         let (parent, parent_inode, name) = match parent_and_name_mount(fs, target, namespace) {
             Err(Error::InvalidPath) if target == "/" => return Err(Error::InvalidMountTarget),
@@ -669,6 +892,12 @@ pub fn mount_in_namespace(
         let Some((index, node)) = mounts.iter_mut().enumerate().find(|(_, node)| !node.used) else {
             return Err(Error::NoSpace);
         };
+        let backend = match source {
+            MountSource::Ramfs => MountedBackend::Ramfs,
+            _ => MountedBackend::Persistent(PersistentMount::open(
+                source.persistent_kind().ok_or(Error::InvalidMountTarget)?,
+            )?),
+        };
         *node = MountNode {
             used: true,
             namespace,
@@ -679,6 +908,7 @@ pub fn mount_in_namespace(
             flags,
             propagation,
             dentry_references: 0,
+            backend,
         };
         Ok(MountId(index as u8))
     })
@@ -1667,6 +1897,80 @@ fn with_fs<R>(f: impl FnOnce(&mut FileSystem) -> Result<R, Error>) -> Result<R, 
     }
 }
 
+fn persistent_backend(id: MountId) -> Result<PersistentMount, Error> {
+    mount_node(id)?
+        .backend
+        .persistent()
+        .ok_or(Error::BackendUnsupported)
+}
+
+fn validate_persistent_path(path: &str) -> Result<(), Error> {
+    let (components, count) = parse_path(path)?;
+    if components
+        .iter()
+        .take(count)
+        .any(|component| component.is_special())
+    {
+        return Err(Error::InvalidPath);
+    }
+    Ok(())
+}
+
+fn map_fat32_error(error: crate::fat32::Error) -> Error {
+    match error {
+        crate::fat32::Error::InvalidPath => Error::InvalidPath,
+        crate::fat32::Error::NotFound => Error::NotFound,
+        crate::fat32::Error::NotDirectory => Error::NotDirectory,
+        crate::fat32::Error::IsDirectory => Error::IsDirectory,
+        crate::fat32::Error::BufferTooSmall => Error::BackendError,
+        crate::fat32::Error::ReadOnly => Error::ReadOnly,
+        crate::fat32::Error::Io
+        | crate::fat32::Error::InvalidBpb
+        | crate::fat32::Error::BadClusterChain
+        | crate::fat32::Error::InvalidPersistenceRecord => Error::BackendError,
+        crate::fat32::Error::NoSpace => Error::NoSpace,
+        _ => Error::BackendError,
+    }
+}
+
+fn map_ext4_error(error: crate::ext4::Error) -> Error {
+    match error {
+        crate::ext4::Error::InvalidPath => Error::InvalidPath,
+        crate::ext4::Error::NotFound => Error::NotFound,
+        crate::ext4::Error::NotDirectory => Error::NotDirectory,
+        crate::ext4::Error::IsDirectory => Error::IsDirectory,
+        crate::ext4::Error::BufferTooSmall => Error::BackendError,
+        crate::ext4::Error::PermissionDenied => Error::PermissionDenied,
+        crate::ext4::Error::ReadOnly => Error::ReadOnly,
+        crate::ext4::Error::UnsupportedFeature => Error::BackendUnsupported,
+        crate::ext4::Error::Io
+        | crate::ext4::Error::InvalidSuperblock
+        | crate::ext4::Error::JournalRecoveryRequired
+        | crate::ext4::Error::BadExtent
+        | crate::ext4::Error::BadDirectory => Error::BackendError,
+    }
+}
+
+fn map_btrfs_error(error: crate::btrfs::Error) -> Error {
+    match error {
+        crate::btrfs::Error::InvalidPath => Error::InvalidPath,
+        crate::btrfs::Error::NotFound => Error::NotFound,
+        crate::btrfs::Error::NotDirectory => Error::NotDirectory,
+        crate::btrfs::Error::IsDirectory => Error::IsDirectory,
+        crate::btrfs::Error::BufferTooSmall => Error::BackendError,
+        crate::btrfs::Error::PermissionDenied => Error::PermissionDenied,
+        crate::btrfs::Error::ReadOnly => Error::ReadOnly,
+        crate::btrfs::Error::UnsupportedChecksum | crate::btrfs::Error::UnsupportedFeature => {
+            Error::BackendUnsupported
+        }
+        crate::btrfs::Error::Io
+        | crate::btrfs::Error::InvalidSuperblock
+        | crate::btrfs::Error::ChecksumMismatch
+        | crate::btrfs::Error::UnmappedLogical
+        | crate::btrfs::Error::TreeCorrupt => Error::BackendError,
+    }
+}
+
 fn mount_node(id: MountId) -> Result<MountNode, Error> {
     unsafe {
         (&*core::ptr::addr_of!(MOUNTS))
@@ -1770,6 +2074,11 @@ fn walk_component(
     }
     *inode = find_child(fs, *inode, component).ok_or(Error::NotFound)?;
     if let Some(child_mount) = find_mount_child(namespace, *mount, *inode) {
+        // Do not reinterpret a persistent mount as RAMFS: dispatch must be added before
+        // generic namespace operations can traverse its paths.
+        if mount_node(child_mount)?.backend.persistent().is_some() {
+            return Err(Error::BackendUnsupported);
+        }
         *mount = child_mount;
         *inode = mount_node(child_mount)?.root_inode;
     }
