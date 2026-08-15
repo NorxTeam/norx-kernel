@@ -4,6 +4,7 @@ const SECTOR_SIZE: usize = 512;
 const MAX_BLOCK_SIZE: usize = 4096;
 const MAX_COMPONENTS: usize = 16;
 const MAX_DIRECTORY_BLOCKS: u64 = 64;
+pub const MAX_NAME_LENGTH: usize = 255;
 const EXT4_MAGIC: u16 = 0xef53;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 const INCOMPAT_FILETYPE: u32 = 0x0002;
@@ -11,6 +12,8 @@ const INCOMPAT_RECOVER: u32 = 0x0004;
 const INCOMPAT_EXTENTS: u32 = 0x0040;
 const INCOMPAT_64BIT: u32 = 0x0080;
 const COMPAT_HAS_JOURNAL: u32 = 0x0004;
+const RO_COMPAT_GDT_CSUM: u32 = 0x0010;
+const RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 
 pub type ReadSector = fn(u64, &mut [u8; SECTOR_SIZE]) -> bool;
 
@@ -46,6 +49,27 @@ pub struct FileInfo {
     pub mode: u16,
     pub size: u64,
     pub directory: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    pub inode: u32,
+    pub mode: u16,
+    pub size: u64,
+    pub directory: bool,
+    pub name: [u8; MAX_NAME_LENGTH],
+    pub name_length: usize,
+}
+
+impl DirectoryEntry {
+    pub const EMPTY: Self = Self {
+        inode: 0,
+        mode: 0,
+        size: 0,
+        directory: false,
+        name: [0; MAX_NAME_LENGTH],
+        name_length: 0,
+    };
 }
 
 #[derive(Clone, Copy)]
@@ -108,7 +132,11 @@ impl Mount {
             value => value,
         };
         let compat = le_u32(&superblock, 0x5c);
+        let ro_compat = le_u32(&superblock, 0x64);
         let incompat = le_u32(&superblock, 0x60);
+        if ro_compat & (RO_COMPAT_GDT_CSUM | RO_COMPAT_METADATA_CSUM) != 0 {
+            return Err(Error::UnsupportedFeature);
+        }
         if blocks <= first_data_block as u64
             || blocks_per_group == 0
             || inodes_per_group == 0
@@ -179,6 +207,34 @@ impl Mount {
         })
     }
 
+    pub fn read_dir(self, path: &str, output: &mut [DirectoryEntry]) -> Result<usize, Error> {
+        let inode_number = self.resolve(path)?;
+        let mut count = 0;
+        self.walk_directory(inode_number, |child, name| {
+            if name == b"." || name == b".." {
+                return Ok(false);
+            }
+            if count == output.len() {
+                return Ok(false);
+            }
+            let inode = self.read_inode(child)?;
+            let name_length = name.len();
+            let mut entry_name = [0u8; MAX_NAME_LENGTH];
+            entry_name[..name_length].copy_from_slice(name);
+            output[count] = DirectoryEntry {
+                inode: child,
+                mode: inode.mode,
+                size: inode.size,
+                directory: is_directory(inode.mode),
+                name: entry_name,
+                name_length,
+            };
+            count += 1;
+            Ok(false)
+        })?;
+        Ok(count)
+    }
+
     pub fn read_file(self, path: &str, output: &mut [u8]) -> Result<usize, Error> {
         let inode = self.read_inode(self.resolve(path)?)?;
         if is_directory(inode.mode) {
@@ -219,6 +275,22 @@ impl Mount {
     }
 
     fn find_in_directory(self, inode_number: u32, target: &str) -> Result<u32, Error> {
+        let mut result = None;
+        self.walk_directory(inode_number, |child, name| {
+            if name == target.as_bytes() {
+                result = Some(child);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })?;
+        result.ok_or(Error::NotFound)
+    }
+
+    fn walk_directory<F>(self, inode_number: u32, mut visitor: F) -> Result<(), Error>
+    where
+        F: FnMut(u32, &[u8]) -> Result<bool, Error>,
+    {
         let inode = self.read_inode(inode_number)?;
         if !is_directory(inode.mode) {
             return Err(Error::NotDirectory);
@@ -231,32 +303,36 @@ impl Mount {
         for logical in 0..block_count as u32 {
             let physical = self.extent_block(&inode, logical)?;
             self.read_block(physical, &mut block)?;
+            let block_start = logical as u64 * self.block_size as u64;
+            let block_length = (inode.size - block_start).min(self.block_size as u64) as usize;
             let mut offset = 0usize;
-            let block_size = self.block_size as usize;
-            while offset < block_size {
-                if offset + 8 > block_size {
+            while offset < block_length {
+                if offset + 8 > block_length {
                     return Err(Error::BadDirectory);
                 }
                 let child = le_u32(&block, offset);
                 let record_length = le_u16(&block, offset + 4) as usize;
                 let name_length = block[offset + 6] as usize;
+                let file_type = block[offset + 7];
                 if record_length < 8
                     || !record_length.is_multiple_of(4)
-                    || offset + record_length > block_size
+                    || offset + record_length > block_length
                     || name_length > record_length - 8
+                    || file_type > 7
+                    || (child != 0 && name_length == 0)
                 {
                     return Err(Error::BadDirectory);
                 }
-                if child != 0
-                    && name_length == target.len()
-                    && &block[offset + 8..offset + 8 + name_length] == target.as_bytes()
-                {
-                    return Ok(child);
+                if child != 0 {
+                    let name = &block[offset + 8..offset + 8 + name_length];
+                    if visitor(child, name)? {
+                        return Ok(());
+                    }
                 }
                 offset += record_length;
             }
         }
-        Err(Error::NotFound)
+        Ok(())
     }
 
     fn read_inode(self, inode_number: u32) -> Result<Inode, Error> {
@@ -407,6 +483,38 @@ fn fixture_check() -> bool {
     if length != 13 || &output[..length] != b"ext4 fixture\n" {
         return false;
     }
+    let mut entries = [DirectoryEntry::EMPTY; 2];
+    let Ok(count) = volume.read_dir("/", &mut entries) else {
+        return false;
+    };
+    if count != 1
+        || entries[0].inode != 3
+        || entries[0].mode & 0o777 != 0o644
+        || entries[0].size != 13
+        || entries[0].directory
+        || entries[0].name_length != 9
+        || &entries[0].name[..entries[0].name_length] != b"hello.txt"
+    {
+        return false;
+    }
+    if volume.read_dir("/", &mut []).is_err()
+        || volume
+            .read_dir("/hello.txt", &mut entries)
+            .is_err_and(|error| error != Error::NotDirectory)
+    {
+        return false;
+    }
+    if !Mount::open(bad_directory_read_sector)
+        .and_then(|volume| volume.read_dir("/", &mut entries).map(|_| volume))
+        .is_err_and(|error| error == Error::BadDirectory)
+    {
+        return false;
+    }
+    if !Mount::open(checksum_feature_read_sector)
+        .is_err_and(|error| error == Error::UnsupportedFeature)
+    {
+        return false;
+    }
     if !volume
         .read_file("/hello.txt", &mut [0u8; 4])
         .is_err_and(|error| error == Error::BufferTooSmall)
@@ -444,6 +552,22 @@ fn fixture_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
 fn fixture_partition_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
     lba.checked_sub(100)
         .is_some_and(|relative| fixture_read_sector(relative, output))
+}
+
+fn bad_directory_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
+    fixture_read_sector(lba, output);
+    if lba == 10 {
+        write_u16(output, 4, 2);
+    }
+    true
+}
+
+fn checksum_feature_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
+    fixture_read_sector(lba, output);
+    if lba == 2 {
+        write_u32(output, 0x64, RO_COMPAT_METADATA_CSUM);
+    }
+    true
 }
 
 fn fixture_superblock(output: &mut [u8; SECTOR_SIZE]) {

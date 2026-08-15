@@ -13,6 +13,7 @@ const MAX_CHUNKS: usize = 16;
 const MAX_PENDING_NODES: usize = 512;
 const MAX_TREE_VISITS: usize = 4096;
 const MAX_COMPONENTS: usize = 16;
+pub const MAX_NAME_LENGTH: usize = 255;
 
 const MAGIC: &[u8; 8] = b"_BHRfS_M";
 const CSUM_CRC32C: u16 = 0;
@@ -75,6 +76,27 @@ pub struct FileInfo {
     pub mode: u32,
     pub size: u64,
     pub directory: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    pub inode: u64,
+    pub mode: u32,
+    pub size: u64,
+    pub directory: bool,
+    pub name: [u8; MAX_NAME_LENGTH],
+    pub name_length: usize,
+}
+
+impl DirectoryEntry {
+    pub const EMPTY: Self = Self {
+        inode: 0,
+        mode: 0,
+        size: 0,
+        directory: false,
+        name: [0; MAX_NAME_LENGTH],
+        name_length: 0,
+    };
 }
 
 #[derive(Clone, Copy)]
@@ -250,6 +272,34 @@ impl Mount {
         })
     }
 
+    pub fn read_dir(self, path: &str, output: &mut [DirectoryEntry]) -> Result<usize, Error> {
+        let (root, parent) = self.resolve(path)?;
+        let mut count = 0;
+        self.walk_directory(root, parent, |child, name| {
+            if name == b"." || name == b".." {
+                return Ok(false);
+            }
+            if count == output.len() {
+                return Ok(false);
+            }
+            let inode = self.find_inode(root, child)?;
+            let name_length = name.len();
+            let mut entry_name = [0u8; MAX_NAME_LENGTH];
+            entry_name[..name_length].copy_from_slice(name);
+            output[count] = DirectoryEntry {
+                inode: child,
+                mode: inode.mode,
+                size: inode.size,
+                directory: inode.mode & 0xf000 == INODE_DIRECTORY,
+                name: entry_name,
+                name_length,
+            };
+            count += 1;
+            Ok(false)
+        })?;
+        Ok(count)
+    }
+
     pub fn read_file(self, path: &str, output: &mut [u8]) -> Result<usize, Error> {
         let (root, inode_number) = self.resolve(path)?;
         let inode = self.find_inode(root, inode_number)?;
@@ -346,10 +396,25 @@ impl Mount {
     }
 
     fn find_dir_entry(self, root: u64, parent: u64, target: &str) -> Result<u64, Error> {
+        let mut result = None;
+        self.walk_directory(root, parent, |child, name| {
+            if name == target.as_bytes() {
+                result = Some(child);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })?;
+        result.ok_or(Error::NotFound)
+    }
+
+    fn walk_directory<F>(self, root: u64, parent: u64, mut visitor: F) -> Result<(), Error>
+    where
+        F: FnMut(u64, &[u8]) -> Result<bool, Error>,
+    {
         if self.find_inode(root, parent)?.mode & 0xf000 != INODE_DIRECTORY {
             return Err(Error::NotDirectory);
         }
-        let mut result = None;
         self.walk_leaves(root, |leaf| {
             self.each_item(leaf, |key, data| {
                 if key.objectid != parent || key.kind != DIR_ITEM_KEY {
@@ -366,21 +431,28 @@ impl Mount {
                         .checked_add(data_length)
                         .and_then(|length| length.checked_add(name_length))
                         .ok_or(Error::TreeCorrupt)?;
-                    if record_length == 30 || offset + record_length > data.len() {
+                    let name_end = offset
+                        .checked_add(30)
+                        .and_then(|start| start.checked_add(name_length))
+                        .ok_or(Error::TreeCorrupt)?;
+                    if record_length <= 30
+                        || name_length > MAX_NAME_LENGTH
+                        || name_end > data.len()
+                        || offset + record_length > data.len()
+                        || le_u64(data, offset) == 0
+                        || data[offset + 8] != INODE_ITEM_KEY
+                        || data[offset + 29] > 7
+                    {
                         return Err(Error::TreeCorrupt);
                     }
-                    if name_length == target.len()
-                        && &data[offset + 30..offset + 30 + name_length] == target.as_bytes()
-                    {
-                        result = Some(le_u64(data, offset));
+                    if visitor(le_u64(data, offset), &data[offset + 30..name_end])? {
                         return Ok(true);
                     }
                     offset += record_length;
                 }
                 Ok(false)
             })
-        })?;
-        result.ok_or(Error::NotFound)
+        })
     }
 
     fn collect_chunk_tree(self) -> Result<([Chunk; MAX_CHUNKS], usize), Error> {
@@ -582,6 +654,38 @@ fn fixture_check() -> bool {
     if length != 14 || &output[..length] != b"btrfs fixture\n" {
         return false;
     }
+    let mut entries = [DirectoryEntry::EMPTY; 2];
+    let Ok(count) = volume.read_dir("/", &mut entries) else {
+        return false;
+    };
+    if count != 2
+        || entries[0].inode != 257
+        || entries[0].mode & 0o777 != 0o644
+        || entries[0].size != 14
+        || entries[0].directory
+        || entries[0].name_length != 9
+        || &entries[0].name[..entries[0].name_length] != b"hello.txt"
+        || entries[1].name_length != 8
+        || &entries[1].name[..entries[1].name_length] != b"copy.txt"
+    {
+        return false;
+    }
+    let mut bounded = [DirectoryEntry::EMPTY; 1];
+    if volume.read_dir("/", &mut bounded) != Ok(1)
+        || &bounded[0].name[..bounded[0].name_length] != b"hello.txt"
+        || volume.read_dir("/", &mut []).is_err()
+        || volume
+            .read_dir("/hello.txt", &mut entries)
+            .is_err_and(|error| error != Error::NotDirectory)
+    {
+        return false;
+    }
+    if !Mount::open(malformed_directory_read_sector)
+        .and_then(|volume| volume.read_dir("/", &mut entries).map(|_| volume))
+        .is_err_and(|error| error == Error::TreeCorrupt)
+    {
+        return false;
+    }
     if !volume
         .read_file("/", &mut [0u8; 1])
         .is_err_and(|error| error == Error::IsDirectory)
@@ -660,6 +764,22 @@ fn unsupported_checksum_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) ->
         output[0xc4] = 1;
     }
     true
+}
+
+fn malformed_directory_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
+    let tree_lba = 0x4000 / SECTOR_SIZE as u64;
+    if lba == tree_lba || lba == tree_lba + 3820 / SECTOR_SIZE as u64 {
+        let mut block = [0u8; MAX_NODE_SIZE];
+        fixture_tree(0x4000, &mut block);
+        block[3820 + 27] = 0xff;
+        block[3820 + 28] = 0xff;
+        let checksum = crc32c(&block[32..]);
+        write_u32(&mut block, 0, checksum);
+        let start = (lba - tree_lba) as usize * SECTOR_SIZE;
+        output.copy_from_slice(&block[start..start + SECTOR_SIZE]);
+        return true;
+    }
+    fixture_read_sector(lba, output)
 }
 
 fn fixture_superblock(output: &mut [u8; SUPERBLOCK_SIZE]) {
@@ -780,7 +900,7 @@ fn fixture_fs_leaf(output: &mut [u8; MAX_NODE_SIZE]) {
     write_u32(output, TREE_HEADER_SIZE + 21, 160);
     write_inode(output, inode_offset, INODE_DIRECTORY | 0o755, 1024);
 
-    let dir_offset: usize = 3897;
+    let dir_offset: usize = 3820;
     write_key(
         output,
         TREE_HEADER_SIZE + LEAF_ITEM_SIZE,
@@ -793,8 +913,9 @@ fn fixture_fs_leaf(output: &mut [u8; MAX_NODE_SIZE]) {
         TREE_HEADER_SIZE + LEAF_ITEM_SIZE + 17,
         dir_offset as u32,
     );
-    write_u32(output, TREE_HEADER_SIZE + LEAF_ITEM_SIZE + 21, 39);
+    write_u32(output, TREE_HEADER_SIZE + LEAF_ITEM_SIZE + 21, 77);
     write_dir_item(&mut output[dir_offset..], 257, b"hello.txt");
+    write_dir_item(&mut output[dir_offset + 39..], 257, b"copy.txt");
 
     let file_inode_offset: usize = 3737;
     write_key(
