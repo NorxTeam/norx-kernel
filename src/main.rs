@@ -47,6 +47,83 @@ mod wasm;
 
 use core::panic::PanicInfo;
 
+fn persistent_vfs_mount_smoke(
+    source: vfs::MountSource,
+) -> Result<(vfs::MountId, usize), vfs::Error> {
+    match vfs::stat("/storage") {
+        Ok(stat) if stat.kind == vfs::NodeType::Directory => {}
+        Ok(_) => return Err(vfs::Error::InvalidMountTarget),
+        Err(vfs::Error::NotFound) => vfs::mkdir("/storage")?,
+        Err(error) => return Err(error),
+    }
+    let mount = vfs::mount(source, "/storage", vfs::MountFlags::read_only())?;
+    let result = (|| {
+        let root = vfs::stat("/storage")?;
+        if root.kind != vfs::NodeType::Directory {
+            return Err(vfs::Error::NotDirectory);
+        }
+        let empty = vfs::DirectoryEntry {
+            kind: vfs::NodeType::Regular,
+            mode: 0,
+            size: 0,
+            links: 0,
+            name: [0; 31],
+            name_length: 0,
+        };
+        let mut entries = [empty; 16];
+        let count = vfs::read_dir("/storage", &mut entries)?;
+        let dentry = vfs::lookup("/storage")?;
+        if dentry.dentry().mount != mount {
+            let _ = vfs::release_dentry(dentry);
+            return Err(vfs::Error::MountNotFound);
+        }
+        vfs::release_dentry(dentry)?;
+        vfs::sync_path("/storage")?;
+
+        for entry in entries.iter().take(count) {
+            if entry.kind != vfs::NodeType::Regular || entry.size > 4096 {
+                continue;
+            }
+            let prefix = b"/storage/";
+            let length = prefix
+                .len()
+                .checked_add(entry.name_length)
+                .ok_or(vfs::Error::InvalidPath)?;
+            if length > 256 {
+                return Err(vfs::Error::InvalidPath);
+            }
+            let mut path_bytes = [0; 256];
+            path_bytes[..prefix.len()].copy_from_slice(prefix);
+            path_bytes[prefix.len()..length].copy_from_slice(&entry.name[..entry.name_length]);
+            let path =
+                core::str::from_utf8(&path_bytes[..length]).map_err(|_| vfs::Error::InvalidPath)?;
+            let handle = vfs::open(path, vfs::OpenOptions::read())?;
+            let before = vfs::stat_handle(handle)?;
+            let mut data = [0; 4096];
+            let read = vfs::read_handle(handle, &mut data)?;
+            if before.size != 0 && read == 0 {
+                let _ = vfs::close(handle);
+                return Err(vfs::Error::BackendError);
+            }
+            vfs::seek_from(handle, 0, 0)?;
+            vfs::sync_handle(handle)?;
+            vfs::close(handle)?;
+            let reopened = vfs::open(path, vfs::OpenOptions::read())?;
+            if vfs::stat_handle(reopened)?.size != before.size {
+                let _ = vfs::close(reopened);
+                return Err(vfs::Error::BackendError);
+            }
+            vfs::close(reopened)?;
+            break;
+        }
+        Ok(count)
+    })();
+    if result.is_err() {
+        let _ = vfs::unmount_mount(mount);
+    }
+    result.map(|count| (mount, count))
+}
+
 #[no_mangle]
 pub extern "C" fn kernel_start() -> ! {
     log::init();
@@ -416,54 +493,99 @@ pub extern "C" fn kernel_start() -> ! {
         bootlog::fail("runtime bus registry capacity exhausted");
     }
     bootlog::start(2, "checking persistent filesystem volumes");
-    match fat32::probe_block() {
-        Ok(volume) => bootlog::ok_fmt(format_args!(
-            "FAT32 block volume sectors={} clusters={} root={} readonly={}",
-            volume.geometry().total_sectors,
-            volume.geometry().cluster_count,
-            volume.geometry().root_cluster,
-            volume.geometry().read_only,
-        )),
+    let fat32_available = match fat32::probe_block() {
+        Ok(volume) => {
+            bootlog::ok_fmt(format_args!(
+                "FAT32 block volume sectors={} clusters={} root={} readonly={}",
+                volume.geometry().total_sectors,
+                volume.geometry().cluster_count,
+                volume.geometry().root_cluster,
+                volume.geometry().read_only,
+            ));
+            true
+        }
         Err(fat32::Error::InvalidBpb) => {
-            bootlog::warn("FAT32 volume absent; ramfs remains the writable root")
+            bootlog::warn("FAT32 volume absent; ramfs remains the writable root");
+            false
         }
-        Err(error) => bootlog::warn_fmt(format_args!(
-            "FAT32 block probe failed: {:?}; ramfs remains the writable root",
-            error
-        )),
-    }
-    match ext4::probe_block() {
-        Ok(volume) => bootlog::ok_fmt(format_args!(
-            "ext4 block volume blocks={} block_size={} groups={} journal={} readonly={}",
-            volume.geometry().blocks,
-            volume.geometry().block_size,
-            volume.geometry().groups,
-            volume.geometry().has_journal,
-            volume.geometry().read_only,
-        )),
+        Err(error) => {
+            bootlog::warn_fmt(format_args!(
+                "FAT32 block probe failed: {:?}; ramfs remains the writable root",
+                error
+            ));
+            false
+        }
+    };
+    let ext4_available = match ext4::probe_block() {
+        Ok(volume) => {
+            bootlog::ok_fmt(format_args!(
+                "ext4 block volume blocks={} block_size={} groups={} journal={} readonly={}",
+                volume.geometry().blocks,
+                volume.geometry().block_size,
+                volume.geometry().groups,
+                volume.geometry().has_journal,
+                volume.geometry().read_only,
+            ));
+            true
+        }
         Err(ext4::Error::InvalidSuperblock) => {
-            bootlog::warn("ext4 volume absent; ramfs remains the writable root")
+            bootlog::warn("ext4 volume absent; ramfs remains the writable root");
+            false
         }
-        Err(error) => bootlog::warn_fmt(format_args!(
-            "ext4 block probe failed: {:?}; ramfs remains the writable root",
-            error
-        )),
-    }
-    match btrfs::probe_block() {
-        Ok(volume) => bootlog::ok_fmt(format_args!(
-            "btrfs block volume bytes={} nodesize={} chunks={} readonly={}",
-            volume.geometry().total_bytes,
-            volume.geometry().nodesize,
-            volume.geometry().chunks,
-            volume.geometry().read_only,
-        )),
+        Err(error) => {
+            bootlog::warn_fmt(format_args!(
+                "ext4 block probe failed: {:?}; ramfs remains the writable root",
+                error
+            ));
+            false
+        }
+    };
+    let btrfs_available = match btrfs::probe_block() {
+        Ok(volume) => {
+            bootlog::ok_fmt(format_args!(
+                "btrfs block volume bytes={} nodesize={} chunks={} readonly={}",
+                volume.geometry().total_bytes,
+                volume.geometry().nodesize,
+                volume.geometry().chunks,
+                volume.geometry().read_only,
+            ));
+            true
+        }
         Err(btrfs::Error::InvalidSuperblock) => {
-            bootlog::warn("btrfs volume absent; ramfs remains the writable root")
+            bootlog::warn("btrfs volume absent; ramfs remains the writable root");
+            false
         }
-        Err(error) => bootlog::warn_fmt(format_args!(
-            "btrfs block probe failed: {:?}; ramfs remains the writable root",
-            error
-        )),
+        Err(error) => {
+            bootlog::warn_fmt(format_args!(
+                "btrfs block probe failed: {:?}; ramfs remains the writable root",
+                error
+            ));
+            false
+        }
+    };
+    for (source, available) in [
+        (vfs::MountSource::Fat32, fat32_available),
+        (vfs::MountSource::Ext4, ext4_available),
+        (vfs::MountSource::Btrfs, btrfs_available),
+    ] {
+        if !available {
+            continue;
+        }
+        match persistent_vfs_mount_smoke(source) {
+            Ok((mount, entries)) => {
+                bootlog::ok_fmt(format_args!(
+                    "persistent VFS mount source={:?} mount={} root_entries={} read_only=true",
+                    source,
+                    mount.raw(),
+                    entries,
+                ));
+                break;
+            }
+            Err(error) => bootlog::warn_fmt(format_args!(
+                "persistent VFS mount source={:?} unavailable: {:?}",
+                source, error
+            )),
+        }
     }
     if drivers::block::persistent() && !drivers::block::read_only() {
         match fat32::fixed_file_persistence_check() {

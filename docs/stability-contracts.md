@@ -54,6 +54,9 @@ journaling, writes for ext4/btrfs, partial I/O for files larger than the bounded
 The table's deferred persistent-storage item refers to process-attached mount
 namespaces and the write-capable POSIX filesystem surface; the read-only mounted
 path/handle dispatch and block flush boundary described above are published.
+Boot now attempts the first valid persistent reader at `/storage`; its bounded
+VFS smoke is optional when no persistent block device is present and rolls back
+the mount if lookup, metadata, I/O, or reopen checks fail.
 
 ## Cross-cutting release rules
 
