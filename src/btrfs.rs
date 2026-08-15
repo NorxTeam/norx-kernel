@@ -13,6 +13,7 @@ const MAX_CHUNKS: usize = 16;
 const MAX_PENDING_NODES: usize = 512;
 const MAX_TREE_VISITS: usize = 4096;
 const MAX_COMPONENTS: usize = 16;
+const MAX_TRANSACTION_SECTORS: usize = 32;
 pub const MAX_NAME_LENGTH: usize = 255;
 
 const MAGIC: &[u8; 8] = b"_BHRfS_M";
@@ -32,6 +33,8 @@ const INODE_DIRECTORY: u32 = 0x4000;
 const INODE_REGULAR: u32 = 0x8000;
 
 pub type ReadSector = fn(u64, &mut [u8; SECTOR_SIZE]) -> bool;
+pub type WriteSector = fn(u64, &[u8; SECTOR_SIZE]) -> bool;
+pub type FlushCache = fn() -> bool;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -139,6 +142,8 @@ struct RootItem {
 #[derive(Clone, Copy)]
 pub struct Mount {
     reader: ReadSector,
+    writer: Option<WriteSector>,
+    flush: Option<FlushCache>,
     base_lba: u64,
     fsid: [u8; 16],
     sectorsize: u32,
@@ -157,8 +162,42 @@ impl Mount {
         Self::open_at(reader, 0, u64::MAX)
     }
 
+    pub fn open_with_writer(
+        reader: ReadSector,
+        writer: WriteSector,
+        flush: FlushCache,
+    ) -> Result<Self, Error> {
+        Self::open_at_with_writer(reader, writer, flush, 0, u64::MAX)
+    }
+
     pub fn open_at(
         reader: ReadSector,
+        base_lba: u64,
+        available_sectors: u64,
+    ) -> Result<Self, Error> {
+        Self::open_at_with_io(reader, None, None, base_lba, available_sectors)
+    }
+
+    pub fn open_at_with_writer(
+        reader: ReadSector,
+        writer: WriteSector,
+        flush: FlushCache,
+        base_lba: u64,
+        available_sectors: u64,
+    ) -> Result<Self, Error> {
+        Self::open_at_with_io(
+            reader,
+            Some(writer),
+            Some(flush),
+            base_lba,
+            available_sectors,
+        )
+    }
+
+    fn open_at_with_io(
+        reader: ReadSector,
+        writer: Option<WriteSector>,
+        flush: Option<FlushCache>,
         base_lba: u64,
         available_sectors: u64,
     ) -> Result<Self, Error> {
@@ -206,6 +245,8 @@ impl Mount {
         )?;
         let mut mount = Self {
             reader,
+            writer,
+            flush,
             base_lba,
             fsid: copy_array(&superblock[0x20..0x30]),
             sectorsize,
@@ -235,6 +276,27 @@ impl Mount {
             checksum: self.csum_type == CSUM_CRC32C,
             read_only: true,
         }
+    }
+
+    pub fn begin_transaction(self) -> Result<Transaction, Error> {
+        let writer = self.writer.ok_or(Error::ReadOnly)?;
+        let flush = self.flush.ok_or(Error::ReadOnly)?;
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(Error::UnsupportedFeature)?;
+        Ok(Transaction {
+            reader: self.reader,
+            writer,
+            flush,
+            base_lba: self.base_lba,
+            total_bytes: self.total_bytes,
+            fsid: self.fsid,
+            nodesize: self.nodesize,
+            generation,
+            pending: [PendingSector::EMPTY; MAX_TRANSACTION_SECTORS],
+            pending_count: 0,
+        })
     }
 
     pub fn subvolumes(self, output: &mut [Subvolume]) -> Result<usize, Error> {
@@ -345,8 +407,30 @@ impl Mount {
         Ok(copied)
     }
 
-    pub fn write_file(self, _path: &str, _input: &[u8]) -> Result<usize, Error> {
-        Err(Error::ReadOnly)
+    pub fn write_file(self, path: &str, input: &[u8]) -> Result<usize, Error> {
+        if self.writer.is_none() || self.flush.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        self.validate_inline_rewrite(path, input)?;
+        // ponytail: COW allocation and root publication are deliberately not
+        // faked; add them before exposing a persistent btrfs mutation.
+        let _transaction = self.begin_transaction()?;
+        Err(Error::UnsupportedFeature)
+    }
+
+    fn validate_inline_rewrite(self, path: &str, input: &[u8]) -> Result<(), Error> {
+        let (root, inode_number) = self.resolve(path)?;
+        let inode = self.find_inode(root, inode_number)?;
+        if inode.mode & 0xf000 != INODE_REGULAR || input.is_empty() {
+            return Err(Error::UnsupportedFeature);
+        }
+        let size = usize::try_from(inode.size).map_err(|_| Error::BufferTooSmall)?;
+        if size != input.len() {
+            return Err(Error::UnsupportedFeature);
+        }
+        let mut current = [0u8; MAX_NODE_SIZE];
+        self.read_file(path, &mut current[..size])?;
+        Ok(())
     }
 
     fn resolve(self, path: &str) -> Result<(u64, u64), Error> {
@@ -604,9 +688,181 @@ impl Mount {
     }
 }
 
+const TRANSACTION_DATA_PHASE: u8 = 0;
+const TRANSACTION_POINTER_PHASE: u8 = 1;
+const TRANSACTION_SUPERBLOCK_PHASE: u8 = 2;
+const MAX_FIXTURE_WRITES: usize = 64;
+
+#[derive(Clone, Copy)]
+struct PendingSector {
+    lba: u64,
+    phase: u8,
+    before: [u8; SECTOR_SIZE],
+    after: [u8; SECTOR_SIZE],
+}
+
+impl PendingSector {
+    const EMPTY: Self = Self {
+        lba: 0,
+        phase: 0,
+        before: [0; SECTOR_SIZE],
+        after: [0; SECTOR_SIZE],
+    };
+}
+
+pub struct Transaction {
+    reader: ReadSector,
+    writer: WriteSector,
+    flush: FlushCache,
+    base_lba: u64,
+    total_bytes: u64,
+    fsid: [u8; 16],
+    nodesize: u32,
+    generation: u64,
+    pending: [PendingSector; MAX_TRANSACTION_SECTORS],
+    pending_count: usize,
+}
+
+impl Transaction {
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    // The caller must supply a block obtained from the future COW allocator.
+    // There is intentionally no allocator here, so write_file never calls it.
+    fn stage_tree_block(
+        &mut self,
+        physical_offset: u64,
+        logical: u64,
+        phase: u8,
+        mut block: [u8; MAX_NODE_SIZE],
+    ) -> Result<(), Error> {
+        if phase > TRANSACTION_POINTER_PHASE
+            || physical_offset % self.nodesize as u64 != 0
+            || logical % self.nodesize as u64 != 0
+            || block[0x20..0x30] != self.fsid
+            || le_u64(&block, 0x30) != logical
+            || block[0x64] > 8
+            || le_u32(&block, 0) != crc32c(&block[32..])
+        {
+            return Err(Error::TreeCorrupt);
+        }
+        write_u64(&mut block, 0x50, self.generation);
+        let checksum = crc32c(&block[32..]);
+        write_u32(&mut block, 0, checksum);
+        self.stage_block(physical_offset, &block, phase)
+    }
+
+    // Superblock publication is always the final phase. Mirrors are outside
+    // this bounded groundwork and therefore cannot be staged accidentally.
+    fn stage_superblock(
+        &mut self,
+        physical_offset: u64,
+        mut superblock: [u8; SUPERBLOCK_SIZE],
+    ) -> Result<(), Error> {
+        if physical_offset != SUPERBLOCK_OFFSET
+            || &superblock[0x40..0x48] != MAGIC
+            || superblock[0x20..0x30] != self.fsid
+            || le_u16(&superblock, 0xc4) != CSUM_CRC32C
+            || le_u32(&superblock, 0) != crc32c(&superblock[32..])
+        {
+            return Err(Error::InvalidSuperblock);
+        }
+        write_u64(&mut superblock, 0x48, self.generation);
+        let checksum = crc32c(&superblock[32..]);
+        write_u32(&mut superblock, 0, checksum);
+        self.stage_block(physical_offset, &superblock, TRANSACTION_SUPERBLOCK_PHASE)
+    }
+
+    fn stage_block(&mut self, physical_offset: u64, bytes: &[u8], phase: u8) -> Result<(), Error> {
+        if phase > TRANSACTION_SUPERBLOCK_PHASE
+            || !physical_offset.is_multiple_of(SECTOR_SIZE as u64)
+            || !bytes.len().is_multiple_of(SECTOR_SIZE)
+            || physical_offset
+                .checked_add(bytes.len() as u64)
+                .is_none_or(|end| end > self.total_bytes)
+        {
+            return Err(Error::Io);
+        }
+        for index in 0..bytes.len() / SECTOR_SIZE {
+            let lba = self
+                .base_lba
+                .checked_add(physical_offset / SECTOR_SIZE as u64 + index as u64)
+                .ok_or(Error::Io)?;
+            if self.pending[..self.pending_count]
+                .iter()
+                .any(|pending| pending.lba == lba)
+            {
+                return Err(Error::UnsupportedFeature);
+            }
+            if self.pending_count == self.pending.len() {
+                return Err(Error::UnsupportedFeature);
+            }
+            let mut before = [0u8; SECTOR_SIZE];
+            if !(self.reader)(lba, &mut before) {
+                return Err(Error::Io);
+            }
+            let start = index * SECTOR_SIZE;
+            let mut after = [0u8; SECTOR_SIZE];
+            after.copy_from_slice(&bytes[start..start + SECTOR_SIZE]);
+            self.pending[self.pending_count] = PendingSector {
+                lba,
+                phase,
+                before,
+                after,
+            };
+            self.pending_count += 1;
+        }
+        Ok(())
+    }
+
+    pub fn commit(self) -> Result<(), Error> {
+        let mut written = [false; MAX_TRANSACTION_SECTORS];
+        for phase in 0..=TRANSACTION_SUPERBLOCK_PHASE {
+            for (index, pending) in self.pending[..self.pending_count].iter().enumerate() {
+                if pending.phase != phase {
+                    continue;
+                }
+                if !(self.writer)(pending.lba, &pending.after) {
+                    self.rollback(&written);
+                    return Err(Error::Io);
+                }
+                written[index] = true;
+            }
+        }
+        if !(self.flush)() {
+            self.rollback(&written);
+            return Err(Error::Io);
+        }
+        Ok(())
+    }
+
+    fn rollback(&self, written: &[bool; MAX_TRANSACTION_SECTORS]) {
+        for phase in (0..=TRANSACTION_SUPERBLOCK_PHASE).rev() {
+            for (index, pending) in self.pending[..self.pending_count].iter().enumerate().rev() {
+                if pending.phase == phase && written[index] {
+                    let _ = (self.writer)(pending.lba, &pending.before);
+                }
+            }
+        }
+        let _ = (self.flush)();
+    }
+}
+
 pub fn probe_block() -> Result<Mount, Error> {
     let partition = block::partition(0).ok_or(Error::InvalidSuperblock)?;
     Mount::open_at(ramdisk_read_sector, partition.start_lba, partition.sectors)
+}
+
+pub fn probe_block_rw() -> Result<Mount, Error> {
+    let partition = block::partition(0).ok_or(Error::InvalidSuperblock)?;
+    Mount::open_at_with_writer(
+        ramdisk_read_sector,
+        ramdisk_write_sector,
+        ramdisk_flush_cache,
+        partition.start_lba,
+        partition.sectors,
+    )
 }
 
 pub fn contract_self_check() {
@@ -617,6 +873,16 @@ fn ramdisk_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
     usize::try_from(lba)
         .ok()
         .is_some_and(|lba| block::read_sector(lba, output))
+}
+
+fn ramdisk_write_sector(lba: u64, input: &[u8; SECTOR_SIZE]) -> bool {
+    usize::try_from(lba)
+        .ok()
+        .is_some_and(|lba| block::write_sector(lba, input))
+}
+
+fn ramdisk_flush_cache() -> bool {
+    block::flush_cache().is_ok()
 }
 
 fn fixture_check() -> bool {
@@ -714,6 +980,26 @@ fn fixture_check() -> bool {
     {
         return false;
     }
+    let Ok(writable) = Mount::open_at_with_writer(
+        fixture_transaction_read_sector,
+        fixture_transaction_write_sector,
+        fixture_transaction_flush_cache,
+        0,
+        u64::MAX,
+    ) else {
+        return false;
+    };
+    if !writable.geometry().read_only
+        || writable
+            .write_file("/hello.txt", b"btrfs fixture\n")
+            .is_err_and(|error| error != Error::UnsupportedFeature)
+        || unsafe { *core::ptr::addr_of!(FIXTURE_TX_WRITE_COUNT) } != 0
+    {
+        return false;
+    }
+    if !fixture_transaction_check() {
+        return false;
+    }
     if !Mount::open(corrupt_fixture_read_sector)
         .is_err_and(|error| error == Error::ChecksumMismatch)
     {
@@ -721,6 +1007,240 @@ fn fixture_check() -> bool {
     }
     Mount::open(unsupported_checksum_read_sector)
         .is_err_and(|error| error == Error::UnsupportedChecksum)
+}
+
+#[derive(Clone, Copy)]
+struct FixtureSector {
+    lba: u64,
+    data: [u8; SECTOR_SIZE],
+    valid: bool,
+}
+
+impl FixtureSector {
+    const EMPTY: Self = Self {
+        lba: 0,
+        data: [0; SECTOR_SIZE],
+        valid: false,
+    };
+}
+
+static mut FIXTURE_TX_MEDIA: [FixtureSector; MAX_TRANSACTION_SECTORS] =
+    [FixtureSector::EMPTY; MAX_TRANSACTION_SECTORS];
+static mut FIXTURE_TX_WRITE_LOG: [u64; MAX_FIXTURE_WRITES] = [0; MAX_FIXTURE_WRITES];
+static mut FIXTURE_TX_WRITE_COUNT: usize = 0;
+static mut FIXTURE_TX_FAIL_ON: usize = usize::MAX;
+
+fn fixture_transaction_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
+    let media = unsafe { &*core::ptr::addr_of!(FIXTURE_TX_MEDIA) };
+    if let Some(sector) = media
+        .iter()
+        .find(|sector| sector.valid && sector.lba == lba)
+    {
+        output.copy_from_slice(&sector.data);
+        true
+    } else {
+        fixture_read_sector(lba, output)
+    }
+}
+
+fn fixture_transaction_write_sector(lba: u64, input: &[u8; SECTOR_SIZE]) -> bool {
+    let media = unsafe { &mut *core::ptr::addr_of_mut!(FIXTURE_TX_MEDIA) };
+    let write_count = unsafe { &mut *core::ptr::addr_of_mut!(FIXTURE_TX_WRITE_COUNT) };
+    let write_log = unsafe { &mut *core::ptr::addr_of_mut!(FIXTURE_TX_WRITE_LOG) };
+    let fail_on = unsafe { *core::ptr::addr_of!(FIXTURE_TX_FAIL_ON) };
+    let call = *write_count;
+    *write_count += 1;
+    if call == fail_on {
+        return false;
+    }
+    if call < write_log.len() {
+        write_log[call] = lba;
+    }
+    let mut slot_index = None;
+    for (index, sector) in media.iter().enumerate() {
+        if sector.valid && sector.lba == lba {
+            slot_index = Some(index);
+            break;
+        }
+    }
+    if slot_index.is_none() {
+        slot_index = media.iter().position(|sector| !sector.valid);
+    }
+    let Some(slot_index) = slot_index else {
+        return false;
+    };
+    let sector = &mut media[slot_index];
+    sector.lba = lba;
+    sector.data.copy_from_slice(input);
+    sector.valid = true;
+    true
+}
+
+fn fixture_transaction_flush_cache() -> bool {
+    true
+}
+
+fn reset_fixture_transaction() {
+    unsafe {
+        *core::ptr::addr_of_mut!(FIXTURE_TX_MEDIA) =
+            [FixtureSector::EMPTY; MAX_TRANSACTION_SECTORS];
+        *core::ptr::addr_of_mut!(FIXTURE_TX_WRITE_LOG) = [0; MAX_FIXTURE_WRITES];
+        *core::ptr::addr_of_mut!(FIXTURE_TX_WRITE_COUNT) = 0;
+        *core::ptr::addr_of_mut!(FIXTURE_TX_FAIL_ON) = usize::MAX;
+    }
+}
+
+fn fixture_transaction_block(lba: u64, output: &mut [u8; MAX_NODE_SIZE]) -> bool {
+    for index in 0..output.len() / SECTOR_SIZE {
+        let mut sector = [0u8; SECTOR_SIZE];
+        if !fixture_transaction_read_sector(lba + index as u64, &mut sector) {
+            return false;
+        }
+        let start = index * SECTOR_SIZE;
+        output[start..start + SECTOR_SIZE].copy_from_slice(&sector);
+    }
+    true
+}
+
+fn fixture_transaction_check() -> bool {
+    reset_fixture_transaction();
+    let Ok(volume) = Mount::open_at_with_writer(
+        fixture_transaction_read_sector,
+        fixture_transaction_write_sector,
+        fixture_transaction_flush_cache,
+        0,
+        u64::MAX,
+    ) else {
+        return false;
+    };
+    let Ok(mut transaction) = volume.begin_transaction() else {
+        return false;
+    };
+    if transaction.generation() != 2 {
+        return false;
+    }
+
+    let mut data_block = [0u8; MAX_NODE_SIZE];
+    fixture_tree(0x4000, &mut data_block);
+    write_u64(&mut data_block, 0x30, 0x5000);
+    let checksum = crc32c(&data_block[32..]);
+    write_u32(&mut data_block, 0, checksum);
+    if transaction
+        .stage_tree_block(0x5000, 0x5000, TRANSACTION_DATA_PHASE, data_block)
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut pointer_block = [0u8; MAX_NODE_SIZE];
+    fixture_tree(0x4000, &mut pointer_block);
+    write_u64(&mut pointer_block, 0x30, 0x6000);
+    let checksum = crc32c(&pointer_block[32..]);
+    write_u32(&mut pointer_block, 0, checksum);
+    if transaction
+        .stage_tree_block(0x6000, 0x6000, TRANSACTION_POINTER_PHASE, pointer_block)
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut superblock = [0u8; SUPERBLOCK_SIZE];
+    fixture_superblock(&mut superblock);
+    if transaction
+        .stage_superblock(SUPERBLOCK_OFFSET, superblock)
+        .is_err()
+        || transaction.commit().is_err()
+    {
+        return false;
+    }
+    let write_log = unsafe { &*core::ptr::addr_of!(FIXTURE_TX_WRITE_LOG) };
+    let write_count = unsafe { *core::ptr::addr_of!(FIXTURE_TX_WRITE_COUNT) };
+    if write_count != 24
+        || write_log[0] != 0x5000 / SECTOR_SIZE as u64
+        || write_log[8] != 0x6000 / SECTOR_SIZE as u64
+        || write_log[16] != SUPERBLOCK_OFFSET / SECTOR_SIZE as u64
+    {
+        return false;
+    }
+    let mut committed_data = [0u8; MAX_NODE_SIZE];
+    let mut committed_pointer = [0u8; MAX_NODE_SIZE];
+    if !fixture_transaction_block(0x5000 / SECTOR_SIZE as u64, &mut committed_data)
+        || !fixture_transaction_block(0x6000 / SECTOR_SIZE as u64, &mut committed_pointer)
+        || le_u64(&committed_data, 0x50) != 2
+        || le_u64(&committed_pointer, 0x50) != 2
+        || le_u32(&committed_data, 0) != crc32c(&committed_data[32..])
+        || le_u32(&committed_pointer, 0) != crc32c(&committed_pointer[32..])
+    {
+        return false;
+    }
+    let mut committed_superblock = [0u8; SUPERBLOCK_SIZE];
+    if !fixture_transaction_block(
+        SUPERBLOCK_OFFSET / SECTOR_SIZE as u64,
+        &mut committed_superblock,
+    ) || le_u64(&committed_superblock, 0x48) != 2
+        || le_u32(&committed_superblock, 0) != crc32c(&committed_superblock[32..])
+    {
+        return false;
+    }
+
+    reset_fixture_transaction();
+    unsafe { *core::ptr::addr_of_mut!(FIXTURE_TX_FAIL_ON) = 10 };
+    let Ok(volume) = Mount::open_at_with_writer(
+        fixture_transaction_read_sector,
+        fixture_transaction_write_sector,
+        fixture_transaction_flush_cache,
+        0,
+        u64::MAX,
+    ) else {
+        return false;
+    };
+    let Ok(mut transaction) = volume.begin_transaction() else {
+        return false;
+    };
+    let mut data_block = [0u8; MAX_NODE_SIZE];
+    fixture_tree(0x4000, &mut data_block);
+    write_u64(&mut data_block, 0x30, 0x5000);
+    let checksum = crc32c(&data_block[32..]);
+    write_u32(&mut data_block, 0, checksum);
+    let mut pointer_block = [0u8; MAX_NODE_SIZE];
+    fixture_tree(0x4000, &mut pointer_block);
+    write_u64(&mut pointer_block, 0x30, 0x6000);
+    let checksum = crc32c(&pointer_block[32..]);
+    write_u32(&mut pointer_block, 0, checksum);
+    let mut superblock = [0u8; SUPERBLOCK_SIZE];
+    fixture_superblock(&mut superblock);
+    if transaction
+        .stage_tree_block(0x5000, 0x5000, TRANSACTION_DATA_PHASE, data_block)
+        .is_err()
+        || transaction
+            .stage_tree_block(0x6000, 0x6000, TRANSACTION_POINTER_PHASE, pointer_block)
+            .is_err()
+        || transaction
+            .stage_superblock(SUPERBLOCK_OFFSET, superblock)
+            .is_err()
+        || transaction.commit() != Err(Error::Io)
+    {
+        return false;
+    }
+    let mut restored = [0u8; MAX_NODE_SIZE];
+    if !fixture_transaction_block(0x5000 / SECTOR_SIZE as u64, &mut restored)
+        || restored != [0; MAX_NODE_SIZE]
+        || !fixture_transaction_block(0x6000 / SECTOR_SIZE as u64, &mut restored)
+        || restored != [0; MAX_NODE_SIZE]
+    {
+        return false;
+    }
+    let mut restored_superblock = [0u8; SUPERBLOCK_SIZE];
+    fixture_superblock(&mut restored_superblock);
+    let mut observed_superblock = [0u8; SUPERBLOCK_SIZE];
+    if !fixture_transaction_block(
+        SUPERBLOCK_OFFSET / SECTOR_SIZE as u64,
+        &mut observed_superblock,
+    ) || observed_superblock != restored_superblock
+    {
+        return false;
+    }
+    true
 }
 
 fn fixture_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
