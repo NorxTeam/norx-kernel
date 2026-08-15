@@ -245,6 +245,18 @@ pub fn timer_source() -> &'static str {
     }
 }
 
+pub fn cpu_id() -> usize {
+    let mpidr: u64;
+    unsafe {
+        asm!(
+            "mrs {}, MPIDR_EL1",
+            out(reg) mpidr,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    (mpidr & 0x00ff_ffff) as usize
+}
+
 pub fn init_timer_interrupts() -> bool {
     if !gic::status().ready || timer_frequency_hz().is_none() || !gic::enable_timer() {
         return false;

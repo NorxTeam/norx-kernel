@@ -134,6 +134,10 @@ pub fn timer_source() -> &'static str {
     }
 }
 
+pub fn cpu_id() -> usize {
+    apic::current_id()
+}
+
 pub fn init_timer_interrupts() -> bool {
     if apic::timer_calibration().is_some() {
         remap_pic();

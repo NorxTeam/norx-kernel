@@ -86,7 +86,9 @@ handles; pipes and serial descriptors reject filesystem-only operations.
 
 When a read-only persistent mount is present, `open`, `read`, `lseek`, `stat`,
 `fstat`, `read_dir`, and `fsync` dispatch to the bounded filesystem reader and
-block flush boundary; persistent mutations return read-only errors. `spawn2`
+block flush boundary. An explicitly writable FAT32 mount additionally supports
+bounded existing-file rewrite plus short 8.3 create/mkdir, empty-file unlink,
+and same-directory rename; ext4 and btrfs remain read-only. `spawn2`
 accepts `NORX_SPAWN_INHERIT_OPEN_FDS`/`SPAWN_INHERIT_OPEN_FDS` for bounded
 inheritance of the parent's open descriptor table while preserving `FD_CLOEXEC`.
 

@@ -31,6 +31,8 @@ pub enum Error {
     FileTooLarge,
     FatMismatch,
     ReadOnly,
+    AlreadyExists,
+    Unsupported,
     InvalidPersistenceRecord,
 }
 
@@ -99,6 +101,13 @@ struct EntryMetadata {
 #[derive(Clone, Copy)]
 struct EntryLocation {
     entry: EntryMetadata,
+    sector: u64,
+    offset: usize,
+    has_long_name: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DirectorySlot {
     sector: u64,
     offset: usize,
 }
@@ -413,8 +422,8 @@ impl Mount {
         let Some(_writer) = self.writer else {
             return Err(Error::ReadOnly);
         };
-        // ponytail: Ceiling: this bounded slice resizes only an existing directory entry;
-        // directory-slot allocation, create, and rename remain out of scope.
+        // ponytail: Ceiling: file data writes still require an existing entry;
+        // directory mutations below are bounded to short 8.3 entries.
         if input.len() > u32::MAX as usize {
             return Err(Error::FileTooLarge);
         }
@@ -501,6 +510,110 @@ impl Mount {
         Ok(input.len())
     }
 
+    /// Create an empty short 8.3 file in an existing directory.
+    ///
+    /// LFN entries, directory-chain growth, timestamps, and file data
+    /// allocation remain intentionally unsupported in this bounded slice.
+    pub fn create_file(self, path: &str) -> Result<(), Error> {
+        if self.writer.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        let (components, count) = components(path)?;
+        let short_name = encode_short_name_for_create(components[count - 1])?;
+        let directory_cluster = self.directory_for_components(&components, count - 1)?;
+        match self.find_entry_location(directory_cluster, components[count - 1]) {
+            Ok(_) => return Err(Error::AlreadyExists),
+            Err(Error::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let slot = self.find_free_directory_slot(directory_cluster)?;
+        let mut entry = [0u8; 32];
+        entry[..11].copy_from_slice(&short_name);
+        entry[11] = 0x20;
+        self.write_directory_entry(slot, &entry)
+    }
+
+    /// Create a short-name directory with a single-cluster bounded body.
+    pub fn mkdir(self, path: &str) -> Result<(), Error> {
+        if self.writer.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        let (components, count) = components(path)?;
+        let short_name = encode_short_name_for_create(components[count - 1])?;
+        let parent_cluster = self.directory_for_components(&components, count - 1)?;
+        match self.find_entry_location(parent_cluster, components[count - 1]) {
+            Ok(_) => return Err(Error::AlreadyExists),
+            Err(Error::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let slot = self.find_free_directory_slot(parent_cluster)?;
+        let (cluster, _) = self.allocate_chain(1)?;
+        if let Err(error) = self.initialize_directory_cluster(cluster, parent_cluster) {
+            let _ = self.free_chain(cluster);
+            return Err(error);
+        }
+        let mut entry = [0u8; 32];
+        entry[..11].copy_from_slice(&short_name);
+        entry[11] = 0x10;
+        entry[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+        entry[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+        if let Err(error) = self.write_directory_entry(slot, &entry) {
+            let _ = self.free_chain(cluster);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Remove an empty short-name file and release its directory slot.
+    pub fn unlink(self, path: &str) -> Result<(), Error> {
+        if self.writer.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        let (components, count) = components(path)?;
+        let directory_cluster = self.directory_for_components(&components, count - 1)?;
+        let location = self.find_entry_location(directory_cluster, components[count - 1])?;
+        if location.entry.directory {
+            return Err(Error::IsDirectory);
+        }
+        if location.has_long_name || location.entry.cluster != 0 || location.entry.size != 0 {
+            return Err(Error::Unsupported);
+        }
+        self.free_directory_entry(location)
+    }
+
+    /// Rename a short-name entry in-place within the same directory.
+    pub fn rename(self, from: &str, to: &str) -> Result<(), Error> {
+        if self.writer.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        let (from_components, from_count) = components(from)?;
+        let (to_components, to_count) = components(to)?;
+        let short_name = encode_short_name_for_create(to_components[to_count - 1])?;
+        let from_directory = self.directory_for_components(&from_components, from_count - 1)?;
+        let to_directory = self.directory_for_components(&to_components, to_count - 1)?;
+        if from_directory != to_directory {
+            return Err(Error::Unsupported);
+        }
+        let source = self.find_entry_location(from_directory, from_components[from_count - 1])?;
+        if source.entry.directory {
+            return Err(Error::IsDirectory);
+        }
+        if source.has_long_name {
+            return Err(Error::Unsupported);
+        }
+        match self.find_entry_location(to_directory, to_components[to_count - 1]) {
+            Ok(destination)
+                if destination.sector == source.sector && destination.offset == source.offset =>
+            {
+                return Ok(());
+            }
+            Ok(_) => return Err(Error::AlreadyExists),
+            Err(Error::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        self.replace_directory_name(source, short_name)
+    }
+
     fn update_directory_entry(
         self,
         location: EntryLocation,
@@ -542,6 +655,146 @@ impl Mount {
         Ok(())
     }
 
+    fn directory_for_components(
+        self,
+        components: &[&str; MAX_COMPONENTS],
+        count: usize,
+    ) -> Result<u32, Error> {
+        let mut directory_cluster = self.root_cluster;
+        for component in components.iter().take(count) {
+            let entry = self.find_entry(directory_cluster, component)?;
+            if !entry.directory {
+                return Err(Error::NotDirectory);
+            }
+            directory_cluster = entry.cluster;
+        }
+        Ok(directory_cluster)
+    }
+
+    fn find_free_directory_slot(self, directory_cluster: u32) -> Result<DirectorySlot, Error> {
+        if !self.valid_cluster(directory_cluster) {
+            return Err(Error::BadClusterChain);
+        }
+        let mut cluster = directory_cluster;
+        for _ in 0..self.cluster_count {
+            for sector in 0..self.sectors_per_cluster as u64 {
+                let sector_number = self.cluster_sector(cluster) + sector;
+                let mut data = [0u8; BYTES_PER_SECTOR];
+                if !self.read_sector(sector_number, &mut data) {
+                    return Err(Error::Io);
+                }
+                for offset in (0..BYTES_PER_SECTOR).step_by(32) {
+                    if data[offset] == 0xe5 {
+                        return Ok(DirectorySlot {
+                            sector: sector_number,
+                            offset,
+                        });
+                    }
+                    if data[offset] == 0 {
+                        if offset + 32 == BYTES_PER_SECTOR || data[offset + 32] != 0 {
+                            return Err(Error::NoSpace);
+                        }
+                        return Ok(DirectorySlot {
+                            sector: sector_number,
+                            offset,
+                        });
+                    }
+                }
+            }
+            let Some(next) = self.next_cluster(cluster)? else {
+                return Err(Error::NoSpace);
+            };
+            cluster = next;
+        }
+        Err(Error::BadClusterChain)
+    }
+
+    fn write_directory_entry(self, slot: DirectorySlot, entry: &[u8; 32]) -> Result<(), Error> {
+        let end = slot.offset.checked_add(32).ok_or(Error::Io)?;
+        if end > BYTES_PER_SECTOR {
+            return Err(Error::Io);
+        }
+        let mut data = [0u8; BYTES_PER_SECTOR];
+        if !self.read_sector(slot.sector, &mut data) {
+            return Err(Error::Io);
+        }
+        let original = data;
+        data[slot.offset..end].copy_from_slice(entry);
+        if !self.write_sector(slot.sector, &data) {
+            let _ = self.write_sector(slot.sector, &original);
+            return Err(Error::Io);
+        }
+        let mut verify = [0u8; BYTES_PER_SECTOR];
+        if !self.read_sector(slot.sector, &mut verify) || verify[slot.offset..end] != entry[..] {
+            let _ = self.write_sector(slot.sector, &original);
+            return Err(Error::Io);
+        }
+        Ok(())
+    }
+
+    fn free_directory_entry(self, location: EntryLocation) -> Result<(), Error> {
+        let mut data = [0u8; BYTES_PER_SECTOR];
+        if !self.read_sector(location.sector, &mut data) {
+            return Err(Error::Io);
+        }
+        let original = data;
+        data[location.offset] = 0xe5;
+        if !self.write_sector(location.sector, &data) {
+            let _ = self.write_sector(location.sector, &original);
+            return Err(Error::Io);
+        }
+        let mut verify = [0u8; BYTES_PER_SECTOR];
+        if !self.read_sector(location.sector, &mut verify) || verify[location.offset] != 0xe5 {
+            let _ = self.write_sector(location.sector, &original);
+            return Err(Error::Io);
+        }
+        Ok(())
+    }
+
+    fn replace_directory_name(self, location: EntryLocation, name: [u8; 11]) -> Result<(), Error> {
+        let mut data = [0u8; BYTES_PER_SECTOR];
+        if !self.read_sector(location.sector, &mut data) {
+            return Err(Error::Io);
+        }
+        let original = data;
+        data[location.offset..location.offset + 11].copy_from_slice(&name);
+        if !self.write_sector(location.sector, &data) {
+            let _ = self.write_sector(location.sector, &original);
+            return Err(Error::Io);
+        }
+        let mut verify = [0u8; BYTES_PER_SECTOR];
+        if !self.read_sector(location.sector, &mut verify)
+            || verify[location.offset..location.offset + 11] != name
+        {
+            let _ = self.write_sector(location.sector, &original);
+            return Err(Error::Io);
+        }
+        Ok(())
+    }
+
+    fn initialize_directory_cluster(self, cluster: u32, parent: u32) -> Result<(), Error> {
+        if !self.valid_cluster(cluster) || !self.valid_cluster(parent) {
+            return Err(Error::BadClusterChain);
+        }
+        for sector in 0..self.sectors_per_cluster as u64 {
+            let mut data = [0u8; BYTES_PER_SECTOR];
+            if sector == 0 {
+                data[..11].copy_from_slice(b".          ");
+                data[11] = 0x10;
+                data[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+                data[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+                data[32..43].copy_from_slice(b"..         ");
+                data[43] = 0x10;
+                data[52..54].copy_from_slice(&((parent >> 16) as u16).to_le_bytes());
+                data[58..60].copy_from_slice(&(parent as u16).to_le_bytes());
+            }
+            if !self.write_sector(self.cluster_sector(cluster) + sector, &data) {
+                return Err(Error::Io);
+            }
+        }
+        Ok(())
+    }
+
     fn find_entry(self, directory_cluster: u32, target: &str) -> Result<EntryMetadata, Error> {
         Ok(self.find_entry_location(directory_cluster, target)?.entry)
     }
@@ -559,6 +812,7 @@ impl Mount {
                     entry: self.entry_metadata(entry)?,
                     sector,
                     offset,
+                    has_long_name: long_name.valid,
                 });
                 return Ok(true);
             }
@@ -1050,6 +1304,7 @@ static mut FIXTURE_DATA_TAIL_VALID: bool = false;
 static mut FIXTURE_DATA_GROWN_VALID: bool = false;
 static mut FIXTURE_FAT_PRIMARY_VALID: bool = false;
 static mut FIXTURE_FAT_SECONDARY_VALID: bool = false;
+static mut FIXTURE_FAIL_WRITE_LBA: u64 = u64::MAX;
 
 const FIXTURE_PARTITION_BASE: u64 = 100;
 
@@ -1061,6 +1316,7 @@ fn fixture_check() -> bool {
         FIXTURE_DATA_GROWN_VALID = false;
         FIXTURE_FAT_PRIMARY_VALID = false;
         FIXTURE_FAT_SECONDARY_VALID = false;
+        FIXTURE_FAIL_WRITE_LBA = u64::MAX;
     }
     let Ok(read_only_volume) = Mount::open(fixture_read_sector) else {
         return false;
@@ -1155,6 +1411,67 @@ fn fixture_check() -> bool {
     if length != 13 || &updated[..length] != b"FAT32 update\n" {
         return false;
     }
+    if volume.create_file("/invalid name.txt") != Err(Error::InvalidPath)
+        || volume.create_file("/SUBDIR") != Err(Error::AlreadyExists)
+        || volume.unlink("/Long Name.txt") != Err(Error::Unsupported)
+    {
+        return false;
+    }
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = 2049;
+    }
+    if volume.create_file("/FAILED.TXT") != Err(Error::Io) {
+        return false;
+    }
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = u64::MAX;
+    }
+    if volume.stat("/FAILED.TXT") != Err(Error::NotFound) {
+        return false;
+    }
+    if volume.create_file("/NEW.TXT").is_err() {
+        return false;
+    }
+    let Ok(new_info) = volume.stat("/NEW.TXT") else {
+        return false;
+    };
+    if new_info.directory || new_info.cluster != 0 || new_info.size != 0 {
+        return false;
+    }
+    if volume.rename("/NEW.TXT", "/RENAMED.TXT").is_err()
+        || volume.stat("/NEW.TXT") != Err(Error::NotFound)
+        || volume.stat("/RENAMED.TXT").is_err()
+    {
+        return false;
+    }
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = 2049;
+    }
+    if volume.rename("/RENAMED.TXT", "/FAILED.TXT") != Err(Error::Io) {
+        return false;
+    }
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = u64::MAX;
+    }
+    if volume.stat("/RENAMED.TXT").is_err() || volume.stat("/FAILED.TXT") != Err(Error::NotFound) {
+        return false;
+    }
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = 2049;
+    }
+    if volume.unlink("/RENAMED.TXT") != Err(Error::Io) {
+        return false;
+    }
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = u64::MAX;
+    }
+    if volume.unlink("/RENAMED.TXT").is_err()
+        || volume.stat("/RENAMED.TXT") != Err(Error::NotFound)
+        || volume.create_file("/REUSED.TXT").is_err()
+        || volume.unlink("/REUSED.TXT").is_err()
+    {
+        return false;
+    }
     let Ok(partitioned) = Mount::open_at(
         fixture_partition_read_sector,
         Some(fixture_partition_write_sector),
@@ -1219,6 +1536,35 @@ fn fixture_check() -> bool {
         return false;
     }
     if volume.write_file("/Long Name.txt", b"again").is_err() {
+        return false;
+    }
+
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = 2049;
+    }
+    if volume.mkdir("/FAILED.DIR") != Err(Error::Io) {
+        return false;
+    }
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = u64::MAX;
+    }
+    if volume.stat("/FAILED.DIR") != Err(Error::NotFound)
+        || fixture_fat_entry(1, 5) != Some(0)
+        || fixture_fat_entry(1025, 5) != Some(0)
+    {
+        return false;
+    }
+    if volume.mkdir("/MADE.DIR").is_err() {
+        return false;
+    }
+    let Ok(made_info) = volume.stat("/MADE.DIR") else {
+        return false;
+    };
+    if !made_info.directory || made_info.cluster != 5 {
+        return false;
+    }
+    let mut made_entries = [DirectoryEntry::EMPTY; 1];
+    if volume.read_dir("/MADE.DIR", &mut made_entries) != Ok(0) {
         return false;
     }
 
@@ -1291,6 +1637,11 @@ fn fixture_read_sector(lba: u64, output: &mut [u8; BYTES_PER_SECTOR]) -> bool {
 }
 
 fn fixture_write_sector(lba: u64, input: &[u8; BYTES_PER_SECTOR]) -> bool {
+    unsafe {
+        if lba == FIXTURE_FAIL_WRITE_LBA {
+            return false;
+        }
+    }
     match lba {
         1 => unsafe {
             (&mut *core::ptr::addr_of_mut!(FIXTURE_FAT_PRIMARY)).copy_from_slice(input);
@@ -1436,6 +1787,71 @@ fn encode_short_name(entry: &[u8; 32], output: &mut [u8]) -> Option<usize> {
         }
     }
     (length != 0).then_some(length)
+}
+
+fn encode_short_name_for_create(name: &str) -> Result<[u8; 11], Error> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." {
+        return Err(Error::InvalidPath);
+    }
+    let mut output = [b' '; 11];
+    let mut extension = false;
+    let mut base_length = 0;
+    let mut extension_length = 0;
+    for byte in bytes.iter().copied() {
+        if byte == b'.' {
+            if extension || base_length == 0 {
+                return Err(Error::InvalidPath);
+            }
+            extension = true;
+            continue;
+        }
+        if !is_short_name_byte(byte) {
+            return Err(Error::InvalidPath);
+        }
+        if extension {
+            if extension_length == 3 {
+                return Err(Error::InvalidPath);
+            }
+            output[8 + extension_length] = byte.to_ascii_uppercase();
+            extension_length += 1;
+        } else {
+            if base_length == 8 {
+                return Err(Error::InvalidPath);
+            }
+            output[base_length] = byte.to_ascii_uppercase();
+            base_length += 1;
+        }
+    }
+    if base_length == 0 || (extension && extension_length == 0) {
+        return Err(Error::InvalidPath);
+    }
+    Ok(output)
+}
+
+fn is_short_name_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'$'
+            | b'%'
+            | b'\''
+            | b'-'
+            | b'_'
+            | b'@'
+            | b'~'
+            | b'`'
+            | b'!'
+            | b'('
+            | b')'
+            | b'{'
+            | b'}'
+            | b'^'
+            | b'#'
+            | b'&'
+    )
 }
 
 fn short_name_matches(entry: &[u8; 32], target: &str) -> bool {

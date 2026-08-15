@@ -78,6 +78,15 @@ pub fn init() -> Status {
     current
 }
 
+pub fn current_id() -> usize {
+    // Owner tokens must be per-CPU; never cache this in a shared static.
+    if X2APIC_ACTIVE.load(Ordering::Acquire) {
+        unsafe { rdmsr(X2APIC_ID) as usize }
+    } else {
+        status().id as usize
+    }
+}
+
 pub fn status() -> Status {
     let features = cpuid(1, 0);
     let present = features.edx & (1 << 9) != 0;

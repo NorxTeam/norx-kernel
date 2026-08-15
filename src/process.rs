@@ -1,4 +1,5 @@
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::address::PhysAddr;
 
@@ -6,6 +7,7 @@ const MAX_PROCESSES: usize = 32;
 const MAX_THREADS: usize = 64;
 const MAX_PROCESS_THREADS: usize = 4;
 const MAX_FDS: usize = 32;
+const RUNTIME_LOCK_SPIN_LIMIT: usize = 1_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessId(u32);
@@ -1286,15 +1288,99 @@ impl Runtime {
     }
 }
 
-struct RuntimeCell(UnsafeCell<Runtime>);
+struct RuntimeLock {
+    owner: AtomicUsize,
+    depth: AtomicUsize,
+}
+
+impl RuntimeLock {
+    const fn new() -> Self {
+        Self {
+            owner: AtomicUsize::new(0),
+            depth: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_lock_for(&self, token: usize) -> Option<RuntimeLockGuard<'_>> {
+        if self.owner.load(Ordering::Acquire) == token {
+            self.depth.fetch_add(1, Ordering::Relaxed);
+            return Some(RuntimeLockGuard { lock: self, token });
+        }
+        if self
+            .owner
+            .compare_exchange(0, token, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.depth.store(1, Ordering::Relaxed);
+            return Some(RuntimeLockGuard { lock: self, token });
+        }
+        None
+    }
+
+    fn lock(&self) -> RuntimeLockGuard<'_> {
+        let token = crate::arch::cpu_id().saturating_add(1);
+        let mut spins = 0;
+        loop {
+            if let Some(guard) = self.try_lock_for(token) {
+                return guard;
+            }
+            if spins == RUNTIME_LOCK_SPIN_LIMIT {
+                // Deliberate fail-stop: a waiter cannot sleep or spin forever
+                // with local IRQs masked, including an interrupt-context bug.
+                panic!("process runtime lock contention");
+            }
+            spins += 1;
+            core::hint::spin_loop();
+        }
+    }
+}
+
+struct RuntimeLockGuard<'a> {
+    lock: &'a RuntimeLock,
+    token: usize,
+}
+
+impl Drop for RuntimeLockGuard<'_> {
+    fn drop(&mut self) {
+        debug_assert_eq!(self.lock.owner.load(Ordering::Relaxed), self.token);
+        if self.lock.depth.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.lock.owner.store(0, Ordering::Release);
+        }
+    }
+}
+
+// ponytail: one global lock is the bounded throughput ceiling; split ownership
+// only after SMP profiling proves this table is a contention hotspot.
+struct RuntimeCell {
+    lock: RuntimeLock,
+    runtime: UnsafeCell<Runtime>,
+}
+
+impl RuntimeCell {
+    const fn new() -> Self {
+        Self {
+            lock: RuntimeLock::new(),
+            runtime: UnsafeCell::new(Runtime::new()),
+        }
+    }
+}
 
 unsafe impl Sync for RuntimeCell {}
 
-static RUNTIME: RuntimeCell = RuntimeCell(UnsafeCell::new(Runtime::new()));
+static RUNTIME: RuntimeCell = RuntimeCell::new();
+
+fn with_runtime<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
+    // Mask local IRQs before taking the SMP lock: an IRQ on this CPU cannot
+    // re-enter the runtime while the guard is held. Re-entry from the same
+    // CPU is counted; foreign contenders spin only up to the fixed budget.
+    crate::arch::without_interrupts(|| {
+        let _guard = RUNTIME.lock.lock();
+        unsafe { f(&mut *RUNTIME.runtime.get()) }
+    })
+}
 
 pub fn init_runtime() -> bool {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         *runtime = Runtime::new();
         let Ok((process, thread)) = runtime.table.create_init() else {
             return false;
@@ -1311,24 +1397,19 @@ pub fn init_runtime() -> bool {
 
 #[allow(dead_code)]
 pub fn with_process_table<R>(f: impl FnOnce(&mut ProcessTable) -> R) -> R {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
-        f(&mut runtime.table)
-    })
+    with_runtime(|runtime| f(&mut runtime.table))
 }
 
 #[allow(dead_code)]
 pub fn spawn_child_current(credentials: Credentials) -> Result<(ProcessId, ThreadId), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let parent = runtime.current_process.ok_or(Error::InvalidState)?;
         runtime.table.spawn_child(parent, credentials)
     })
 }
 
 pub fn spawn_child_current_staged(credentials: Credentials) -> Result<SpawnTransaction, Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let parent = runtime.current_process.ok_or(Error::InvalidState)?;
         let (child, thread) = runtime.table.spawn_child_staged(parent, credentials)?;
         Ok(SpawnTransaction {
@@ -1340,16 +1421,14 @@ pub fn spawn_child_current_staged(credentials: Credentials) -> Result<SpawnTrans
 }
 
 pub fn current_credentials() -> Result<Credentials, Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &*RUNTIME.0.get();
+    with_runtime(|runtime| {
         let process = runtime.current_process.ok_or(Error::InvalidState)?;
         runtime.table.credentials(process)
     })
 }
 
 pub fn set_current_credentials(credentials: Credentials) -> Result<(), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let process = runtime.current_process.ok_or(Error::InvalidState)?;
         let current = runtime.table.credentials(process)?;
         let privileged = current.has_capability(Capability::SessionAdmin as u8);
@@ -1369,16 +1448,14 @@ pub fn set_current_credentials(credentials: Credentials) -> Result<(), Error> {
 }
 
 pub fn current_session() -> Result<SessionState, Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &*RUNTIME.0.get();
+    with_runtime(|runtime| {
         let process = runtime.current_process.ok_or(Error::InvalidState)?;
         runtime.table.session(process)
     })
 }
 
 pub fn set_current_session(credentials: Credentials, session: SessionState) -> Result<(), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let process = runtime.current_process.ok_or(Error::InvalidState)?;
         session.validate()?;
         let current_credentials = runtime.table.credentials(process)?;
@@ -1404,14 +1481,13 @@ pub fn set_current_session(credentials: Credentials, session: SessionState) -> R
 }
 
 pub fn current_process_id() -> Option<ProcessId> {
-    crate::arch::without_interrupts(|| unsafe { (&*RUNTIME.0.get()).current_process })
+    with_runtime(|runtime| runtime.current_process)
 }
 
 // ABI wrappers stay local until syscall dispatch is implemented in the next pass.
 #[allow(dead_code)]
 pub fn current_process_group_id() -> Option<ProcessId> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &*RUNTIME.0.get();
+    with_runtime(|runtime| {
         runtime
             .current_process
             .and_then(|process| runtime.table.get_process_group(process).ok())
@@ -1420,8 +1496,7 @@ pub fn current_process_group_id() -> Option<ProcessId> {
 
 #[allow(dead_code)]
 pub fn set_current_process_group(pgid: ProcessId) -> Result<(), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let process = runtime.current_process.ok_or(Error::InvalidState)?;
         runtime.table.set_process_group(process, pgid)
     })
@@ -1429,8 +1504,7 @@ pub fn set_current_process_group(pgid: ProcessId) -> Result<(), Error> {
 
 #[allow(dead_code)]
 pub fn raise_signal_to_current_group(signal: u8) -> Result<(), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let process = runtime.current_process.ok_or(Error::InvalidState)?;
         let pgid = runtime.table.get_process_group(process)?;
         runtime.table.raise_signal_to_group(pgid, signal)
@@ -1438,17 +1512,11 @@ pub fn raise_signal_to_current_group(signal: u8) -> Result<(), Error> {
 }
 
 pub fn attach_address_space(process: ProcessId, root: PhysAddr) -> Result<(), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        (&mut *RUNTIME.0.get())
-            .table
-            .attach_address_space(process, root)
-    })
+    with_runtime(|runtime| runtime.table.attach_address_space(process, root))
 }
 
 pub fn address_space_root(process: ProcessId) -> Result<Option<PhysAddr>, Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        (&*RUNTIME.0.get()).table.address_space_root(process)
-    })
+    with_runtime(|runtime| runtime.table.address_space_root(process))
 }
 
 pub fn handle_user_fault(fault: crate::vm::FaultInfo) -> crate::vm::FaultResult {
@@ -1465,14 +1533,11 @@ pub fn handle_user_fault(fault: crate::vm::FaultInfo) -> crate::vm::FaultResult 
 }
 
 pub fn clear_address_space(process: ProcessId) -> Result<(), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        (&mut *RUNTIME.0.get()).table.clear_address_space(process)
-    })
+    with_runtime(|runtime| runtime.table.clear_address_space(process))
 }
 
 pub fn restore_process(process: ProcessId) -> Result<ThreadId, Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         if runtime.current_thread.is_some() || runtime.current_process.is_some() {
             return Err(Error::InvalidState);
         }
@@ -1485,8 +1550,7 @@ pub fn restore_process(process: ProcessId) -> Result<ThreadId, Error> {
 }
 
 pub fn discard_child(parent: ProcessId, child: ProcessId) -> Result<(), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         if runtime.table.process_state(child)? == ProcessState::Creating {
             runtime.table.abort_child(parent, child)?;
         } else {
@@ -1499,8 +1563,7 @@ pub fn discard_child(parent: ProcessId, child: ProcessId) -> Result<(), Error> {
 
 #[allow(dead_code)]
 pub fn switch_to_user(process: ProcessId, thread: ThreadId) -> Result<(), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let current = runtime.current_thread.ok_or(Error::InvalidState)?;
         if runtime.table.thread_owner(thread)? != Some(process)
             || runtime.table.thread_kind(thread)? != ThreadKind::User
@@ -1514,8 +1577,7 @@ pub fn switch_to_user(process: ProcessId, thread: ThreadId) -> Result<(), Error>
 
 #[allow(dead_code)]
 pub fn restore_init() -> Result<(), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         if runtime.current_thread.is_some() {
             return Err(Error::InvalidState);
         }
@@ -1528,8 +1590,7 @@ pub fn restore_init() -> Result<(), Error> {
 }
 
 pub fn restore_init_after_user() -> Result<(), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         if runtime.current_thread.is_some() || runtime.current_process.is_some() {
             return Err(Error::InvalidState);
         }
@@ -1543,8 +1604,7 @@ pub fn restore_init_after_user() -> Result<(), Error> {
 }
 
 pub fn current_ids() -> Option<(u32, u32)> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &*RUNTIME.0.get();
+    with_runtime(|runtime| {
         Some((
             runtime.current_process?.get(),
             runtime.current_thread?.get(),
@@ -1553,8 +1613,7 @@ pub fn current_ids() -> Option<(u32, u32)> {
 }
 
 pub fn exit_current(status: i32) -> Result<Option<ContextSwitch>, Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let process = runtime.current_process.ok_or(Error::InvalidState)?;
         let thread = runtime.current_thread.ok_or(Error::InvalidState)?;
         if process == ProcessId::INIT {
@@ -1587,12 +1646,11 @@ pub fn exit_current(status: i32) -> Result<Option<ContextSwitch>, Error> {
 }
 
 pub fn init_exit_status() -> Option<i32> {
-    crate::arch::without_interrupts(|| unsafe { (&*RUNTIME.0.get()).init_exit_status })
+    with_runtime(|runtime| runtime.init_exit_status)
 }
 
 pub fn wait_current(child: Option<u32>) -> Result<(u32, i32), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let parent = runtime.current_process.ok_or(Error::InvalidState)?;
         let child = child.map(ProcessId::from_raw);
         let (process, status) = runtime.table.wait(parent, child)?;
@@ -1602,8 +1660,7 @@ pub fn wait_current(child: Option<u32>) -> Result<(u32, i32), Error> {
 }
 
 pub fn peek_wait_current(child: Option<u32>) -> Result<(u32, i32), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &*RUNTIME.0.get();
+    with_runtime(|runtime| {
         let parent = runtime.current_process.ok_or(Error::InvalidState)?;
         let child = child.map(ProcessId::from_raw);
         let (process, status) = runtime.table.peek_wait(parent, child)?;
@@ -1612,8 +1669,7 @@ pub fn peek_wait_current(child: Option<u32>) -> Result<(u32, i32), Error> {
 }
 
 pub fn close_current(fd: u32) -> Result<(), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let process = runtime.current_process.ok_or(Error::InvalidState)?;
         runtime
             .table
@@ -1627,8 +1683,7 @@ pub fn open_current_fd(
     readable: bool,
     writable: bool,
 ) -> Result<u32, Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let process = runtime.current_process.ok_or(Error::InvalidState)?;
         Ok(runtime
             .table
@@ -1638,16 +1693,14 @@ pub fn open_current_fd(
 }
 
 pub fn current_fd_info(fd: u32) -> Result<(u32, bool, bool, bool, bool), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &*RUNTIME.0.get();
+    with_runtime(|runtime| {
         let process = runtime.current_process.ok_or(Error::InvalidState)?;
         runtime.table.fd_info(process, FileDescriptor::from_raw(fd))
     })
 }
 
 pub fn set_close_on_exec_current(fd: u32, enabled: bool) -> Result<(), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let process = runtime.current_process.ok_or(Error::InvalidState)?;
         runtime
             .table
@@ -1656,8 +1709,7 @@ pub fn set_close_on_exec_current(fd: u32, enabled: bool) -> Result<(), Error> {
 }
 
 pub fn duplicate_fd_current(old_fd: u32, new_fd: u32) -> Result<u32, Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let process = runtime.current_process.ok_or(Error::InvalidState)?;
         runtime.table.duplicate_fd(
             process,
@@ -1708,8 +1760,7 @@ fn release_open_file(open_file: u32) {
 }
 
 pub fn current_fd_access(fd: u32) -> Result<(bool, bool, bool), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &*RUNTIME.0.get();
+    with_runtime(|runtime| {
         let process = runtime.current_process.ok_or(Error::InvalidState)?;
         runtime
             .table
@@ -1718,8 +1769,7 @@ pub fn current_fd_access(fd: u32) -> Result<(bool, bool, bool), Error> {
 }
 
 pub fn yield_current() -> Result<Option<ContextSwitch>, Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let current = runtime.current_thread.ok_or(Error::InvalidState)?;
         if !crate::arch::has_user_context(current.get()) {
             return Ok(None);
@@ -1738,8 +1788,7 @@ pub fn yield_current() -> Result<Option<ContextSwitch>, Error> {
 }
 
 pub fn commit_user_switch(from: u32, to: u32) -> Result<PhysAddr, Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let from = ThreadId::from_raw(from);
         let to = ThreadId::from_raw(to);
         if runtime.current_thread != Some(from) || runtime.current_process.is_none() {
@@ -1761,8 +1810,7 @@ pub fn commit_user_switch(from: u32, to: u32) -> Result<PhysAddr, Error> {
 
 #[allow(dead_code)]
 pub fn user_thread_root(thread: u32) -> Result<PhysAddr, Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &*RUNTIME.0.get();
+    with_runtime(|runtime| {
         let process = runtime
             .table
             .thread_process(ThreadId::from_raw(thread))?
@@ -1797,8 +1845,7 @@ pub fn inherit_spawn_fds(
     source_fds: [u32; 3],
     inherit_open_fds: bool,
 ) -> Result<(), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let inherit = if inherit_open_fds {
             ProcessTable::inherit_open_fds
         } else {
@@ -1814,8 +1861,7 @@ pub fn inherit_spawn_fds(
 }
 
 pub fn publish_spawn(transaction: SpawnTransaction) -> Result<(), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         runtime
             .table
             .publish_child(transaction.child, transaction.thread)
@@ -1826,8 +1872,7 @@ pub fn set_process_group_for_spawn(
     transaction: SpawnTransaction,
     pgid: ProcessId,
 ) -> Result<(), Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         runtime
             .table
             .set_process_group_for_child(transaction.parent, transaction.child, pgid)
@@ -1835,8 +1880,7 @@ pub fn set_process_group_for_spawn(
 }
 
 pub fn sleep_current(duration: u64) -> Result<Option<ContextSwitch>, Error> {
-    crate::arch::without_interrupts(|| unsafe {
-        let runtime = &mut *RUNTIME.0.get();
+    with_runtime(|runtime| {
         let current = runtime.current_thread.ok_or(Error::InvalidState)?;
         if duration == 0 || !crate::arch::has_user_context(current.get()) {
             return Ok(None);
@@ -1859,12 +1903,34 @@ pub fn sleep_current(duration: u64) -> Result<Option<ContextSwitch>, Error> {
 }
 
 pub fn wake_sleepers(now: u64) {
-    crate::arch::without_interrupts(|| unsafe {
-        (&mut *RUNTIME.0.get()).table.wake_sleepers(now);
+    with_runtime(|runtime| {
+        runtime.table.wake_sleepers(now);
     });
 }
 
 pub fn contract_self_check() {
+    let lock = RuntimeLock::new();
+    let first = lock
+        .try_lock_for(1)
+        .unwrap_or_else(|| panic!("runtime lock acquire"));
+    assert_eq!(lock.owner.load(Ordering::Relaxed), 1);
+    assert_eq!(lock.depth.load(Ordering::Relaxed), 1);
+    let nested = lock
+        .try_lock_for(1)
+        .unwrap_or_else(|| panic!("runtime lock re-entry"));
+    assert_eq!(lock.depth.load(Ordering::Relaxed), 2);
+    assert!(lock.try_lock_for(2).is_none());
+    drop(nested);
+    assert_eq!(lock.depth.load(Ordering::Relaxed), 1);
+    assert!(lock.try_lock_for(2).is_none());
+    drop(first);
+    assert_eq!(lock.owner.load(Ordering::Relaxed), 0);
+    let foreign = lock
+        .try_lock_for(2)
+        .unwrap_or_else(|| panic!("runtime lock release"));
+    drop(foreign);
+    assert_eq!(with_runtime(|_| current_process_id()), None);
+
     let _ = (
         ProcessState::Reaped,
         ThreadState::Blocked,

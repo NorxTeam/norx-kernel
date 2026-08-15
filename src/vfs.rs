@@ -229,7 +229,7 @@ impl PersistentBackendKind {
     }
 
     pub const fn read_only(self) -> bool {
-        true
+        matches!(self, Self::Ext4 | Self::Btrfs)
     }
 }
 
@@ -534,9 +534,15 @@ enum PersistentBackend {
 impl PersistentBackend {
     fn probe(source: PersistentBackendKind) -> Result<Self, Error> {
         match source {
-            PersistentBackendKind::Fat32 => fat32::probe_block()
-                .map(Self::Fat32)
-                .map_err(map_fat32_error),
+            PersistentBackendKind::Fat32 => {
+                let mount =
+                    if crate::drivers::block::persistent() && !crate::drivers::block::read_only() {
+                        fat32::probe_block_rw()
+                    } else {
+                        fat32::probe_block()
+                    };
+                mount.map(Self::Fat32).map_err(map_fat32_error)
+            }
             PersistentBackendKind::Ext4 => {
                 ext4::probe_block().map(Self::Ext4).map_err(map_ext4_error)
             }
@@ -551,6 +557,50 @@ impl PersistentBackend {
             Self::Fat32(_) => PersistentBackendKind::Fat32,
             Self::Ext4(_) => PersistentBackendKind::Ext4,
             Self::Btrfs(_) => PersistentBackendKind::Btrfs,
+        }
+    }
+
+    fn read_only(self) -> bool {
+        match self {
+            Self::Fat32(mount) => mount.geometry().read_only,
+            Self::Ext4(mount) => mount.geometry().read_only,
+            Self::Btrfs(mount) => mount.geometry().read_only,
+        }
+    }
+
+    fn write_file(self, path: &str, input: &[u8]) -> Result<usize, Error> {
+        match self {
+            Self::Fat32(mount) => mount.write_file(path, input).map_err(map_fat32_error),
+            Self::Ext4(mount) => mount.write_file(path, input).map_err(map_ext4_error),
+            Self::Btrfs(mount) => mount.write_file(path, input).map_err(map_btrfs_error),
+        }
+    }
+
+    fn create_file(self, path: &str) -> Result<(), Error> {
+        match self {
+            Self::Fat32(mount) => mount.create_file(path).map_err(map_fat32_error),
+            Self::Ext4(_) | Self::Btrfs(_) => Err(Error::ReadOnly),
+        }
+    }
+
+    fn mkdir(self, path: &str) -> Result<(), Error> {
+        match self {
+            Self::Fat32(mount) => mount.mkdir(path).map_err(map_fat32_error),
+            Self::Ext4(_) | Self::Btrfs(_) => Err(Error::ReadOnly),
+        }
+    }
+
+    fn unlink(self, path: &str) -> Result<(), Error> {
+        match self {
+            Self::Fat32(mount) => mount.unlink(path).map_err(map_fat32_error),
+            Self::Ext4(_) | Self::Btrfs(_) => Err(Error::ReadOnly),
+        }
+    }
+
+    fn rename(self, old_path: &str, new_path: &str) -> Result<(), Error> {
+        match self {
+            Self::Fat32(mount) => mount.rename(old_path, new_path).map_err(map_fat32_error),
+            Self::Ext4(_) | Self::Btrfs(_) => Err(Error::ReadOnly),
         }
     }
 
@@ -681,14 +731,14 @@ impl PersistentBackend {
 #[derive(Clone, Copy)]
 pub struct PersistentMount {
     backend: PersistentBackend,
+    writable: bool,
 }
 
 impl PersistentMount {
-    /// Open a bounded first partition through an existing filesystem reader.
-    /// No persistent inode or file contents are copied into the RAMFS tables.
-    fn open(source: PersistentBackendKind) -> Result<Self, Error> {
+    fn open_with_access(source: PersistentBackendKind, writable: bool) -> Result<Self, Error> {
         Ok(Self {
             backend: PersistentBackend::probe(source)?,
+            writable,
         })
     }
 
@@ -700,8 +750,8 @@ impl PersistentMount {
         self.kind().source()
     }
 
-    pub const fn read_only(self) -> bool {
-        true
+    pub fn read_only(self) -> bool {
+        !self.writable || self.backend.read_only()
     }
 
     pub fn read_file(self, path: &str, output: &mut [u8]) -> Result<usize, Error> {
@@ -719,8 +769,45 @@ impl PersistentMount {
         self.backend.read_dir(path, output)
     }
 
-    pub fn write_file(self, _path: &str, _input: &[u8]) -> Result<usize, Error> {
-        Err(Error::ReadOnly)
+    pub fn write_file(self, path: &str, input: &[u8]) -> Result<usize, Error> {
+        validate_persistent_path(path)?;
+        if self.read_only() {
+            return Err(Error::ReadOnly);
+        }
+        self.backend.write_file(path, input)
+    }
+
+    fn create_file(self, path: &str) -> Result<(), Error> {
+        validate_persistent_path(path)?;
+        if self.read_only() {
+            return Err(Error::ReadOnly);
+        }
+        self.backend.create_file(path)
+    }
+
+    fn mkdir(self, path: &str) -> Result<(), Error> {
+        validate_persistent_path(path)?;
+        if self.read_only() {
+            return Err(Error::ReadOnly);
+        }
+        self.backend.mkdir(path)
+    }
+
+    fn unlink(self, path: &str) -> Result<(), Error> {
+        validate_persistent_path(path)?;
+        if self.read_only() {
+            return Err(Error::ReadOnly);
+        }
+        self.backend.unlink(path)
+    }
+
+    fn rename(self, old_path: &str, new_path: &str) -> Result<(), Error> {
+        validate_persistent_path(old_path)?;
+        validate_persistent_path(new_path)?;
+        if self.read_only() {
+            return Err(Error::ReadOnly);
+        }
+        self.backend.rename(old_path, new_path)
     }
 }
 
@@ -891,7 +978,7 @@ pub fn contract_self_check() {
     assert!(validate_persistent_path("/bounded/path").is_ok());
     assert!(validate_persistent_path("relative").is_err());
     assert_eq!(validate_persistent_path("/a/../b"), Err(Error::InvalidPath));
-    assert!(PersistentBackendKind::Fat32.read_only());
+    assert!(!PersistentBackendKind::Fat32.read_only());
     assert!(PersistentBackendKind::Ext4.read_only());
     assert!(PersistentBackendKind::Btrfs.read_only());
     let mut persistent_path = PersistentPath::ROOT;
@@ -1040,7 +1127,15 @@ pub fn mount_in_namespace(
     propagation: Propagation,
 ) -> Result<MountId, Error> {
     with_fs(|fs| {
-        if source.is_persistent() && !flags.read_only {
+        let persistent_backend = if source.is_persistent() {
+            Some(PersistentMount::open_with_access(
+                source.persistent_kind().ok_or(Error::InvalidMountTarget)?,
+                !flags.read_only,
+            )?)
+        } else {
+            None
+        };
+        if !flags.read_only && persistent_backend.is_some_and(|backend| backend.read_only()) {
             return Err(Error::ReadOnly);
         }
         let (parent, parent_inode, name) = match parent_and_name_mount(fs, target, namespace) {
@@ -1065,11 +1160,10 @@ pub fn mount_in_namespace(
         let Some((index, node)) = mounts.iter_mut().enumerate().find(|(_, node)| !node.used) else {
             return Err(Error::NoSpace);
         };
-        let backend = match source {
-            MountSource::Ramfs => MountedBackend::Ramfs,
-            _ => MountedBackend::Persistent(PersistentMount::open(
-                source.persistent_kind().ok_or(Error::InvalidMountTarget)?,
-            )?),
+        let backend = match (source, persistent_backend) {
+            (MountSource::Ramfs, None) => MountedBackend::Ramfs,
+            (_, Some(backend)) => MountedBackend::Persistent(backend),
+            _ => return Err(Error::InvalidMountTarget),
         };
         *node = MountNode {
             used: true,
@@ -1293,23 +1387,48 @@ pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
         if options.truncate && !options.write {
             return Err(Error::PermissionDenied);
         }
+        if options.append && !options.write {
+            return Err(Error::PermissionDenied);
+        }
         if let Some((mount, persistent_path)) = locate_persistent_path(fs, path, NamespaceId::ROOT)?
         {
-            if options.write
-                || options.create
-                || options.truncate
-                || options.append
-                || !options.read
-            {
+            let path_str = persistent_path.as_str()?;
+            let backend = persistent_backend(mount)?;
+            let writable = !mount_flags(mount)?.read_only && !backend.read_only();
+            if options.write && !writable {
                 return Err(Error::ReadOnly);
             }
-            let path_str = persistent_path.as_str()?;
-            let info = persistent_backend(mount)?.stat(path_str)?;
+            if options.create && !writable && options.write {
+                return Err(Error::ReadOnly);
+            }
+            if !options.read && !options.write {
+                return Err(Error::PermissionDenied);
+            }
+            let info = match backend.stat(path_str) {
+                Ok(info) => {
+                    if options.create && options.exclusive {
+                        return Err(Error::AlreadyExists);
+                    }
+                    info
+                }
+                Err(Error::NotFound) if options.create && writable => {
+                    backend.create_file(path_str)?;
+                    backend.stat(path_str)?
+                }
+                Err(Error::NotFound) if options.create => return Err(Error::ReadOnly),
+                Err(error) => return Err(error),
+            };
             if info.kind == NodeType::Directory {
                 return Err(Error::IsDirectory);
             }
-            if info.mode & 0o444 == 0 {
+            if options.read && info.mode & 0o444 == 0 {
                 return Err(Error::PermissionDenied);
+            }
+            if options.write && info.mode & 0o222 == 0 {
+                return Err(Error::PermissionDenied);
+            }
+            if options.truncate {
+                backend.write_file(path_str, &[])?;
             }
             let slot = fs
                 .handles
@@ -1329,9 +1448,9 @@ pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
             }
             handle.references = 1;
             handle.offset = 0;
-            handle.readable = true;
-            handle.writable = false;
-            handle.append = false;
+            handle.readable = options.read;
+            handle.writable = options.write;
+            handle.append = options.append;
             fs.open_count += 1;
             return Ok(FileHandle {
                 slot: slot as u8,
@@ -1513,6 +1632,41 @@ pub fn write_handle(handle: FileHandle, input: &[u8]) -> Result<usize, Error> {
         if !fs.handles[slot].writable {
             return Err(Error::PermissionDenied);
         }
+        if fs.handles[slot].persistent {
+            let description = fs.handles[slot];
+            let path = PersistentPath {
+                bytes: description.path,
+                length: description.path_length,
+            };
+            let path_str = path.as_str()?;
+            let backend = persistent_backend(mount)?;
+            if backend.read_only() {
+                return Err(Error::ReadOnly);
+            }
+            let info = backend.stat(path_str)?;
+            if info.kind == NodeType::Directory {
+                return Err(Error::IsDirectory);
+            }
+            let mut data = [0u8; FILE_MAX];
+            let length = backend.read_file(path_str, &mut data)?;
+            let offset = if description.append {
+                length
+            } else {
+                description.offset
+            };
+            let end = offset.checked_add(input.len()).ok_or(Error::NoSpace)?;
+            if end > FILE_MAX {
+                return Err(Error::NoSpace);
+            }
+            if offset > length {
+                data[length..offset].fill(0);
+            }
+            data[offset..end].copy_from_slice(input);
+            let new_length = length.max(end);
+            backend.write_file(path_str, &data[..new_length])?;
+            fs.handles[slot].offset = end;
+            return Ok(input.len());
+        }
         let inode_id = fs.handles[slot].inode;
         let append = fs.handles[slot].append;
         let current_offset = fs.handles[slot].offset;
@@ -1652,6 +1806,9 @@ pub fn chmod(path: &str, mode: u16) -> Result<(), Error> {
 pub fn fchmod(handle: FileHandle, mode: u16) -> Result<(), Error> {
     with_fs(|fs| {
         let slot = validate_handle(fs, &handle)?;
+        if fs.handles[slot].persistent {
+            return Err(Error::ReadOnly);
+        }
         let mount = fs.handles[slot].mount;
         if mount_flags(mount)?.read_only {
             return Err(Error::ReadOnly);
@@ -1667,8 +1824,14 @@ pub fn mkdir(path: &str) -> Result<(), Error> {
 
 pub fn mkdir_with_mode(path: &str, mode: u16) -> Result<(), Error> {
     with_fs(|fs| {
-        if locate_persistent_path(fs, path, NamespaceId::ROOT)?.is_some() {
-            return Err(Error::ReadOnly);
+        if let Some((mount, persistent_path)) = locate_persistent_path(fs, path, NamespaceId::ROOT)?
+        {
+            let backend = persistent_backend(mount)?;
+            if mount_flags(mount)?.read_only || backend.read_only() {
+                return Err(Error::ReadOnly);
+            }
+            let _ = mode;
+            return backend.mkdir(persistent_path.as_str()?);
         }
         let (mount, parent, name) = parent_and_name_mount(fs, path, NamespaceId::ROOT)?;
         if mount_flags(mount)?.read_only {
@@ -1680,8 +1843,13 @@ pub fn mkdir_with_mode(path: &str, mode: u16) -> Result<(), Error> {
 
 pub fn unlink(path: &str) -> Result<(), Error> {
     with_fs(|fs| {
-        if locate_persistent_path(fs, path, NamespaceId::ROOT)?.is_some() {
-            return Err(Error::ReadOnly);
+        if let Some((mount, persistent_path)) = locate_persistent_path(fs, path, NamespaceId::ROOT)?
+        {
+            let backend = persistent_backend(mount)?;
+            if mount_flags(mount)?.read_only || backend.read_only() {
+                return Err(Error::ReadOnly);
+            }
+            return backend.unlink(persistent_path.as_str()?);
         }
         let (mount, parent, name) = parent_and_name_mount(fs, path, NamespaceId::ROOT)?;
         if mount_flags(mount)?.read_only {
@@ -1707,8 +1875,14 @@ pub fn unlink(path: &str) -> Result<(), Error> {
 
 pub fn remove_dir(path: &str) -> Result<(), Error> {
     with_fs(|fs| {
-        if locate_persistent_path(fs, path, NamespaceId::ROOT)?.is_some() {
-            return Err(Error::ReadOnly);
+        if let Some((mount, _persistent_path)) =
+            locate_persistent_path(fs, path, NamespaceId::ROOT)?
+        {
+            let backend = persistent_backend(mount)?;
+            if mount_flags(mount)?.read_only || backend.read_only() {
+                return Err(Error::ReadOnly);
+            }
+            return Err(Error::BackendUnsupported);
         }
         let (mount, parent, name) = parent_and_name_mount(fs, path, NamespaceId::ROOT)?;
         if mount_flags(mount)?.read_only {
@@ -1733,10 +1907,23 @@ pub fn remove_dir(path: &str) -> Result<(), Error> {
 
 pub fn rename(old_path: &str, new_path: &str) -> Result<(), Error> {
     with_fs(|fs| {
-        if locate_persistent_path(fs, old_path, NamespaceId::ROOT)?.is_some()
-            || locate_persistent_path(fs, new_path, NamespaceId::ROOT)?.is_some()
-        {
-            return Err(Error::ReadOnly);
+        let old_persistent = locate_persistent_path(fs, old_path, NamespaceId::ROOT)?;
+        let new_persistent = locate_persistent_path(fs, new_path, NamespaceId::ROOT)?;
+        if old_persistent.is_some() || new_persistent.is_some() {
+            let Some((old_mount, old_path)) = old_persistent else {
+                return Err(Error::InvalidPath);
+            };
+            let Some((new_mount, new_path)) = new_persistent else {
+                return Err(Error::InvalidPath);
+            };
+            if old_mount != new_mount {
+                return Err(Error::InvalidPath);
+            }
+            let backend = persistent_backend(old_mount)?;
+            if mount_flags(old_mount)?.read_only || backend.read_only() {
+                return Err(Error::ReadOnly);
+            }
+            return backend.rename(old_path.as_str()?, new_path.as_str()?);
         }
         let (old_mount, old_parent, old_name) =
             parent_and_name_mount(fs, old_path, NamespaceId::ROOT)?;
@@ -2329,6 +2516,7 @@ fn map_fat32_error(error: crate::fat32::Error) -> Error {
     match error {
         crate::fat32::Error::InvalidPath => Error::InvalidPath,
         crate::fat32::Error::NotFound => Error::NotFound,
+        crate::fat32::Error::AlreadyExists => Error::AlreadyExists,
         crate::fat32::Error::NotDirectory => Error::NotDirectory,
         crate::fat32::Error::IsDirectory => Error::IsDirectory,
         crate::fat32::Error::BufferTooSmall => Error::BackendError,
@@ -2337,6 +2525,7 @@ fn map_fat32_error(error: crate::fat32::Error) -> Error {
         | crate::fat32::Error::InvalidBpb
         | crate::fat32::Error::BadClusterChain
         | crate::fat32::Error::InvalidPersistenceRecord => Error::BackendError,
+        crate::fat32::Error::Unsupported => Error::BackendUnsupported,
         crate::fat32::Error::NoSpace => Error::NoSpace,
         _ => Error::BackendError,
     }

@@ -44,16 +44,20 @@ QEMU smoke, not that the subsystem is production-ready.
 
 The current storage increment adds bounded FAT32 allocation/free-chain updates for
 existing files, mirrored-FAT consistency checks, metadata enumeration for all
-three persistent readers, and an explicit read-only `PersistentMount` reader
-boundary. Mounted persistent paths now dispatch through VFS for lookup,
-read-only open/read/lseek/stat/fstat/read_dir, and block-backed fsync/flush;
-contents are not imported into RAMFS. Directory creation/deletion/rename,
-journaling, writes for ext4/btrfs, partial I/O for files larger than the bounded
-`FILE_MAX`, and SMP-grade concurrent spawn execution remain deferred.
+three persistent readers, and an access-checked `PersistentMount` boundary. A
+writable FAT32 VFS mount can now rewrite bounded existing files and perform short
+8.3 create/mkdir, empty-file unlink, and same-directory rename; each operation
+publishes only after sector readback. Mounted ext4/btrfs paths remain read-only,
+and all persistent writes require the block flush boundary. Directory-chain
+growth, long-name/timestamp metadata, full rmdir semantics, journaling, partial
+I/O for files larger than bounded `FILE_MAX`, and full POSIX path coverage remain
+deferred. Process runtime table access is now serialized by a reentrant
+per-CPU-token SMP lock with a bounded fail-stop contention ceiling.
 
 The table's deferred persistent-storage item refers to process-attached mount
-namespaces and the write-capable POSIX filesystem surface; the read-only mounted
-path/handle dispatch and block flush boundary described above are published.
+namespaces and the full write-capable POSIX filesystem surface; the bounded FAT32
+slice, read-only ext4/btrfs mounted path/handle dispatch, and block flush boundary
+described above are published.
 Boot now attempts the first valid persistent reader at `/storage`; its bounded
 VFS smoke is optional when no persistent block device is present and rolls back
 the mount if lookup, metadata, I/O, or reopen checks fail.
