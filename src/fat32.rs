@@ -21,6 +21,7 @@ pub enum Error {
     BufferTooSmall,
     NoSpace,
     ReadOnly,
+    InvalidPersistenceRecord,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,7 +220,7 @@ impl Mount {
             sectors_per_cluster: self.sectors_per_cluster,
             cluster_count: self.cluster_count,
             root_cluster: self.root_cluster,
-            read_only: true,
+            read_only: self.writer.is_none(),
         }
     }
 
@@ -455,6 +456,47 @@ pub fn probe_ramdisk() -> Result<Mount, Error> {
     Mount::open(ramdisk_read_sector)
 }
 
+pub fn probe_block_rw() -> Result<Mount, Error> {
+    Mount::open_rw(ramdisk_read_sector, ramdisk_write_sector)
+}
+
+pub const PERSISTENCE_FILE: &str = "/NORX.PST";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PersistenceStatus {
+    pub previous_sequence: u64,
+    pub sequence: u64,
+}
+
+pub fn fixed_file_persistence_check() -> Result<PersistenceStatus, Error> {
+    if !block::persistent() || block::read_only() {
+        return Err(Error::ReadOnly);
+    }
+    let volume = probe_block_rw()?;
+    let mut record = [0u8; BYTES_PER_SECTOR];
+    let length = volume.read_file(PERSISTENCE_FILE, &mut record)?;
+    if length != record.len() {
+        return Err(Error::InvalidPersistenceRecord);
+    }
+    let previous_sequence = u64::from_le_bytes(record[..8].try_into().unwrap());
+    let sequence = previous_sequence
+        .checked_add(1)
+        .ok_or(Error::InvalidPersistenceRecord)?;
+    record[..8].copy_from_slice(&sequence.to_le_bytes());
+    volume.write_file(PERSISTENCE_FILE, &record)?;
+    block::flush_cache().map_err(|_| Error::Io)?;
+    let mut verify = [0u8; BYTES_PER_SECTOR];
+    if volume.read_file(PERSISTENCE_FILE, &mut verify)? != record.len()
+        || verify[..8] != record[..8]
+    {
+        return Err(Error::Io);
+    }
+    Ok(PersistenceStatus {
+        previous_sequence,
+        sequence,
+    })
+}
+
 pub fn contract_self_check() {
     assert!(fixture_check());
 }
@@ -463,6 +505,12 @@ fn ramdisk_read_sector(lba: u64, output: &mut [u8; BYTES_PER_SECTOR]) -> bool {
     usize::try_from(lba)
         .ok()
         .is_some_and(|lba| block::read_sector(lba, output))
+}
+
+fn ramdisk_write_sector(lba: u64, input: &[u8; BYTES_PER_SECTOR]) -> bool {
+    usize::try_from(lba)
+        .ok()
+        .is_some_and(|lba| block::write_sector(lba, input))
 }
 
 static mut FIXTURE_DIRECTORY: [u8; BYTES_PER_SECTOR] = [0; BYTES_PER_SECTOR];
@@ -487,6 +535,9 @@ fn fixture_check() -> bool {
     let Ok(volume) = Mount::open_rw(fixture_read_sector, fixture_write_sector) else {
         return false;
     };
+    if volume.geometry().read_only {
+        return false;
+    }
     let mut output = [0u8; 32];
     let Ok(length) = volume.read_file("/Long Name.txt", &mut output) else {
         return false;

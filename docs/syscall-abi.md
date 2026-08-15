@@ -57,21 +57,22 @@ are frozen so kernel, Rust, and C implementations cannot drift:
 and reserved word. `SpawnSpec` is eleven 64-bit words containing copied path,
 argument/environment vectors, stdio fds, process group, and flags. Open flags
 are `READ`, `WRITE`, `CREATE`, `TRUNCATE`, `APPEND`, and `EXCLUSIVE`;
-`EXCLUSIVE` requires `CREATE` and fails if the path already exists. `fsync`
-is the file durability boundary and `sync_path` is the publication boundary;
-the current RAMFS backend validates these boundaries and later block-backed
-filesystems must attach actual persistence there. Rename replaces an existing
-regular, unopened destination atomically and refuses directories or open
-destinations. Spawn flags are
+`EXCLUSIVE` requires `CREATE` and fails if the path already exists. `fsync` and
+`sync_path` validate their descriptor/path and return `-ENOTSUP` until a
+block-backed filesystem provides a real flush/publication implementation; the
+volatile RAMFS never claims durability. Rename replaces an existing regular,
+unopened destination atomically and refuses directories or open destinations.
+Spawn flags are
 `NEW_PROCESS_GROUP` and `FOREGROUND`.
 
 The kernel implements bounded `open`, VFS-backed `read`/`write`/`close`,
 `pipe`, `dup2`, synchronous `wait_status`, process-group authorization, a
 single serial controlling-TTY ownership backend, a static-image `spawn2`, and a
-bounded `spawn_delegated`
-path that copies bounded argv/environment strings, inherits requested standard
-descriptors, publishes a ready child, and switches through a cooperative
-syscall-boundary continuation. The filesystem extension exposes regular files
+bounded `spawn_delegated` path that copies bounded argv/environment strings,
+stages the child until runtime and standard-descriptor setup succeeds, publishes
+a ready child, and switches through a cooperative syscall-boundary continuation.
+The current ABI inherits only the explicitly requested standard descriptors;
+arbitrary parent FDs are not copied. The filesystem extension exposes regular files
 and directories, fixed-size metadata, hard links, and bounded directory
 records. Symlink nodes, locale state, and host I/O are not part of this ABI.
 

@@ -171,7 +171,7 @@ pub fn contract_self_check() {
     let processes = unsafe { &mut *core::ptr::addr_of_mut!(EXEC_TEST_TABLE) };
     let (owner, thread) = processes.create_init().unwrap();
     processes.switch_to(None, thread).unwrap();
-    let fd = processes.open_fd(owner, 9, true, false).unwrap();
+    let fd = processes.open_fd(owner, 1, true, false).unwrap();
     processes.set_close_on_exec(owner, fd, true).unwrap();
     contract_success(processes, owner, fd, image, &plan, &arguments, &environment);
     contract_rollback(processes, owner, &plan, &arguments, &environment);

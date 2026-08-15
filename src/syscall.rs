@@ -810,6 +810,14 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 let _ = crate::user_runtime::discard(child_id);
                 return Errno::Eperm.return_value();
             }
+            if crate::process::publish_child(child_id).is_err() {
+                let parent = crate::process::current_process_id();
+                if let Some(parent) = parent {
+                    let _ = crate::process::discard_child(parent, child_id);
+                }
+                let _ = crate::user_runtime::discard(child_id);
+                return Errno::Eagain.return_value();
+            }
             child as UserWord
         }
         value if value == Number::SpawnDelegated as UserWord => {
@@ -1056,7 +1064,11 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Ok(mode) => mode & 0o777,
                 Err(_) => return Errno::Einval.return_value(),
             };
-            match crate::vfs::mkdir_with_mode(path, mode) {
+            let umask = match crate::process::current_session() {
+                Ok(session) => session.umask,
+                Err(_) => return Errno::Einval.return_value(),
+            };
+            match crate::vfs::mkdir_with_mode(path, mode & !umask) {
                 Ok(()) => 0,
                 Err(error) => vfs_errno(error).return_value(),
             }
@@ -1205,20 +1217,14 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Ok(fd) => fd,
                 Err(_) => return Errno::Ebadf.return_value(),
             };
-            let (open_file, _, _, writable) = match current_fd_info(fd) {
+            let (_, _, _, writable) = match current_fd_info(fd) {
                 Ok(info) => info,
                 Err(errno) => return errno.return_value(),
             };
             if !writable {
                 return Errno::Ebadf.return_value();
             }
-            match crate::vfs::FileHandle::from_raw(open_file)
-                .ok_or(crate::vfs::Error::InvalidHandle)
-                .and_then(|_| Ok(()))
-            {
-                Ok(()) => 0,
-                Err(error) => vfs_errno(error).return_value(),
-            }
+            Errno::Enotsup.return_value()
         }
         value if value == Number::SyncPath as UserWord => {
             let mut path_bytes = [0u8; MAX_PATH];
@@ -1227,7 +1233,7 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Err(errno) => return errno.return_value(),
             };
             match crate::vfs::sync_path(path) {
-                Ok(()) => 0,
+                Ok(()) => Errno::Enotsup.return_value(),
                 Err(error) => vfs_errno(error).return_value(),
             }
         }
@@ -1590,6 +1596,10 @@ fn finalize_spawn(
         discard_spawn(child_id);
         return Err(());
     }
+    if crate::process::publish_child(child_id).is_err() {
+        discard_spawn(child_id);
+        return Err(());
+    }
     Ok(())
 }
 
@@ -1736,7 +1746,7 @@ pub fn runtime_contract_self_check() {
     );
     let source_fd = crate::process::with_process_table(|table| {
         table
-            .open_fd(crate::process::ProcessId::INIT, 99, true, true)
+            .open_fd(crate::process::ProcessId::INIT, 1, true, true)
             .unwrap()
             .get()
     });
@@ -1768,6 +1778,15 @@ pub fn runtime_contract_self_check() {
             },
         ),
         0
+    );
+    assert_eq!(
+        dispatch(
+            Number::Fsync as UserWord,
+            Args {
+                values: [1, 0, 0, 0, 0, 0],
+            },
+        ),
+        Errno::Enotsup.return_value()
     );
     assert_eq!(
         dispatch(

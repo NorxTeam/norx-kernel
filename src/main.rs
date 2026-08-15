@@ -464,6 +464,26 @@ pub extern "C" fn kernel_start() -> ! {
     } else {
         bootlog::fail("runtime bus registry capacity exhausted");
     }
+    if drivers::block::persistent() && !drivers::block::read_only() {
+        match fat32::fixed_file_persistence_check() {
+            Ok(status) => {
+                bootlog::ok_fmt(format_args!(
+                    "NORX_FAT32_PERSIST_WRITE_OK v=1 previous={} sequence={}",
+                    status.previous_sequence, status.sequence
+                ));
+                bootlog::ok_fmt(format_args!(
+                    "NORX_FAT32_PERSIST_READBACK_OK v=1 sequence={}",
+                    status.sequence
+                ));
+            }
+            Err(error) => bootlog::fail_fmt(format_args!(
+                "NORX_FAT32_PERSIST_FAIL v=1 error={:?}",
+                error
+            )),
+        }
+    } else if drivers::block::persistent() {
+        bootlog::warn("persistent block device is read-only; FAT32 persistence smoke skipped");
+    }
     #[cfg(target_arch = "x86_64")]
     {
         bootlog::start(2, "initializing network stack");

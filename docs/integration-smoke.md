@@ -73,7 +73,7 @@ probe:
   out-of-range accesses without dereferencing them;
 - the driver framework rejects invalid resource ranges and DMA ownership or
   direction, while block, virtio-net, virtio-gpu, and xHCI checks reject bad
-  queue or descriptor shapes and unavailable operations;
+  queue or descriptor shapes, unsupported features, and unavailable operations;
 - FAT32, ext4, btrfs, ELF, dynamic-loader, Wasm, syscall, and usercopy
   contracts exercise malformed metadata, broken images, invalid pointers,
   permission failures, and deterministic traps;
@@ -92,6 +92,30 @@ is emitted only after all groups have returned successfully:
 interrupt, MMIO, PIO, and DMA boundary checks passed
 boot hand-off and parser boundary checks passed
 ```
+
+## Bounded storage persistence smoke
+
+The default boot remains RAM-backed when no media image is supplied. The x86_64
+QEMU path can attach a raw FAT32 image through `QEMU_BLOCK_IMAGE`; the
+kernel then probes a modern PCI virtio-blk device with `VERSION_1`,
+`VIRTIO_BLK_F_FLUSH`, one bounded split queue, DMA bounce pages, and polling
+completion. A found device that fails initialization is reported as failed
+before the explicitly logged RAM fallback is selected.
+
+`scripts/make-persistence-image.py` creates a fixed-size image containing
+one pre-seeded 512-byte `/NORX.PST` file. On each boot the bounded FAT32
+writer increments its little-endian sequence, flushes the block backend,
+rereads the record, and emits:
+
+```text
+NORX_FAT32_PERSIST_WRITE_OK v=1 previous=N sequence=N+1
+NORX_FAT32_PERSIST_READBACK_OK v=1 sequence=N+1
+```
+
+CI boots twice against the same image and asserts that the second `previous`
+value equals the first sequence. This is evidence for the fixed-file FAT32
+vertical only; it is not a claim of a complete persistent VFS, ext4/btrfs
+writer, allocator, journal-recovery path, or general POSIX filesystem ABI.
 
 ## Serial and framebuffer artifacts
 

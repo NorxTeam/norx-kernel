@@ -348,6 +348,23 @@ impl ProcessTable {
         parent: ProcessId,
         credentials: Credentials,
     ) -> Result<(ProcessId, ThreadId), Error> {
+        self.spawn_child_with_state(parent, credentials, true)
+    }
+
+    pub fn spawn_child_staged(
+        &mut self,
+        parent: ProcessId,
+        credentials: Credentials,
+    ) -> Result<(ProcessId, ThreadId), Error> {
+        self.spawn_child_with_state(parent, credentials, false)
+    }
+
+    fn spawn_child_with_state(
+        &mut self,
+        parent: ProcessId,
+        credentials: Credentials,
+        publish: bool,
+    ) -> Result<(ProcessId, ThreadId), Error> {
         if self.process(parent)?.state != ProcessState::Running {
             return Err(Error::InvalidState);
         }
@@ -373,9 +390,56 @@ impl ProcessTable {
                 return Err(error);
             }
         };
+        if publish {
+            self.publish_child(process, thread)?;
+        }
+        Ok((process, thread))
+    }
+
+    pub fn publish_child(&mut self, process: ProcessId, thread: ThreadId) -> Result<(), Error> {
+        if self.process(process)?.state != ProcessState::Creating
+            || self.thread_owner(thread)? != Some(process)
+            || self.thread_state(thread)? != ThreadState::Created
+        {
+            return Err(Error::InvalidState);
+        }
         self.process_mut(process)?.state = ProcessState::Running;
         self.thread_mut(thread)?.state = ThreadState::Ready;
-        Ok((process, thread))
+        Ok(())
+    }
+
+    pub fn abort_child(&mut self, parent: ProcessId, child: ProcessId) -> Result<(), Error> {
+        let record = *self.process(child)?;
+        if record.parent != Some(parent) || record.state != ProcessState::Creating {
+            return Err(Error::InvalidState);
+        }
+        let process_slot = child.slot().ok_or(Error::InvalidId)?;
+        if self.process_generations[process_slot] == u16::MAX {
+            return Err(Error::GenerationExhausted);
+        }
+        let mut thread_slots = [None; MAX_PROCESS_THREADS];
+        for (index, thread) in record.threads.into_iter().enumerate() {
+            let Some(thread) = thread else {
+                continue;
+            };
+            let slot = thread.slot().ok_or(Error::InvalidId)?;
+            if self.threads[slot].map(|entry| entry.id) != Some(thread)
+                || self.thread_generations[slot] == u16::MAX
+            {
+                return Err(Error::InvalidState);
+            }
+            thread_slots[index] = Some(slot);
+        }
+        for entry in record.fds.into_iter().flatten() {
+            release_open_file(entry.open_file);
+        }
+        for slot in thread_slots.into_iter().flatten() {
+            self.threads[slot] = None;
+            self.thread_generations[slot] += 1;
+        }
+        self.processes[process_slot] = None;
+        self.process_generations[process_slot] += 1;
+        Ok(())
     }
 
     pub fn spawn_kernel_thread(&mut self) -> Result<ThreadId, Error> {
@@ -481,6 +545,7 @@ impl ProcessTable {
         readable: bool,
         writable: bool,
     ) -> Result<FileDescriptor, Error> {
+        validate_open_file(open_file)?;
         if self.process(process)?.state != ProcessState::Running {
             return Err(Error::InvalidState);
         }
@@ -519,6 +584,9 @@ impl ProcessTable {
     ) -> Result<FileDescriptor, Error> {
         let old_slot = old_fd.slot().ok_or(Error::InvalidFd)?;
         let new_slot = new_fd.slot().ok_or(Error::InvalidFd)?;
+        if new_slot >= self.process(process)?.session.max_fds as usize {
+            return Err(Error::FdCapacity);
+        }
         if old_slot == new_slot {
             self.process(process)?.fds[old_slot].ok_or(Error::InvalidFd)?;
             return Ok(new_fd);
@@ -544,14 +612,20 @@ impl ProcessTable {
         source_fds: [FileDescriptor; 3],
     ) -> Result<(), Error> {
         self.process(parent)?;
-        self.process(child)?;
+        let child_record = *self.process(child)?;
+        if child_record.parent != Some(parent) || child_record.state != ProcessState::Creating {
+            return Err(Error::InvalidState);
+        }
         let mut sources = [None; 3];
         for (index, fd) in source_fds.into_iter().enumerate() {
             let slot = fd.slot().ok_or(Error::InvalidFd)?;
             sources[index] = Some(self.process(parent)?.fds[slot].ok_or(Error::InvalidFd)?);
         }
         let mut duplicated = [None; 3];
-        for (index, source) in sources.into_iter().flatten().enumerate() {
+        for (index, source) in sources.into_iter().enumerate() {
+            let Some(source) = source else {
+                continue;
+            };
             if let Err(error) = duplicate_open_file(source.open_file) {
                 for open_file in duplicated.into_iter().flatten() {
                     release_open_file(open_file);
@@ -565,7 +639,10 @@ impl ProcessTable {
             release_open_file(entry.open_file);
         }
         let record = self.process_mut(child)?;
-        for (index, source) in sources.into_iter().flatten().enumerate() {
+        for (index, source) in sources.into_iter().enumerate() {
+            let Some(source) = source else {
+                continue;
+            };
             record.fds[index] = Some(FdEntry {
                 open_file: duplicated[index].ok_or(Error::InvalidState)?,
                 close_on_exec: source.close_on_exec,
@@ -1148,6 +1225,13 @@ impl Runtime {
         self.current_process = self.table.thread_owner(thread)?;
         Ok(())
     }
+
+    fn exclude_init_from_user_schedule(&self, current_process: Option<ProcessId>) -> bool {
+        current_process != Some(ProcessId::INIT)
+            && !self
+                .init_thread
+                .is_some_and(|thread| crate::arch::has_user_context(thread.get()))
+    }
 }
 
 struct RuntimeCell(UnsafeCell<Runtime>);
@@ -1187,6 +1271,16 @@ pub fn spawn_child_current(credentials: Credentials) -> Result<(ProcessId, Threa
         let runtime = &mut *RUNTIME.0.get();
         let parent = runtime.current_process.ok_or(Error::InvalidState)?;
         runtime.table.spawn_child(parent, credentials)
+    })
+}
+
+pub fn spawn_child_current_staged(
+    credentials: Credentials,
+) -> Result<(ProcessId, ThreadId), Error> {
+    crate::arch::without_interrupts(|| unsafe {
+        let runtime = &mut *RUNTIME.0.get();
+        let parent = runtime.current_process.ok_or(Error::InvalidState)?;
+        runtime.table.spawn_child_staged(parent, credentials)
     })
 }
 
@@ -1338,8 +1432,12 @@ pub fn restore_process(process: ProcessId) -> Result<ThreadId, Error> {
 pub fn discard_child(parent: ProcessId, child: ProcessId) -> Result<(), Error> {
     crate::arch::without_interrupts(|| unsafe {
         let runtime = &mut *RUNTIME.0.get();
-        runtime.table.exit(child, -127)?;
-        let _ = runtime.table.wait(parent, Some(child))?;
+        if runtime.table.process_state(child)? == ProcessState::Creating {
+            runtime.table.abort_child(parent, child)?;
+        } else {
+            runtime.table.exit(child, -127)?;
+            let _ = runtime.table.wait(parent, Some(child))?;
+        }
         Ok(())
     })
 }
@@ -1419,10 +1517,10 @@ pub fn exit_current(status: i32) -> Result<Option<ContextSwitch>, Error> {
             runtime.current_thread = None;
             return Ok(None);
         }
-        let Some(next) = runtime
-            .table
-            .pick_ready_user_with_init_policy(runtime.current_process, process != ProcessId::INIT)
-        else {
+        let Some(next) = runtime.table.pick_ready_user_with_init_policy(
+            runtime.current_process,
+            runtime.exclude_init_from_user_schedule(runtime.current_process),
+        ) else {
             runtime.current_process = None;
             runtime.current_thread = None;
             return Ok(None);
@@ -1506,12 +1604,34 @@ pub fn duplicate_fd_current(old_fd: u32, new_fd: u32) -> Result<u32, Error> {
 }
 
 fn duplicate_open_file(open_file: u32) -> Result<(), Error> {
+    if open_file <= 2 {
+        return Ok(());
+    }
     if crate::vfs::FileHandle::from_raw(open_file).is_some() {
         crate::vfs::duplicate_raw(open_file).map_err(|_| Error::InvalidFd)?;
     } else if crate::pipe::is_pipe_raw(open_file) {
         crate::pipe::duplicate_raw(open_file).map_err(|_| Error::InvalidFd)?;
+    } else {
+        return Err(Error::InvalidFd);
     }
     Ok(())
+}
+
+fn validate_open_file(open_file: u32) -> Result<(), Error> {
+    if open_file <= 2 {
+        return Ok(());
+    }
+    if crate::vfs::FileHandle::from_raw(open_file).is_some() {
+        let duplicate = crate::vfs::duplicate_raw(open_file).map_err(|_| Error::InvalidFd)?;
+        crate::vfs::close_raw(duplicate).map_err(|_| Error::InvalidFd)?;
+        return Ok(());
+    }
+    if crate::pipe::is_pipe_raw(open_file) {
+        let duplicate = crate::pipe::duplicate_raw(open_file).map_err(|_| Error::InvalidFd)?;
+        crate::pipe::close_raw(duplicate).map_err(|_| Error::InvalidFd)?;
+        return Ok(());
+    }
+    Err(Error::InvalidFd)
 }
 
 fn release_open_file(open_file: u32) {
@@ -1542,7 +1662,7 @@ pub fn yield_current() -> Result<Option<ContextSwitch>, Error> {
         runtime.table.wake_sleepers(crate::time::ticks());
         let Some(next) = runtime.table.pick_ready_user_with_init_policy(
             runtime.current_process,
-            runtime.current_process != Some(ProcessId::INIT),
+            runtime.exclude_init_from_user_schedule(runtime.current_process),
         ) else {
             return Ok(None);
         };
@@ -1610,6 +1730,14 @@ pub fn inherit_current_standard_fds(child: ProcessId, source_fds: [u32; 3]) -> R
     })
 }
 
+pub fn publish_child(child: ProcessId) -> Result<(), Error> {
+    crate::arch::without_interrupts(|| unsafe {
+        let runtime = &mut *RUNTIME.0.get();
+        let thread = runtime.table.process_thread(child)?;
+        runtime.table.publish_child(child, thread)
+    })
+}
+
 pub fn set_process_group_for_child(process: ProcessId, pgid: ProcessId) -> Result<(), Error> {
     crate::arch::without_interrupts(|| unsafe {
         let runtime = &mut *RUNTIME.0.get();
@@ -1633,7 +1761,7 @@ pub fn sleep_current(duration: u64) -> Result<Option<ContextSwitch>, Error> {
         runtime.table.sleep_thread_until(current, wake_at)?;
         let Some(next) = runtime.table.pick_ready_user_with_init_policy(
             runtime.current_process,
-            runtime.current_process != Some(ProcessId::INIT),
+            runtime.exclude_init_from_user_schedule(runtime.current_process),
         ) else {
             runtime.table.wake_thread(current)?;
             runtime.table.switch_to(None, current)?;
@@ -1738,17 +1866,18 @@ pub fn contract_self_check() {
         uid_zero_without_capabilities.authorize(Capability::Mount),
         Err(Error::PermissionDenied)
     );
-    let fd = table.open_fd(child, 7, true, false).unwrap();
+    assert_eq!(table.open_fd(child, 7, true, false), Err(Error::InvalidFd));
+    let fd = table.open_fd(child, 1, true, false).unwrap();
     assert_eq!(fd.get(), 3);
     assert_eq!(
         table.fd_info(child, fd).unwrap(),
-        (7, false, false, true, false)
+        (1, false, false, true, false)
     );
     let duplicate = table
         .duplicate_fd(child, fd, FileDescriptor::from_raw(4))
         .unwrap();
     assert_eq!(duplicate.get(), 4);
-    assert_eq!(table.fd_info(child, duplicate).unwrap().0, 7);
+    assert_eq!(table.fd_info(child, duplicate).unwrap().0, 1);
     table.raise_signal(child, 2).unwrap();
     table.raise_event(child, 3).unwrap();
     assert!(table.signal_pending(child, 2).unwrap());
@@ -1778,6 +1907,41 @@ pub fn contract_self_check() {
     assert_eq!(
         table.thread_state(child_thread).unwrap(),
         ThreadState::Ready
+    );
+    let (inherited_child, inherited_thread) = table
+        .spawn_child_staged(child, Credentials::BOOTSTRAP)
+        .unwrap();
+    table
+        .inherit_standard_fds(child, inherited_child, [fd, fd, duplicate])
+        .unwrap();
+    assert_eq!(
+        table
+            .fd_info(inherited_child, FileDescriptor::from_raw(0))
+            .unwrap()
+            .0,
+        1
+    );
+    assert_eq!(
+        table
+            .fd_info(inherited_child, FileDescriptor::from_raw(1))
+            .unwrap()
+            .0,
+        1
+    );
+    assert_eq!(
+        table
+            .fd_info(inherited_child, FileDescriptor::from_raw(2))
+            .unwrap()
+            .0,
+        1
+    );
+    table
+        .publish_child(inherited_child, inherited_thread)
+        .unwrap();
+    table.exit(inherited_child, 0).unwrap();
+    assert_eq!(
+        table.wait(child, Some(inherited_child)).unwrap(),
+        (inherited_child, 0)
     );
     table.switch_to(None, kernel_thread).unwrap();
     table.account_thread(kernel_thread, 2).unwrap();

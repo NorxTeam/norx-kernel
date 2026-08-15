@@ -17,6 +17,8 @@ pub mod serial;
 #[cfg(target_arch = "x86_64")]
 pub mod usb;
 #[cfg(target_arch = "x86_64")]
+pub mod virtio_blk;
+#[cfg(target_arch = "x86_64")]
 pub mod virtio_gpu;
 
 #[cfg(target_arch = "x86_64")]
@@ -148,6 +150,8 @@ pub fn init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
     serial::ns16550::contract_self_check();
     #[cfg(target_arch = "aarch64")]
     serial::pl011::contract_self_check();
+    #[cfg(target_arch = "x86_64")]
+    virtio_blk::contract_self_check();
     display::contract_self_check();
     crate::bootlog::ok_fmt(format_args!(
         "NORX_DISPLAY_MODE_CONTRACT_OK v={} guest=firmware-fixed host-scale=external scanout=separate",
@@ -187,22 +191,7 @@ pub fn init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
     ) {
         ok = false;
     }
-    let block_state = if block::init() {
-        framework::DeviceState::Ready
-    } else {
-        framework::DeviceState::Failed
-    };
-    if !framework::register(
-        framework::Driver::new(
-            3,
-            "ramdisk0",
-            framework::Class::Block,
-            framework::BusKind::Platform,
-        ),
-        block_state,
-    ) {
-        ok = false;
-    }
+    let _ = block::init();
     if !framework::register(
         framework::Driver::new(
             4,
@@ -251,6 +240,58 @@ pub fn poll() {
 }
 
 pub fn runtime_init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
+    let mut ok = true;
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::bootlog::start(1, "probing PCI virtio-blk controller");
+        match virtio_blk::init() {
+            virtio_blk::InitResult::Ready(status) => crate::bootlog::ok_fmt(format_args!(
+                "virtio-blk ready pci={:02x}:{:02x}.{} vendor=0x{:04x} device=0x{:04x} sectors={} queue={} flush={} readonly={}",
+                status.bus,
+                status.slot,
+                status.function,
+                status.vendor,
+                status.device,
+                status.sectors,
+                status.queue_size,
+                status.flush,
+                status.read_only,
+            )),
+            virtio_blk::InitResult::Unsupported => {
+                crate::bootlog::warn("virtio-blk controller not found; RAM-disk fallback active")
+            }
+            virtio_blk::InitResult::Failed(error) => crate::bootlog::fail_fmt(format_args!(
+                "virtio-blk probe failed: {:?}; RAM-disk fallback active",
+                error,
+            )),
+        }
+    }
+    let block_state = if block::init() {
+        framework::DeviceState::Ready
+    } else {
+        framework::DeviceState::Failed
+    };
+    #[cfg(target_arch = "x86_64")]
+    let block_is_virtio = block::persistent();
+    #[cfg(target_arch = "aarch64")]
+    let block_is_virtio = false;
+    ok &= framework::register(
+        framework::Driver::new(
+            3,
+            if block_is_virtio {
+                "virtio-blk0"
+            } else {
+                "ramdisk0"
+            },
+            framework::Class::Block,
+            if block_is_virtio {
+                framework::BusKind::Pci
+            } else {
+                framework::BusKind::Platform
+            },
+        ),
+        block_state,
+    );
     #[cfg(target_arch = "x86_64")]
     {
         usb::xhci::contract_self_check();
@@ -301,7 +342,7 @@ pub fn runtime_init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
                 framework::DeviceState::Failed
             }
         };
-        let mut ok = framework::register(
+        ok &= framework::register(
             framework::Driver::new(
                 7,
                 "xhci",
@@ -466,7 +507,7 @@ pub fn runtime_init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
         let _ = framebuffer;
         crate::bootlog::start(1, "probing PCI USB host controllers");
         crate::bootlog::warn("xHCI controller unsupported on aarch64 bring-up");
-        let mut ok = framework::register(
+        ok &= framework::register(
             framework::Driver::new(
                 7,
                 "xhci",

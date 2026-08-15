@@ -44,7 +44,7 @@ lifecycle, interrupt registration API, DMA API, or driver-owned error type.
 | x86 IDT/GDT/TSS | Static IDT, GDT, TSS, and 16 KiB kernel stack | exception and timer handlers, syscall stack setup | `arch::x86_64::tables` owns all storage for the current boot. It is single-CPU static state; per-CPU and teardown semantics are absent. |
 | x86 local APIC | APIC MSR and physical MMIO base from `IA32_APIC_BASE` | calibrated timer interrupt path and status command | `arch::x86_64` owns APIC/HPET calibration, vector routing, EOI, and the PIT fallback decision. The MMIO pointer has no explicit mapping/resource validation. |
 | aarch64 exception vectors/GIC | Static vector table, EL-specific system registers, and DTB-discovered GICv2/v3 | synchronous syscall/fault entry, IRQ acknowledgement, and generic timer PPI | `arch::aarch64::tables` installs VBAR and uses a dedicated kernel stack; `arch::aarch64::gic` owns distributor/CPU-interface or redistributor setup, ACK/EOI, and timer enable. |
-| RAM block layer | `static mut RAMDISK`, 32 sectors of 512 bytes, fixed request queue | `vfs`, serial `block` diagnostic | `drivers::block` owns geometry, request lifetime, bounded completion, MBR partition discovery, read-only state, and write-through cache policy. The RAM backend has no persistent teardown because it is boot-owned memory. |
+| Block layer | `static mut RAMDISK` fallback plus optional x86_64 modern PCI virtio-blk, fixed request queue | `vfs`, serial `block` diagnostic, FAT32 persistence smoke | `drivers::block` owns geometry, request lifetime, bounded completion, partition discovery, read-only state, backend selection, and write-through cache policy. The RAM backend is volatile; virtio-blk owns its bounded DMA queue and optional flush boundary. |
 | Driver registry | Static 32-entry metadata array and length | boot initialization and `drivers` debugger command | `framework` owns storage, but callers ignore the `bool` result. Registration is only a status display and does not own hardware or bind a driver. |
 | Physical frames | Static range table and monotonic allocator | x86 paging lazy mapper | `memory` owns allocation; paging returns a frame when a lazy leaf cannot be installed. This is an adjacent memory contract, not a device DMA allocator. |
 | Direct map/page tables | x86 static table pool and page-table entries | paging and lazy fault path | `arch::x86_64::paging` owns the pool and mappings. The current interface exposes raw pointers/physical addresses and has no mapping lifetime or concurrency contract. |
@@ -231,8 +231,8 @@ paths are evidence for the audit only.
   error contract in `src/drivers/framework.rs`.
 - Hard-coded UART initialization with a resource-backed serial device and
   bounded I/O.
-- The RAM backend with a real media driver once geometry, DMA, and persistence
-  requirements justify a second block implementation.
+- The bounded RAM fallback with a full persistent media stack once allocation,
+  mount publication, recovery, and namespace requirements justify that scope.
 - Direct VFS-to-LBA knowledge with the first mountable filesystem vertical
   path.
 - Legacy PIT/PIC fallback remains available behind an explicit interrupt/timer
@@ -507,17 +507,39 @@ explicit typed errors.
 
 The RAM backend initializes a small MBR partition table and discovers bounded
 valid entries, falling back to a whole-disk partition when no valid table is
-present. Cache policy is explicit and currently write-through; selecting
-write-back returns `Unsupported` until a page cache owns dirty data. The serial
-`block` command reports geometry, queue, completions, partitions, read-only
-state, and cache mode, with `ro`, `rw`, `flush`, `write-through`, and explicit
+present. On x86_64, a modern PCI virtio-blk device can replace that backend
+after VERSION_1 and F_FLUSH negotiation. Its one split queue is capped
+at eight descriptors, uses separate page-aligned DMA regions and one-sector bounce buffers,
+and validates used-ring count, descriptor, length, and request-status fields
+before publishing completion. A detected but failed device is reported and
+then falls back explicitly to the volatile RAM disk.
+
+Cache policy is explicit and currently write-through; selecting write-back
+returns `Unsupported` until a page cache owns dirty data. The serial `block`
+command reports geometry, queue, completions, partitions, read-only state, and
+cache mode, with `ro`, `rw`, `flush`, `write-through`, and explicit
 write-back rejection controls.
 
-The x86_64 QEMU bootlog reported `sector=512 sectors=32 queue=8
-partitions=1 readonly=false cache=write-through`, followed by the block
-completion/read-only/partition/cache self-check and successful VFS
-initialization. The aarch64 build and clippy path also pass because the RAM
-layer is architecture-neutral.
+Without attached media, the x86_64 QEMU bootlog reports `sector=512 sectors=32 queue=8
+partitions=1 readonly=false cache=write-through`; the aarch64 path remains
+RAM-backed and architecture neutral. The persistent smoke attaches a fixed FAT32
+image and reports the virtio geometry before the same block contract checks.
+
+### Virtio-blk and fixed-file persistence follow-up
+
+`src/drivers/virtio_blk.rs` is deliberately a bounded polling backend rather
+than a general storage subsystem. It discovers the modern PCI capabilities,
+negotiates `VERSION_1` and optional block flush support, accepts read-only
+media, and exposes sector reads, writes, and flushes through the block layer.
+The driver has a contract self-check for queue geometry and malformed used-ring
+responses; `scripts/run.sh` exposes it through `QEMU_BLOCK_IMAGE`.
+
+`src/fat32.rs` opens a writable view over the real block callbacks and updates
+only the existing fixed `/NORX.PST` chain. It does not allocate clusters or
+create arbitrary files. The CI image generator pre-seeds the file, and the
+two-boot smoke asserts the sequence survives a QEMU process restart. FAT32
+allocation, mount-tree publication, ext4/btrfs write paths, journal recovery,
+and a complete persistent POSIX namespace remain later roadmap work.
 
 ### Ramfs follow-up
 
@@ -548,9 +570,11 @@ wide clippy still reports pre-existing warnings outside this VFS pass.
 `src/fat32.rs` now provides the first on-disk filesystem vertical. `Mount::open`
 validates the FAT32 BPB, derives bounded data geometry, walks FAT cluster
 chains, resolves both short names and checked UTF-16 long names, and reads
-regular files through the block-sector contract. The boot path probes the RAM
-disk read-only and leaves ramfs as the writable root when no FAT32 volume is
-present.
+regular files through the block-sector contract. The boot path probes the active
+block backend read-only and leaves ramfs as the writable root when no FAT32
+volume is present. When a persistent virtio-blk image is attached, the bounded
+`/NORX.PST` check uses `Mount::open_rw`, the existing fixed chain, and
+the block flush boundary.
 
 `Mount::open_rw` adds a deliberately bounded safe-write path: it rewrites data
 inside an existing cluster chain and commits the file size in its directory
@@ -560,10 +584,11 @@ remain a later extension. The fixture self-check covers BPB validation, long
 name lookup, read-only rejection, directory-size update, readback, and the
 no-space guard.
 
-Both final QEMU bootlogs report `FAT32 parser, long-name, and safe-write checks
-passed`, `FAT32 volume absent; ramfs remains the writable root`, and
-`kernel initialization complete` on x86_64 and aarch64. All unsupported-device
-and fallback messages remain in the normal kernel boot log.
+The normal no-media boot reports `FAT32 parser, long-name, and safe-write
+checks passed`, the expected absent-volume fallback, and `kernel initialization
+complete` on x86_64 and aarch64. The separate x86_64 media run reports the
+versioned `/NORX.PST` write and readback markers. All unsupported-device and
+fallback messages remain in the normal kernel boot log.
 
 ### Ext4 staged follow-up
 

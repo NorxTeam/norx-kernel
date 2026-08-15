@@ -79,6 +79,9 @@ jobs:
       - name: Build aarch64 GRUB image
         run: MODE=build ./scripts/run.sh aarch64
 
+      - name: Prepare bounded persistence image
+        run: python3 scripts/make-persistence-image.py "$RUNNER_TEMP/norx-persistence.img"
+
       - name: QEMU smoke tests
         run: |
           set -euo pipefail
@@ -170,6 +173,48 @@ jobs:
           smoke x86_64 "x86_64 lazy page faults allocate, zero, and map through the direct map" "vnc=127.0.0.1:0" "NORX_EARLY_UART_READY v=1 backend=ns16550 poll-limit=4096" "ramfs /hello.txt readback passed"
           smoke aarch64 "persistent warm-reboot status committed" "vnc=127.0.0.1:1" "NORX_EARLY_UART_READY v=1 backend=pl011 poll-limit=4096" "ramfs /hello.txt readback passed"
           grep -F "NORX_SERIAL_DEBUGGER_READY v=1" "$RUNNER_TEMP/norx-aarch64.stable.log"
+
+      - name: QEMU x86_64 bounded persistence smoke
+        run: |
+          set -euo pipefail
+          image="$RUNNER_TEMP/norx-persistence.img"
+
+          boot() {
+            log="$1"
+            vars="$2"
+            rm -f "$log" "$vars"
+            env QEMU_SHARE="$RUNNER_TEMP/norx-qemu-share" \
+              QEMU_DISPLAY=none QEMU_SERIAL="file:$log" \
+              QEMU_VARS="$vars" QEMU_BLOCK_IMAGE="$image" MODE=run \
+              ./scripts/run.sh x86_64 >"$log.stdout" 2>&1 &
+            qemu_pid=$!
+            deadline=$((SECONDS + 45))
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              if grep -F "NORX_FAT32_PERSIST_READBACK_OK v=1" "$log" >/dev/null 2>&1; then
+                break
+              fi
+              if ! kill -0 "$qemu_pid" 2>/dev/null; then
+                cat "$log.stdout" 2>/dev/null || true
+                cat "$log" 2>/dev/null || true
+                return 1
+              fi
+              sleep 1
+            done
+            grep -F "NORX_FAT32_PERSIST_WRITE_OK v=1" "$log"
+            grep -F "NORX_FAT32_PERSIST_READBACK_OK v=1" "$log"
+            kill "$qemu_pid" 2>/dev/null || true
+            wait "$qemu_pid" 2>/dev/null || true
+          }
+
+          first="$RUNNER_TEMP/norx-persistence-1.serial.log"
+          second="$RUNNER_TEMP/norx-persistence-2.serial.log"
+          boot "$first" "$RUNNER_TEMP/norx-persistence-1-vars.fd"
+          boot "$second" "$RUNNER_TEMP/norx-persistence-2-vars.fd"
+          first_sequence="$(grep -o 'NORX_FAT32_PERSIST_WRITE_OK v=1 previous=[0-9]* sequence=[0-9]*' "$first" | tail -1 | sed -E 's/.*sequence=([0-9]+).*/\1/')"
+          second_previous="$(grep -o 'NORX_FAT32_PERSIST_WRITE_OK v=1 previous=[0-9]* sequence=[0-9]*' "$second" | tail -1 | sed -E 's/.*previous=([0-9]+).*/\1/')"
+          second_sequence="$(grep -o 'NORX_FAT32_PERSIST_WRITE_OK v=1 previous=[0-9]* sequence=[0-9]*' "$second" | tail -1 | sed -E 's/.*sequence=([0-9]+).*/\1/')"
+          test "$second_previous" = "$first_sequence"
+          test "$second_sequence" = "$((first_sequence + 1))"
 
       - name: Upload QEMU smoke logs and framebuffer screenshots
         if: always()

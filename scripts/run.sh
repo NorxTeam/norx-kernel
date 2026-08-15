@@ -124,6 +124,18 @@ if [ -n "${QEMU_MONITOR:-}" ]; then
     qmp_args="-qmp unix:${QEMU_MONITOR},server=on,wait=off"
 fi
 
+block_args=()
+if [ -n "${QEMU_BLOCK_IMAGE:-}" ]; then
+    if [ ! -f "$QEMU_BLOCK_IMAGE" ]; then
+        echo "QEMU_BLOCK_IMAGE does not exist: $QEMU_BLOCK_IMAGE" >&2
+        exit 1
+    fi
+    block_args=(
+        -drive "if=none,id=norx-persist,format=raw,file=$QEMU_BLOCK_IMAGE"
+        -device virtio-blk-pci,drive=norx-persist,disable-legacy=on
+    )
+fi
+
 if [ "$arch" = x86_64 ]; then
     qemu_video_args="-vga none -device virtio-vga,edid=on,xres=1200,yres=800"
 else
@@ -139,6 +151,7 @@ exec "$qemu" \
     $qemu_video_args \
     $usb_args \
     $network_args \
+    "${block_args[@]}" \
     -serial "$qemu_serial" \
     -no-reboot \
     -no-shutdown \

@@ -54,7 +54,12 @@ zombie record is published.
 
 The first implementation is fixed-capacity and does not expose host paths.
 Descriptors are the only process-visible route to VFS handles; raw `FileHandle`
-slots never cross the syscall boundary.
+slots never cross the syscall boundary. Process-table insertion accepts only the
+three serial endpoints, a live VFS handle, or a live pipe endpoint; unknown raw
+values are rejected. `spawn2` creates a `Creating` child and keeps its thread
+unschedulable while the runtime and explicitly requested standard descriptors are
+installed. Only then does it publish `Running/Ready`; arbitrary parent FD-table
+entries are not inherited by this bounded ABI.
 
 ## Credentials and events
 

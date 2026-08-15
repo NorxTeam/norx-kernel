@@ -1092,7 +1092,7 @@ fn spawn_user_path_resumable_with_args_and_credentials(
         },
     };
     let (child, thread) =
-        crate::process::spawn_child_current(credentials).map_err(|error| match error {
+        crate::process::spawn_child_current_staged(credentials).map_err(|error| match error {
             crate::process::Error::ProcessCapacity | crate::process::Error::ThreadCapacity => {
                 SpawnError::Capacity
             }
