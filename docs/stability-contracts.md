@@ -43,21 +43,25 @@ QEMU smoke, not that the subsystem is production-ready.
 | Warm reboot and panic context | `crash` owns the four-record ring and checksum validation; EFI variables or x86 CMOS are backing stores; serial is fallback. | Corrupt records are ignored; failed durable writes are reported and panic context remains serial-only; panic always halts. | 64-byte record format, states `BOOTING/READY/PANIC/CHECKPOINT`, four-slot sequence ordering, and the separate bounded FAT32 `/NORX.PST` smoke record. | OVMF/UEFI variable persistence across QEMU process restart; x86 CMOS fallback; x86 virtio-blk/FAT32 two-boot smoke for the file path. | RAM disk persistence, cross-firmware variable migration, arbitrary persistent namespaces, and guaranteed persistence after power loss are not promised. |
 
 The current storage increment adds bounded FAT32 allocation/free-chain updates for
-existing files, mirrored-FAT consistency checks, metadata enumeration for all
+existing files, mirrored-FAT consistency checks, LFN create/rename/unlink,
+directory-chain growth, empty-directory removal, metadata enumeration for all
 three persistent readers, and an access-checked `PersistentMount` boundary. A
-writable FAT32 VFS mount can now rewrite bounded existing files and perform short
-8.3 create/mkdir, empty-file unlink, and same-directory rename; each operation
-publishes only after sector readback. Mounted ext4/btrfs paths remain read-only,
-and all persistent writes require the block flush boundary. Directory-chain
-growth, long-name/timestamp metadata, full rmdir semantics, journaling, partial
-I/O for files larger than bounded `FILE_MAX`, and full POSIX path coverage remain
-deferred. Process runtime table access is now serialized by a reentrant
+writable FAT32 VFS mount can now rewrite bounded existing files and perform create,
+mkdir, unlink, rmdir, and same-directory rename; each operation publishes only
+after sector readback. A journal-clean ext4 mount can rewrite existing depth-0
+extent files through a bounded JBD2 transaction; allocation and directory
+mutations remain typed unsupported. Btrfs exposes a validated COW transaction
+boundary with generation/checksum/order/rollback checks, but does not publish a
+fake writer until allocation, root publication, mirrored superblocks, and recovery
+exist. All persistent writes require the block flush boundary. Partial I/O for
+files larger than bounded `FILE_MAX`, page cache, and full POSIX path coverage
+remain deferred. Process runtime table access is now serialized by a reentrant
 per-CPU-token SMP lock with a bounded fail-stop contention ceiling.
 
 The table's deferred persistent-storage item refers to process-attached mount
 namespaces and the full write-capable POSIX filesystem surface; the bounded FAT32
-slice, read-only ext4/btrfs mounted path/handle dispatch, and block flush boundary
-described above are published.
+slice, journal-safe ext4 rewrite, btrfs transaction boundary, mounted path/handle
+dispatch, and block flush boundary described above are published.
 Boot now attempts the first valid persistent reader at `/storage`; its bounded
 VFS smoke is optional when no persistent block device is present and rolls back
 the mount if lookup, metadata, I/O, or reopen checks fail.
