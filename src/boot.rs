@@ -148,6 +148,31 @@ pub struct MemoryRegion {
     pub length: u64,
 }
 
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+pub struct Aarch64InterruptInfo {
+    pub gic_version: u8,
+    pub gic_distributor: u64,
+    pub gic_cpu_interface: u64,
+    pub gic_redistributor: u64,
+    pub timer_irq: u32,
+    pub timer_flags: u32,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Aarch64InterruptInfo {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            gic_version: 0,
+            gic_distributor: 0,
+            gic_cpu_interface: 0,
+            gic_redistributor: 0,
+            timer_irq: 0,
+            timer_flags: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 pub struct Module {
@@ -171,6 +196,8 @@ pub struct BootInfo {
     pub efi_system_table: u64,
     #[cfg(target_arch = "x86_64")]
     pub acpi_rsdp: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub interrupt_info: Aarch64InterruptInfo,
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub efi_runtime_el: u8,
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
@@ -196,6 +223,8 @@ impl BootInfo {
             efi_system_table: 0,
             #[cfg(target_arch = "x86_64")]
             acpi_rsdp: 0,
+            #[cfg(target_arch = "aarch64")]
+            interrupt_info: Aarch64InterruptInfo::empty(),
             efi_runtime_el: 0,
             efi_runtime_vbar: 0,
             efi_runtime_sp_el0: 0,
@@ -335,6 +364,13 @@ pub extern "efiapi" fn norx_efi_main(_image_handle: u64, system_table: u64) -> !
             (*core::ptr::addr_of_mut!(INFO)).framebuffer = Some(framebuffer);
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        reserve_efi_mapped_regions(&mut *core::ptr::addr_of_mut!(INFO))
+    };
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::start_kernel();
+    #[cfg(not(target_arch = "aarch64"))]
     crate::kernel_start()
 }
 
@@ -385,6 +421,53 @@ fn add_reserved(info: &mut BootInfo, base: u64, length: u64) {
     if info.reserved_len < info.reserved.len() {
         info.reserved[info.reserved_len] = MemoryRegion { base, length };
         info.reserved_len += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn reserve_efi_mapped_regions(info: &mut BootInfo) {
+    let original_len = info.reserved_len;
+    let mut index = 0;
+    while index < original_len {
+        let region = info.reserved[index];
+        let start = region.base & !(4096 - 1);
+        let Some(end) = region.base.checked_add(region.length) else {
+            index += 1;
+            continue;
+        };
+        let end = end.checked_add(4095).map(|value| value & !(4096 - 1));
+        let Some(end) = end else {
+            index += 1;
+            continue;
+        };
+        if start >= end {
+            index += 1;
+            continue;
+        }
+        let Some(physical_start) =
+            crate::arch::virtual_to_physical(crate::address::VirtAddr::new(start as usize))
+        else {
+            index += 1;
+            continue;
+        };
+        let Some(physical_end) =
+            crate::arch::virtual_to_physical(crate::address::VirtAddr::new((end - 1) as usize))
+        else {
+            index += 1;
+            continue;
+        };
+        let Some(physical_length) = physical_end
+            .value()
+            .checked_sub(physical_start.value())
+            .and_then(|value| value.checked_add(4096))
+        else {
+            index += 1;
+            continue;
+        };
+        if physical_length == end - start {
+            add_reserved(info, physical_start.value(), physical_length);
+        }
+        index += 1;
     }
 }
 
@@ -626,6 +709,11 @@ unsafe fn parse_fdt(address: usize) -> Option<BootInfo> {
     let mut framebuffer_stride = 0u64;
     let mut framebuffer_format = [0u8; 16];
     let mut framebuffer_format_len = 0usize;
+    let mut gic_version = 0u8;
+    let mut gic_distributor = 0u64;
+    let mut gic_second_region = 0u64;
+    let mut timer_irq = 0u32;
+    let mut timer_flags = 0u32;
 
     loop {
         let token = read_be32(cursor)?;
@@ -687,6 +775,39 @@ unsafe fn parse_fdt(address: usize) -> Option<BootInfo> {
                         data,
                         length,
                     );
+                } else if kind == NodeKind::InterruptController && c_string_eq(name, b"compatible")
+                {
+                    if c_string_starts_with(data, b"arm,gic-v3") {
+                        gic_version = 3;
+                    } else if c_string_starts_with(data, b"arm,cortex-a15-gic")
+                        || c_string_starts_with(data, b"arm,gic-400")
+                    {
+                        gic_version = 2;
+                    }
+                } else if kind == NodeKind::InterruptController && c_string_eq(name, b"reg") {
+                    let entry_cells = address_cells.checked_add(size_cells)?;
+                    let entry_bytes = entry_cells.checked_mul(4)?;
+                    if entry_bytes == 0 || !length.is_multiple_of(entry_bytes) {
+                        return None;
+                    }
+                    gic_distributor = read_cells(data, address_cells * 4, address_cells)?;
+                    if length >= entry_bytes * 2 {
+                        gic_second_region =
+                            read_cells(data + entry_bytes, address_cells * 4, address_cells)?;
+                    }
+                } else if kind == NodeKind::Timer && c_string_eq(name, b"interrupts") {
+                    let spec_bytes = 12usize;
+                    let virtual_offset = spec_bytes.checked_mul(2)?;
+                    if length >= virtual_offset + spec_bytes {
+                        let spec = data + virtual_offset;
+                        if read_be32(spec)? == 1 {
+                            let irq = read_be32(spec + 4)?;
+                            if irq < 16 {
+                                timer_irq = 16 + irq;
+                                timer_flags = read_be32(spec + 8)?;
+                            }
+                        }
+                    }
                 }
             }
             4 => {}
@@ -725,6 +846,22 @@ unsafe fn parse_fdt(address: usize) -> Option<BootInfo> {
         }
     }
     info.handoff_address = address as u64;
+    info.interrupt_info = Aarch64InterruptInfo {
+        gic_version,
+        gic_distributor,
+        gic_cpu_interface: if gic_version == 2 {
+            gic_second_region
+        } else {
+            0
+        },
+        gic_redistributor: if gic_version >= 3 {
+            gic_second_region
+        } else {
+            0
+        },
+        timer_irq,
+        timer_flags,
+    };
     add_reserved(&mut info, address as u64, total_size as u64);
     #[cfg(not(target_os = "uefi"))]
     reserve_kernel(&mut info);
@@ -947,6 +1084,8 @@ enum NodeKind {
     Chosen,
     Memory,
     SimpleFramebuffer,
+    InterruptController,
+    Timer,
     Other,
 }
 
@@ -962,6 +1101,12 @@ unsafe fn node_kind(address: usize) -> (usize, NodeKind) {
         NodeKind::Memory
     } else if c_string_starts_with(address, b"simple-framebuffer") {
         NodeKind::SimpleFramebuffer
+    } else if c_string_starts_with(address, b"intc")
+        || c_string_starts_with(address, b"interrupt-controller")
+    {
+        NodeKind::InterruptController
+    } else if c_string_eq(address, b"timer") {
+        NodeKind::Timer
     } else {
         NodeKind::Other
     };

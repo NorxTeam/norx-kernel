@@ -2,9 +2,14 @@ use core::arch::asm;
 
 pub const NAME: &str = "aarch64";
 
+pub mod gic;
 pub mod paging;
 pub mod syscall;
 pub mod tables;
+
+pub fn start_kernel() -> ! {
+    unsafe { tables::norx_aarch64_kernel_start_entry() }
+}
 
 const EARLY_SERIAL_BASE: usize = 0x0900_0000;
 
@@ -230,15 +235,86 @@ pub fn timer_frequency_hz() -> Option<u64> {
 }
 
 pub fn timer_source() -> &'static str {
-    "poll"
+    if gic::timer_enabled() {
+        "gic"
+    } else {
+        "poll"
+    }
 }
 
 pub fn init_timer_interrupts() -> bool {
-    false
+    if !gic::status().ready || timer_frequency_hz().is_none() || !gic::enable_timer() {
+        return false;
+    }
+    let frequency = timer_frequency_hz().unwrap_or(0);
+    let interval = (frequency / crate::time::scheduler_hz()).max(1);
+    unsafe {
+        asm!(
+            "msr cntv_ctl_el0, {disabled}",
+            "msr cntv_tval_el0, {interval}",
+            "msr cntv_ctl_el0, {enabled}",
+            "isb",
+            disabled = in(reg) 0u64,
+            interval = in(reg) interval,
+            enabled = in(reg) 1u64,
+            options(nomem, nostack, preserves_flags)
+        );
+        asm!(
+            "msr daifclr, #2",
+            "isb",
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    crate::bootlog::ok_fmt(format_args!(
+        "aarch64 generic timer IRQ enabled source=gic intid={} frequency_hz={} interval={}",
+        gic::status().timer_intid,
+        frequency,
+        interval,
+    ));
+    true
+}
+
+pub fn rearm_timer() {
+    let frequency = timer_frequency_hz().unwrap_or(0);
+    let interval = (frequency / crate::time::scheduler_hz()).max(1);
+    unsafe {
+        asm!(
+            "msr cntv_tval_el0, {}",
+            in(reg) interval,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 }
 
 pub fn init_interrupt_controller() {
-    crate::bootlog::warn("gic interrupt controller init deferred");
+    gic::contract_self_check();
+    if let Some(status) = gic::init(crate::boot::info().interrupt_info) {
+        crate::bootlog::ok_fmt(format_args!(
+            "aarch64 gic{} discovered distributor=0x{:x} cpu=0x{:x} redistributor=0x{:x} timer_intid={} flags=0x{:x}",
+            status.version,
+            status.distributor,
+            status.cpu_interface,
+            status.redistributor,
+            status.timer_intid,
+            crate::boot::info().interrupt_info.timer_flags,
+        ));
+    } else {
+        crate::bootlog::warn(
+            "aarch64 GIC discovery/configuration unavailable; using counter polling",
+        );
+    }
+}
+
+pub fn handle_irq() {
+    if let Some(intid) = gic::acknowledge() {
+        let _ = crate::irq::dispatch(intid);
+        if intid == gic::status().timer_intid {
+            rearm_timer();
+        }
+        gic::end_of_interrupt(intid);
+    } else {
+        crate::irq::spurious();
+    }
 }
 
 pub fn init_syscalls() -> bool {

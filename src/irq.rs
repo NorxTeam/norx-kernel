@@ -25,15 +25,13 @@ pub enum IrqError {
 struct Registration {
     kind: IrqKind,
     line: u32,
-    vector: u8,
+    vector: u32,
     hard: HardHandler,
     deferred: Option<DeferredHandler>,
 }
 
 static TIMER: AtomicU64 = AtomicU64::new(0);
-#[cfg(target_arch = "x86_64")]
 static TIMER_PENDING: AtomicU64 = AtomicU64::new(0);
-#[cfg(target_arch = "x86_64")]
 static TIMER_REGISTRATION: AtomicU64 = AtomicU64::new(u64::MAX);
 static SPURIOUS: AtomicU64 = AtomicU64::new(0);
 static EXCEPTIONS: AtomicU64 = AtomicU64::new(0);
@@ -55,9 +53,7 @@ pub struct Stats {
 pub fn init() {
     PENDING.store(0, Ordering::Release);
     TIMER.store(0, Ordering::Relaxed);
-    #[cfg(target_arch = "x86_64")]
     TIMER_PENDING.store(0, Ordering::Relaxed);
-    #[cfg(target_arch = "x86_64")]
     TIMER_REGISTRATION.store(u64::MAX, Ordering::Relaxed);
     SPURIOUS.store(0, Ordering::Relaxed);
     EXCEPTIONS.store(0, Ordering::Relaxed);
@@ -93,8 +89,8 @@ pub fn contract_self_check() {
         assert_eq!(run_deferred(), 1);
         assert!(unregister(id).is_ok());
         assert!(matches!(unregister(id), Err(IrqError::NotRegistered)));
-        timer_contract_self_check();
     }
+    timer_contract_self_check();
     assert!(interrupt_storm_self_check());
 }
 
@@ -123,7 +119,7 @@ pub fn interrupt_storm_self_check() -> bool {
 pub fn register(
     kind: IrqKind,
     line: u32,
-    vector: u8,
+    vector: u32,
     hard: HardHandler,
     deferred: Option<DeferredHandler>,
 ) -> Result<RegistrationId, IrqError> {
@@ -177,7 +173,7 @@ pub fn unregister(id: RegistrationId) -> Result<(), IrqError> {
 /// Dispatches one vector. The hard handler must be bounded and non-blocking;
 /// deferred work is only marked here and runs through `run_deferred` later.
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-pub fn dispatch(vector: u8) -> bool {
+pub fn dispatch(vector: u32) -> bool {
     let registration = unsafe {
         let handlers = core::ptr::addr_of!(HANDLERS);
         let mut index = 0;
@@ -232,21 +228,17 @@ pub fn run_deferred() -> usize {
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 pub fn timer() {
     TIMER.fetch_add(1, Ordering::Relaxed);
-    #[cfg(target_arch = "x86_64")]
     TIMER_PENDING.fetch_add(1, Ordering::Release);
 }
 
-#[cfg(target_arch = "x86_64")]
 pub fn register_timer(id: RegistrationId) {
     TIMER_REGISTRATION.store(id as u64, Ordering::Release);
 }
 
-#[cfg(target_arch = "x86_64")]
 pub fn timer_pending() -> bool {
     TIMER_PENDING.load(Ordering::Acquire) != 0
 }
 
-#[cfg(target_arch = "x86_64")]
 pub fn requeue_timer() {
     let id = TIMER_REGISTRATION.load(Ordering::Acquire);
     if id < 64 {
@@ -254,7 +246,6 @@ pub fn requeue_timer() {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 pub fn take_timer_ticks(limit: u64) -> u64 {
     if limit == 0 {
         return 0;
@@ -279,7 +270,6 @@ pub fn take_timer_ticks(limit: u64) -> u64 {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 pub fn timer_contract_self_check() {
     for _ in 0..5 {
         timer();
@@ -303,10 +293,7 @@ pub fn exception() {
 pub fn stats() -> Stats {
     Stats {
         timer: TIMER.load(Ordering::Relaxed),
-        #[cfg(target_arch = "x86_64")]
         timer_pending: TIMER_PENDING.load(Ordering::Acquire),
-        #[cfg(target_arch = "aarch64")]
-        timer_pending: 0,
         spurious: SPURIOUS.load(Ordering::Relaxed),
         exceptions: EXCEPTIONS.load(Ordering::Relaxed),
         unhandled: UNHANDLED.load(Ordering::Relaxed),

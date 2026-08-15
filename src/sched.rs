@@ -3,7 +3,7 @@ use core::cell::UnsafeCell;
 const MAX_TASKS: usize = 16;
 const BASE_SLICE: u64 = 4;
 const INTERACTIVE_SLICE: u64 = 2;
-const HARDWARE_PROBE_SPINS: u32 = 100_000_000;
+const HARDWARE_PROBE_SPINS: u32 = 10_000_000;
 const POLLING_PROBE_SPINS: u32 = 100_000_000;
 const PROBE_BATCH_SPINS: u32 = 4096;
 const RUNTIME_PROBE_TICKS: u64 = 8;

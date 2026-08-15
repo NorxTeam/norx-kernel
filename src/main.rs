@@ -47,7 +47,8 @@ mod wasm;
 
 use core::panic::PanicInfo;
 
-pub fn kernel_start() -> ! {
+#[no_mangle]
+pub extern "C" fn kernel_start() -> ! {
     log::init();
     irq::init();
     irq::contract_self_check();
@@ -207,7 +208,6 @@ pub fn kernel_start() -> ! {
     } else {
         bootlog::fail("physical allocator has no free frames");
     }
-
     bootlog::start(3, "checking architecture tables");
     if arch::tables::init() {
         bootlog::ok("architecture tables initialized");
@@ -335,6 +335,12 @@ pub fn kernel_start() -> ! {
     sched::init_runtime();
     bootlog::ok("scheduler runtime initialized");
     bootlog::start(2, "checking timer source");
+    #[cfg(target_arch = "aarch64")]
+    let timer_handler_registered = arch::tables::register_timer_handler();
+    #[cfg(target_arch = "aarch64")]
+    if !timer_handler_registered {
+        bootlog::fail("aarch64 GIC timer handler registration failed");
+    }
     let timer_ready = timer::init();
     if timer_ready {
         bootlog::ok("hardware scheduler timer initialized");
@@ -367,13 +373,53 @@ pub fn kernel_start() -> ! {
             irq.timer,
             irq.deferred,
         ));
+        #[cfg(target_arch = "aarch64")]
+        {
+            let gic = arch::gic::status();
+            if timer_ready
+                && timer_handler_registered
+                && gic.ready
+                && gic.timer_enabled
+                && gic.ack_count >= 8
+                && irq.timer >= 8
+                && status.timer_ticks >= 8
+            {
+                bootlog::ok_fmt(format_args!(
+                    "NORX_AARCH64_GIC_TIMER_IRQ_OK v=1 intid={} ack_count={} irq_timer={} ticks={}",
+                    gic.timer_intid, gic.ack_count, irq.timer, status.timer_ticks,
+                ));
+            } else {
+                bootlog::fail_fmt(format_args!(
+                    "NORX_AARCH64_GIC_TIMER_IRQ_FAIL v=1 reason=insufficient-accounting intid={} ack_count={} irq_timer={} ticks={}",
+                    gic.timer_intid, gic.ack_count, irq.timer, status.timer_ticks,
+                ));
+            }
+        }
     } else {
         let status = sched::status();
         let irq = irq::stats();
         bootlog::fail_fmt(format_args!(
-            "scheduler runtime accounting probe failed ticks={} clock={} irq_timer={} pending={}",
-            status.timer_ticks, status.clock, irq.timer, irq.timer_pending,
+            "scheduler runtime accounting probe failed source={} ticks={} clock={} irq_timer={} pending={} spurious={} unhandled={} exceptions={} deferred={}",
+            arch::timer_source(),
+            status.timer_ticks,
+            status.clock,
+            irq.timer,
+            irq.timer_pending,
+            irq.spurious,
+            irq.unhandled,
+            irq.exceptions,
+            irq.deferred,
         ));
+        #[cfg(target_arch = "aarch64")]
+        bootlog::fail("NORX_AARCH64_GIC_TIMER_IRQ_FAIL v=1 reason=scheduler-accounting");
+        #[cfg(target_arch = "aarch64")]
+        {
+            let gic = arch::gic::status();
+            bootlog::warn_fmt(format_args!(
+                "aarch64 gic probe ack_count={} last_ack={} timer_intid={}",
+                gic.ack_count, gic.last_ack, gic.timer_intid,
+            ));
+        }
     }
     bootlog::start(1, "checking userspace init boundary");
     let userspace_init_ok = service::user_entry_self_check();

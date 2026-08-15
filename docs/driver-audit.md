@@ -39,11 +39,11 @@ lifecycle, interrupt registration API, DMA API, or driver-owned error type.
 | NS16550 MMIO | `0x1000_0000` helper in `ns16550` | none on supported targets | RISC-V-only dead surface in this tree; no RISC-V target or caller exists. Remove until RISC-V is supported, or retain only with a real platform resource. |
 | VGA fallback | Physical text memory `0xb8000`, writer state in `vga::STATE` | `log` during early x86 boot | `log::init` enables it and `log::init_framebuffer` disables it. No ownership or presence probe exists; x86-only fallback is intentionally retained. |
 | Firmware framebuffer | Bootloader-provided pointer, size, stride, format; reservation is recorded by `boot` | `framebuffer`, `log::CONSOLE` | Boot parsing validates geometry and reserves the range; console copies the descriptor and never releases it. No mode change, hotplug, or cache/flush contract exists. |
-| Clock counter | `rdtsc` on x86; `cntvct_el0`/`cntfrq_el0` on aarch64 | `time`, polling scheduler, diagnostics | Counter access is architecture-owned. Frequency is unknown on x86; aarch64 has a counter but no interrupt source. `clock` is currently reported `ready` before a usable scheduler source is known. |
-| x86 PIC/PIT | PIC ports `0x20/0x21/0xa0/0xa1`, PIT ports `0x40/0x43` | timer interrupt path | `arch::x86_64` owns setup and PIC EOI. APIC is only inspected/enabled for status; timer routing still uses legacy PIC/PIT. No IRQ object or shared ownership exists. |
+| Clock counter | `rdtsc` on x86; `cntvct_el0`/`cntfrq_el0` on aarch64 | `time`, scheduler, diagnostics | Counter access is architecture-owned. Frequency is unknown on x86; aarch64 programs the virtual counter as a GIC timer PPI at the scheduler rate after DTB discovery. |
+| x86 PIC/PIT | PIC ports `0x20/0x21/0xa0/0xa1`, PIT ports `0x40/0x43` | timer fallback and legacy IRQ EOI | `arch::x86_64` owns the remapped fallback path; APIC/HPET is preferred when calibration succeeds. Both routes use the shared IRQ contract. |
 | x86 IDT/GDT/TSS | Static IDT, GDT, TSS, and 16 KiB kernel stack | exception and timer handlers, syscall stack setup | `arch::x86_64::tables` owns all storage for the current boot. It is single-CPU static state; per-CPU and teardown semantics are absent. |
-| x86 local APIC | APIC MSR and physical MMIO base from `IA32_APIC_BASE` | status command and `apic::init` | `apic` owns the probe/enable write, but does not map or route APIC interrupts. The MMIO pointer has no explicit mapping/resource validation. |
-| aarch64 exception vectors | Static vector table and EL-specific system registers | synchronous syscall stub and fatal exception handler | `arch::aarch64::tables` installs VBAR and owns the vector image. GIC discovery, IRQ acknowledgement, and timer IRQ delivery are absent. |
+| x86 local APIC | APIC MSR and physical MMIO base from `IA32_APIC_BASE` | calibrated timer interrupt path and status command | `arch::x86_64` owns APIC/HPET calibration, vector routing, EOI, and the PIT fallback decision. The MMIO pointer has no explicit mapping/resource validation. |
+| aarch64 exception vectors/GIC | Static vector table, EL-specific system registers, and DTB-discovered GICv2/v3 | synchronous syscall/fault entry, IRQ acknowledgement, and generic timer PPI | `arch::aarch64::tables` installs VBAR and uses a dedicated kernel stack; `arch::aarch64::gic` owns distributor/CPU-interface or redistributor setup, ACK/EOI, and timer enable. |
 | RAM block layer | `static mut RAMDISK`, 32 sectors of 512 bytes, fixed request queue | `vfs`, serial `block` diagnostic | `drivers::block` owns geometry, request lifetime, bounded completion, MBR partition discovery, read-only state, and write-through cache policy. The RAM backend has no persistent teardown because it is boot-owned memory. |
 | Driver registry | Static 32-entry metadata array and length | boot initialization and `drivers` debugger command | `framework` owns storage, but callers ignore the `bool` result. Registration is only a status display and does not own hardware or bind a driver. |
 | Physical frames | Static range table and monotonic allocator | x86 paging lazy mapper | `memory` owns allocation; paging returns a frame when a lazy leaf cannot be installed. This is an adjacent memory contract, not a device DMA allocator. |
@@ -95,17 +95,20 @@ must remain inside the architecture/bus implementation.
 - x86 installs IDT entries for exceptions, spurious IRQs, and vector 32.
   Timer IRQ work increments statistics, charges the scheduler, and sends a
   legacy PIC EOI in the hard handler (`src/arch/x86_64/tables.rs:204-220`).
-- x86 APIC detection does not replace PIC routing. `init_timer_interrupts`
-  always remaps PIC, programs PIT, enables interrupts, and returns `true`.
-- aarch64 installs exception vectors and handles fatal exceptions plus the
-  temporary syscall path. `init_interrupt_controller` only logs that GIC is
-  deferred and `init_timer_interrupts` returns `false`.
-- There is no interrupt ownership, masking policy, handler registration,
-  threaded/deferred work, storm protection, or safe driver callback boundary.
+- x86 selects the calibrated APIC timer when available and keeps the remapped
+  PIT/PIC path as a bounded fallback; both paths feed the shared IRQ contract.
+- aarch64 installs exception vectors on the dedicated kernel stack, discovers
+  GICv2/v3 from the DTB, acknowledges and EOIs interrupt IDs, and programs the
+  virtual generic timer PPI. The scheduler runtime smoke requires positive IRQ
+  accounting; polling remains the bounded fallback when discovery or setup is
+  unavailable.
+- The shared registration table provides line/vector ownership, bounded hard
+  handlers, deferred callbacks, and storm coalescing. Per-CPU ownership,
+  threaded IRQs, and high-throughput driver callbacks remain out of scope.
 
-The scheduler callback is bounded by the current fixed task array, but it is
-still work in hard IRQ context and must not become the model for high-throughput
-drivers.
+The scheduler callback is bounded by the current fixed task array and runs from
+the deferred normal-context pass; it must not become the model for
+high-throughput drivers.
 
 ### DMA
 
@@ -268,11 +271,10 @@ unaligned parsing remain architecture/boot-parser internals.
 ### IRQ follow-up
 
 IRQ registration now carries `IrqKind`, line, vector, a bounded hard handler,
-and an optional deferred callback. x86 legacy timer vector 32 only increments
-an atomic counter in hard IRQ context; scheduler work runs in one bounded
-normal-context pass. MSI/MSI-X/GIC are represented by the shared contract, but
-their hardware routing remains explicitly unsupported/deferred until a real
-controller driver exists.
+and an optional deferred callback. x86 timer and aarch64 GIC timer hard
+handlers only increment atomic accounting; scheduler work runs in one bounded
+normal-context pass. MSI/MSI-X and per-device GIC routing remain deferred until
+their controller/device ownership contracts are added.
 
 ### Runtime tracing follow-up
 

@@ -514,7 +514,7 @@ impl Runtime {
         if self.irq > 15 {
             return false;
         }
-        let vector = 32 + self.irq;
+        let vector = 32u32 + self.irq as u32;
         let Ok(_) = crate::irq::register(
             crate::drivers::framework::IrqKind::Legacy,
             self.irq as u32,

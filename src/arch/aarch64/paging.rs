@@ -84,7 +84,24 @@ pub fn physical_to_virtual(address: crate::address::PhysAddr) -> Option<crate::a
 }
 
 pub fn virtual_to_physical(address: crate::address::VirtAddr) -> Option<crate::address::PhysAddr> {
-    Some(crate::address::PhysAddr::new(address.value() as u64))
+    let virtual_address = address.value() as u64;
+    let physical: u64;
+    unsafe {
+        asm!(
+            "at s1e1r, {address}",
+            "isb",
+            address = in(reg) virtual_address,
+            options(nomem, nostack, preserves_flags),
+        );
+        asm!(
+            "mrs {physical}, par_el1",
+            physical = out(reg) physical,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (physical & 1 == 0).then_some(crate::address::PhysAddr::new(
+        (physical & ADDRESS_MASK) | (virtual_address & (PAGE_SIZE - 1)),
+    ))
 }
 
 pub fn user_space_prepare(root: crate::address::PhysAddr) -> bool {

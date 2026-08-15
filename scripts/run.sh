@@ -41,6 +41,8 @@ case "$arch" in
         ;;
 esac
 
+machine="${QEMU_MACHINE:-$machine}"
+
 command -v grub-mkstandalone >/dev/null 2>&1 || {
     echo "grub-mkstandalone is required" >&2
     exit 1
