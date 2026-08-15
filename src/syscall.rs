@@ -412,6 +412,7 @@ pub struct DelegatedSpawnSpec {
 }
 
 pub const SPAWN_INHERIT_CREDENTIALS: UserWord = 1 << 2;
+pub const SPAWN_INHERIT_OPEN_FDS: UserWord = 1 << 3;
 pub const CAP_PRIVILEGE_DELEGATION: u64 = 1 << 7;
 
 #[repr(C)]
@@ -762,7 +763,10 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Err(errno) => return errno.return_value(),
             };
             if spec.flags
-                & !(SPAWN_NEW_PROCESS_GROUP | SPAWN_FOREGROUND | SPAWN_INHERIT_CREDENTIALS)
+                & !(SPAWN_NEW_PROCESS_GROUP
+                    | SPAWN_FOREGROUND
+                    | SPAWN_INHERIT_CREDENTIALS
+                    | SPAWN_INHERIT_OPEN_FDS)
                 != 0
             {
                 return Errno::Einval.return_value();
@@ -805,9 +809,17 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                     return Errno::Ebadf.return_value();
                 }
             };
-            if crate::process::inherit_spawn_standard_fds(transaction, source_fds).is_err() {
+            if let Err(error) = crate::process::inherit_spawn_fds(
+                transaction,
+                source_fds,
+                spec.flags & SPAWN_INHERIT_OPEN_FDS != 0,
+            ) {
                 discard_spawn(transaction);
-                return Errno::Ebadf.return_value();
+                return match error {
+                    crate::process::Error::InvalidFd => Errno::Ebadf.return_value(),
+                    crate::process::Error::FdCapacity => Errno::Eagain.return_value(),
+                    _ => Errno::Eperm.return_value(),
+                };
             }
             let requested_group = if spec.flags & SPAWN_NEW_PROCESS_GROUP != 0 {
                 child_id
@@ -1229,14 +1241,20 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Ok(fd) => fd,
                 Err(_) => return Errno::Ebadf.return_value(),
             };
-            let (_, _, _, writable) = match current_fd_info(fd) {
+            let (open_file, _, _, writable) = match current_fd_info(fd) {
                 Ok(info) => info,
                 Err(errno) => return errno.return_value(),
             };
             if !writable {
                 return Errno::Ebadf.return_value();
             }
-            Errno::Enotsup.return_value()
+            let Some(handle) = crate::vfs::FileHandle::from_raw(open_file) else {
+                return Errno::Enotsup.return_value();
+            };
+            match crate::vfs::sync_handle(handle) {
+                Ok(()) => 0,
+                Err(error) => vfs_errno(error).return_value(),
+            }
         }
         value if value == Number::SyncPath as UserWord => {
             let mut path_bytes = [0u8; MAX_PATH];
@@ -1245,7 +1263,7 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Err(errno) => return errno.return_value(),
             };
             match crate::vfs::sync_path(path) {
-                Ok(()) => Errno::Enotsup.return_value(),
+                Ok(()) => 0,
                 Err(error) => vfs_errno(error).return_value(),
             }
         }
@@ -1758,6 +1776,7 @@ fn vfs_errno(error: crate::vfs::Error) -> Errno {
         crate::vfs::Error::InvalidHandle => Errno::Ebadf,
         crate::vfs::Error::InvalidPath => Errno::Einval,
         crate::vfs::Error::OffsetOutOfRange => Errno::Einval,
+        crate::vfs::Error::BackendUnsupported => Errno::Enotsup,
         _ => Errno::Einval,
     }
 }
@@ -1818,6 +1837,7 @@ pub fn contract_self_check() {
     assert_eq!(PIPE_NONBLOCK, 1);
     assert_eq!(SPAWN_NEW_PROCESS_GROUP | SPAWN_FOREGROUND, 3);
     assert_eq!(SPAWN_INHERIT_CREDENTIALS, 4);
+    assert_eq!(SPAWN_INHERIT_OPEN_FDS, 8);
     assert_eq!(WAIT_NONBLOCK, 1);
     assert_eq!(F_GETFD, 1);
     assert_eq!(F_SETFD, 2);

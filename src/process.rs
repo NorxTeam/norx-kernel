@@ -619,21 +619,56 @@ impl ProcessTable {
         child: ProcessId,
         source_fds: [FileDescriptor; 3],
     ) -> Result<(), Error> {
-        self.process(parent)?;
+        self.inherit_fds(parent, child, source_fds, false)
+    }
+
+    pub fn inherit_open_fds(
+        &mut self,
+        parent: ProcessId,
+        child: ProcessId,
+        source_fds: [FileDescriptor; 3],
+    ) -> Result<(), Error> {
+        self.inherit_fds(parent, child, source_fds, true)
+    }
+
+    fn inherit_fds(
+        &mut self,
+        parent: ProcessId,
+        child: ProcessId,
+        source_fds: [FileDescriptor; 3],
+        inherit_open_fds: bool,
+    ) -> Result<(), Error> {
+        let parent_record = *self.process(parent)?;
         let child_record = *self.process(child)?;
-        if child_record.parent != Some(parent) || child_record.state != ProcessState::Creating {
+        if parent_record.state != ProcessState::Running
+            || child_record.parent != Some(parent)
+            || child_record.state != ProcessState::Creating
+        {
             return Err(Error::InvalidState);
         }
         let mut sources = [None; 3];
         for (index, fd) in source_fds.into_iter().enumerate() {
             let slot = fd.slot().ok_or(Error::InvalidFd)?;
-            sources[index] = Some(self.process(parent)?.fds[slot].ok_or(Error::InvalidFd)?);
+            sources[index] = Some(parent_record.fds[slot].ok_or(Error::InvalidFd)?);
         }
-        let mut duplicated = [None; 3];
+        let mut target = [None; MAX_FDS];
+        if inherit_open_fds {
+            target = parent_record.fds;
+        }
         for (index, source) in sources.into_iter().enumerate() {
+            target[index] = source;
+        }
+        let mut duplicated = [None; MAX_FDS];
+        for (index, source) in target.into_iter().enumerate() {
             let Some(source) = source else {
                 continue;
             };
+            if index >= child_record.session.max_fds as usize {
+                for open_file in duplicated.into_iter().flatten() {
+                    release_open_file(open_file);
+                }
+                return Err(Error::FdCapacity);
+            }
             if let Err(error) = duplicate_open_file(source.open_file) {
                 for open_file in duplicated.into_iter().flatten() {
                     release_open_file(open_file);
@@ -646,19 +681,7 @@ impl ProcessTable {
         for entry in old.into_iter().flatten() {
             release_open_file(entry.open_file);
         }
-        let record = self.process_mut(child)?;
-        for (index, source) in sources.into_iter().enumerate() {
-            let Some(source) = source else {
-                continue;
-            };
-            record.fds[index] = Some(FdEntry {
-                open_file: duplicated[index].ok_or(Error::InvalidState)?,
-                close_on_exec: source.close_on_exec,
-                nonblocking: source.nonblocking,
-                readable: source.readable,
-                writable: source.writable,
-            });
-        }
+        self.process_mut(child)?.fds = target;
         Ok(())
     }
 
@@ -1766,9 +1789,23 @@ pub fn inherit_spawn_standard_fds(
     transaction: SpawnTransaction,
     source_fds: [u32; 3],
 ) -> Result<(), Error> {
+    inherit_spawn_fds(transaction, source_fds, false)
+}
+
+pub fn inherit_spawn_fds(
+    transaction: SpawnTransaction,
+    source_fds: [u32; 3],
+    inherit_open_fds: bool,
+) -> Result<(), Error> {
     crate::arch::without_interrupts(|| unsafe {
         let runtime = &mut *RUNTIME.0.get();
-        runtime.table.inherit_standard_fds(
+        let inherit = if inherit_open_fds {
+            ProcessTable::inherit_open_fds
+        } else {
+            ProcessTable::inherit_standard_fds
+        };
+        inherit(
+            &mut runtime.table,
             transaction.parent,
             transaction.child,
             source_fds.map(FileDescriptor::from_raw),
@@ -1928,6 +1965,78 @@ pub fn contract_self_check() {
     assert_eq!(duplicate.get(), 4);
     assert_eq!(table.fd_info(child, duplicate).unwrap().0, 1);
     assert!(!table.fd_info(child, duplicate).unwrap().1);
+    table.set_close_on_exec(child, fd, false).unwrap();
+    let extra_fd = table.open_fd(child, 2, false, true).unwrap();
+    assert_eq!(extra_fd.get(), 5);
+    table.set_close_on_exec(child, extra_fd, true).unwrap();
+    let (all_fds_child, all_fds_thread) = table
+        .spawn_child_staged(child, Credentials::BOOTSTRAP)
+        .unwrap();
+    table
+        .inherit_open_fds(child, all_fds_child, [fd, duplicate, fd])
+        .unwrap();
+    assert_eq!(
+        table
+            .fd_info(all_fds_child, FileDescriptor::from_raw(3))
+            .unwrap()
+            .0,
+        1
+    );
+    assert_eq!(
+        table
+            .fd_info(all_fds_child, FileDescriptor::from_raw(4))
+            .unwrap()
+            .0,
+        1
+    );
+    assert_eq!(
+        table
+            .fd_info(all_fds_child, FileDescriptor::from_raw(5))
+            .unwrap(),
+        (2, true, false, false, true)
+    );
+    assert!(
+        !table
+            .fd_info(all_fds_child, FileDescriptor::from_raw(3))
+            .unwrap()
+            .1
+    );
+    assert!(
+        table
+            .fd_info(all_fds_child, FileDescriptor::from_raw(5))
+            .unwrap()
+            .1
+    );
+    assert_eq!(table.close_on_exec(all_fds_child), Ok(1));
+    assert_eq!(
+        table.fd_info(all_fds_child, FileDescriptor::from_raw(5)),
+        Err(Error::InvalidFd)
+    );
+    table.publish_child(all_fds_child, all_fds_thread).unwrap();
+    table.exit(all_fds_child, 0).unwrap();
+    assert_eq!(
+        table.wait(child, Some(all_fds_child)).unwrap(),
+        (all_fds_child, 0)
+    );
+
+    let (capacity_child, capacity_thread) = table
+        .spawn_child_staged(child, Credentials::BOOTSTRAP)
+        .unwrap();
+    table.process_mut(capacity_child).unwrap().session.max_fds = 5;
+    assert_eq!(
+        table.inherit_open_fds(child, capacity_child, [fd, duplicate, fd]),
+        Err(Error::FdCapacity)
+    );
+    assert_eq!(
+        table
+            .fd_info(capacity_child, FileDescriptor::from_raw(0))
+            .unwrap()
+            .0,
+        0
+    );
+    table.abort_child(child, capacity_child).unwrap();
+    let _ = capacity_thread;
+
     table.raise_signal(child, 2).unwrap();
     table.raise_event(child, 3).unwrap();
     assert!(table.signal_pending(child, 2).unwrap());
@@ -1985,6 +2094,10 @@ pub fn contract_self_check() {
             .0,
         1
     );
+    assert_eq!(
+        table.fd_info(inherited_child, FileDescriptor::from_raw(3)),
+        Err(Error::InvalidFd)
+    );
     let transaction = SpawnTransaction {
         parent: child,
         child: inherited_child,
@@ -2011,6 +2124,7 @@ pub fn contract_self_check() {
     assert_eq!(table.thread_accounting(kernel_thread).unwrap(), (2, 1, 1));
     table.close_fd(child, fd).unwrap();
     table.close_fd(child, duplicate).unwrap();
+    table.close_fd(child, extra_fd).unwrap();
     table.exit(child, 23).unwrap();
     assert_eq!(table.wait(init, Some(child)).unwrap(), (child, 23));
     assert_eq!(table.thread_state(child_thread), Err(Error::InvalidId));
