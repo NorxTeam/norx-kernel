@@ -34,7 +34,7 @@ lifecycle, interrupt registration API, DMA API, or driver-owned error type.
 
 | Component | Resource and current owner | Current consumers | Lifetime and gap |
 | --- | --- | --- | --- |
-| x86 NS16550 | COM1 PIO ports `0x3f8..0x3ff`; raw port access is in `arch` | boot logging, panic logging, serial debugger | Initialized by `arch::init`; never probed, released, or represented as a resource. |
+| x86 NS16550 | COM1 PIO ports `0x3f8..0x3ff`; raw port access is in `arch` | boot logging, panic logging, serial debugger | Initialized by `arch::init` with a scratch-register presence probe; never released or represented as a resource. |
 | aarch64 PL011 | MMIO base `0x0900_0000`; raw register access is in `drivers::serial::pl011` | boot logging, panic logging, serial debugger | Initialized by `arch::init`; address is assumed, not obtained from the DTB, and there is no absent-device state. |
 | NS16550 MMIO | `0x1000_0000` helper in `ns16550` | none on supported targets | RISC-V-only dead surface in this tree; no RISC-V target or caller exists. Remove until RISC-V is supported, or retain only with a real platform resource. |
 | VGA fallback | Physical text memory `0xb8000`, writer state in `vga::STATE` | `log` during early x86 boot | `log::init` enables it and `log::init_framebuffer` disables it. No ownership or presence probe exists; x86-only fallback is intentionally retained. |
@@ -151,9 +151,9 @@ caller would duplicate the same bug surface.
 
 ### Fake capabilities and silent errors
 
-- `drivers::init` reports serial, clock, and framebuffer as `Ready` without
-  probing or checking availability. A missing framebuffer is only diagnosed
-  later in `main`.
+- `drivers::init` now registers serial as `Failed` when the early UART latch is
+  unavailable, but clock and framebuffer still need richer probe states. A
+  missing framebuffer is only diagnosed later in `main`.
 - aarch64 reports the clock driver as ready even though its scheduler timer
   returns `false`; the GIC is explicitly absent.
 - all four `framework::register` results are ignored, so capacity failure is
@@ -162,8 +162,9 @@ caller would duplicate the same bug surface.
   “vfs initialized” regardless of that result.
 - the block API returns `bool`, which loses the distinction between invalid
   LBA, unavailable device, timeout, and I/O error.
-- serial formatting discards `fmt::Result`; today the writers always return
-  `Ok`, but this prevents future absent/stalled-device reporting.
+- serial formatting returns failure to the shared writer, which records the
+  first init or transmit-timeout reason and suppresses later UART attempts;
+  fallback sinks still receive the same log call.
 
 The future state must be derived from probe results and must distinguish at
 least `deferred`, `unsupported`, `busy`, and `failed`, as required by the
@@ -173,9 +174,10 @@ boot path attempted to initialize it.
 ### Busy loops and timeouts
 
 The audit found unbounded UART waits in the x86 NS16550 and PL011 transmit
-paths, plus a dead RISC-V NS16550 path. The dead path was removed; the live
-transmit paths now use a bounded poll limit, return failure, and the shared
-serial layer suppresses repeated writes after the first hardware failure.
+paths, plus a dead RISC-V NS16550 path. The dead path was removed; both live
+transmit paths now use the shared 4096-poll limit, return failure, and the
+shared serial layer suppresses repeated writes after the first hardware
+failure.
 `halt` and the serial-debugger main loop remain intentionally unbounded control
 loops and are not device wait bugs.
 
@@ -184,8 +186,10 @@ loops and are not device wait bugs.
 - `sched::self_check` is a boot-time assertion for the scheduler model.
 - The serial debugger's `crash` command is an intentional panic-path hook;
   `drivers`, `irq`, `hw`, `mem`, and `paging` are diagnostic views.
-- No driver-specific fault injection, timeout, malformed descriptor, DMA
-  failure, hot-unplug, or interrupt-storm test hook exists.
+- The serial contract self-check covers the failure-reason encoding and poll
+  bound; `scripts/qemu-boot.ps1 -SerialDevice none` provides a bounded missing
+  COM1 run. Other driver-specific fault injection, malformed descriptor, DMA
+  failure, and hot-unplug hooks remain absent.
 - The CI workflow covers formatting, two builds, two Clippy runs, and GRUB
   image creation, but does not run QEMU smoke assertions or failure matrices.
 
@@ -302,8 +306,9 @@ not write the buffer.
 
 ### UART follow-up
 
-The early serial paths now use bounded polling and report initialization or
-transmit failure instead of waiting forever. The x86 NS16550 driver programs a
+The early serial paths now use a shared 4096-poll bound and report
+initialization or transmit failure instead of waiting forever. The x86 NS16550
+driver probes its standard scratch register after programming a
 validated divisor from the configured clock and baud, enables or disables its
 FIFO, and can request the controller's automatic RTS/CTS mode. The aarch64
 PL011 driver programs rounded integer and fractional divisors, FIFO mode, and
@@ -314,9 +319,11 @@ and baud configurations before touching hardware.
 the PL011 `init_with_config` path provide the runtime configuration boundary.
 The architecture early-console wrappers use the default configuration and
 mark the shared serial service failed after the first bounded I/O failure, so
-later logging does not repeatedly spin on a missing or stalled UART. Each
-architecture runs a boot-time divisor/FIFO/flow-control contract check before
-driver registration.
+later logging does not repeatedly spin on a missing or stalled UART. The boot
+log emits the versioned `NORX_EARLY_UART_READY` or
+`NORX_EARLY_UART_DISABLED` marker after fallback selection. Each architecture
+runs a boot-time divisor/FIFO/flow-control contract check before driver
+registration.
 
 ### PS/2 controller follow-up
 

@@ -55,11 +55,35 @@ pub extern "C" fn kernel_start() -> ! {
     io::contract_self_check();
     #[cfg(target_arch = "x86_64")]
     net::contract_self_check();
+    drivers::serial::contract_self_check();
     let boot = boot::info();
     #[cfg(target_arch = "x86_64")]
     bootlog::ok("VGA fallback initialized");
     if let Some(raw) = boot.framebuffer {
         log::init_framebuffer(raw);
+    }
+    #[cfg(target_arch = "x86_64")]
+    let fallback = "vga-or-framebuffer";
+    #[cfg(target_arch = "aarch64")]
+    let fallback = if boot.framebuffer.is_some() {
+        "framebuffer"
+    } else {
+        "none"
+    };
+    if let Some(reason) = drivers::serial::failure_reason() {
+        bootlog::warn_fmt(format_args!(
+            "NORX_EARLY_UART_DISABLED v=1 backend={} reason={} poll-limit={} fallback={}",
+            drivers::serial::backend_name(),
+            reason.name(),
+            drivers::serial::EARLY_TX_POLL_LIMIT,
+            fallback,
+        ));
+    } else {
+        bootlog::ok_fmt(format_args!(
+            "NORX_EARLY_UART_READY v=1 backend={} poll-limit={}",
+            drivers::serial::backend_name(),
+            drivers::serial::EARLY_TX_POLL_LIMIT,
+        ));
     }
     bootlog::title();
     bootlog::ok("interrupt, MMIO, PIO, and DMA boundary checks passed");
@@ -180,7 +204,11 @@ pub extern "C" fn kernel_start() -> ! {
         bootlog::fail("vfs initialization failed");
     }
     bootlog::start(2, "initializing serial-debugger");
-    bootlog::ok("serial-debugger input ready");
+    if drivers::serial::available() {
+        bootlog::ok("serial-debugger input ready");
+    } else {
+        bootlog::warn("serial-debugger unavailable; UART failure fallback active");
+    }
 
     if boot.framebuffer.is_none() {
         bootlog::start(3, "checking framebuffer");
@@ -490,7 +518,11 @@ pub extern "C" fn kernel_start() -> ! {
         bootlog::warn("persistent warm-reboot status commit failed");
     }
     bootlog::quickinit_overlay_complete(userspace_init_ok && warm_reboot_ready);
-    serial_debugger::run()
+    if drivers::serial::available() {
+        serial_debugger::run()
+    } else {
+        arch::halt()
+    }
 }
 
 #[panic_handler]

@@ -15,8 +15,11 @@ static mut RUNTIME_CR3: u64 = 0;
 
 pub fn init() {
     unsafe { FIRMWARE_CR3 = paging::current_cr3_value() };
-    if !crate::drivers::serial::ns16550::init_port_io(EARLY_SERIAL_PORT) {
-        crate::drivers::serial::mark_failed();
+    let initialized = crate::drivers::serial::ns16550::init_port_io(EARLY_SERIAL_PORT);
+    if !initialized {
+        crate::drivers::serial::mark_failed(crate::drivers::serial::FailureReason::Init);
+    } else if !crate::drivers::serial::ns16550::tx_ready_port_io(EARLY_SERIAL_PORT) {
+        crate::drivers::serial::mark_failed(crate::drivers::serial::FailureReason::TxTimeout);
     }
     unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) };
 }

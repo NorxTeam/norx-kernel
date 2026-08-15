@@ -1,4 +1,4 @@
-use super::{FlowControl, SerialConfig};
+use super::{FlowControl, SerialConfig, EARLY_TX_POLL_LIMIT};
 
 const DR: usize = 0x00;
 const FR: usize = 0x18;
@@ -8,7 +8,6 @@ const LCRH: usize = 0x2c;
 const CR: usize = 0x30;
 const IMSC: usize = 0x38;
 const ICR: usize = 0x44;
-const TX_POLL_LIMIT: usize = 1_000_000;
 const UART_CLOCK_HZ: u32 = 24_000_000;
 const DEFAULT_BAUD: u32 = 115_200;
 
@@ -44,12 +43,23 @@ pub fn write(base: usize, byte: u8) -> bool {
     let Some(mmio) = region(base) else {
         return false;
     };
-    for _ in 0..TX_POLL_LIMIT {
-        if mmio.read_u32_le(FR).unwrap_or(1 << 5) & (1 << 5) == 0 {
+    for _ in 0..EARLY_TX_POLL_LIMIT {
+        if tx_ready_mmio(&mmio) {
             return mmio.write_u32_le(DR, byte as u32);
         }
     }
     false
+}
+
+pub fn tx_ready(base: usize) -> bool {
+    let Some(mmio) = region(base) else {
+        return false;
+    };
+    tx_ready_mmio(&mmio)
+}
+
+fn tx_ready_mmio(mmio: &crate::io::MmioRegion) -> bool {
+    mmio.read_u32_le(FR).unwrap_or(1 << 5) & (1 << 5) == 0
 }
 
 pub fn read(base: usize) -> Option<u8> {

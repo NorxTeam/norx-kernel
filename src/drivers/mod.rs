@@ -155,6 +155,11 @@ pub fn init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
     ));
     block::contract_self_check();
     let mut ok = true;
+    let serial_state = if serial::available() {
+        framework::DeviceState::Ready
+    } else {
+        framework::DeviceState::Failed
+    };
     let display_state = match display::init(framebuffer) {
         display::InitResult::Ready(_) => framework::DeviceState::Ready,
         display::InitResult::Unsupported => framework::DeviceState::Unsupported,
@@ -167,7 +172,7 @@ pub fn init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
             framework::Class::Serial,
             framework::BusKind::Platform,
         ),
-        framework::DeviceState::Ready,
+        serial_state,
     ) {
         ok = false;
     }

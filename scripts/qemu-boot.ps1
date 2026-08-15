@@ -8,6 +8,7 @@ param(
     [string]$Esp,
     [string]$Vars,
     [string]$SerialLog,
+    [string]$SerialDevice = 'stdio',
     [string]$Display = 'none',
     [string[]]$Marker = @(),
     [switch]$Interactive
@@ -113,7 +114,7 @@ if ($Arch -eq 'x86_64') {
     $qemuArgs += @('-device', 'ramfb')
 }
 $qemuArgs += @(
-    '-serial', 'stdio',
+    '-serial', $SerialDevice,
     '-drive', "if=pflash,format=raw,readonly=on,file=$firmwarePath",
     '-drive', "if=pflash,format=raw,file=$Vars",
     '-drive', "format=raw,file=fat:rw:$Esp"
@@ -144,14 +145,14 @@ if (-not $completed) {
 }
 
 $output = Get-Content -LiteralPath $SerialLog -Raw -ErrorAction SilentlyContinue
+if (-not $completed) {
+    Write-Host "QEMU $Arch timed out after ${TimeoutSeconds}s; serial log=$SerialLog"
+    exit 124
+}
 $missing = @($Marker | Where-Object { $output -notlike "*$_*" })
 if ($missing.Count -gt 0) {
     Write-Error ("Missing QEMU markers: " + ($missing -join ', '))
     exit 1
-}
-if (-not $completed) {
-    Write-Host "QEMU $Arch timed out after ${TimeoutSeconds}s; serial log=$SerialLog"
-    exit 124
 }
 Write-Host "QEMU $Arch exited code=$($process.ExitCode); serial log=$SerialLog"
 exit $process.ExitCode

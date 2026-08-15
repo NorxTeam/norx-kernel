@@ -61,8 +61,11 @@ pub fn init() {
             options(nomem, nostack, preserves_flags)
         )
     };
-    if !crate::drivers::serial::pl011::init(EARLY_SERIAL_BASE) {
-        crate::drivers::serial::mark_failed();
+    let initialized = crate::drivers::serial::pl011::init(EARLY_SERIAL_BASE);
+    if !initialized {
+        crate::drivers::serial::mark_failed(crate::drivers::serial::FailureReason::Init);
+    } else if !crate::drivers::serial::pl011::tx_ready(EARLY_SERIAL_BASE) {
+        crate::drivers::serial::mark_failed(crate::drivers::serial::FailureReason::TxTimeout);
     }
 }
 

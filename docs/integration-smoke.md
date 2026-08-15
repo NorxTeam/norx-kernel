@@ -93,7 +93,43 @@ boot hand-off and parser boundary checks passed
 
 ## Serial and framebuffer artifacts
 
-CI keeps the raw serial stream for diagnosis and derives an ANSI/CR-free
+### Early UART failure contract
+
+The architecture wrapper initializes and performs a non-blocking TX-ready
+probe on the early UART before `kernel_start`. The contract is one-way for the
+lifetime of a boot: an init failure, an initially stalled TX status, or the
+first transmit that exhausts the shared 4096-poll budget stores the first
+failure reason (`init` or `tx-timeout`), disables subsequent UART writes and
+reads, and lets `log` continue to VGA or the firmware framebuffer. No logging
+path retries a failed UART indefinitely. x86 NS16550 initialization also
+writes and reads its standard scratch register, so a missing COM1 is reported
+as `reason=init`; PL011 relies on the bounded transmit path because a blind
+read from an unmapped MMIO address is not a safe presence probe. The runtime
+serial debugger is not entered when the latch is failed, avoiding a silent
+no-op input loop.
+
+The early boot marker is emitted after fallback consoles are selected:
+
+```text
+NORX_EARLY_UART_READY v=1 backend=ns16550|pl011 poll-limit=4096
+NORX_EARLY_UART_DISABLED v=1 backend=ns16550|pl011 reason=init|tx-timeout poll-limit=4096 fallback=...
+```
+
+For a local bounded missing-COM1 run, use the Windows wrapper without serial
+markers and attach the host backend to `none`; the wrapper must return within
+the requested timeout rather than hanging in UART output:
+
+```powershell
+pwsh ./scripts/qemu-boot.ps1 -Arch x86_64 -SerialDevice none -Display none -TimeoutSeconds 5
+```
+
+The same override is available to the POSIX launcher with `QEMU_SERIAL=none`.
+A disabled-UART marker is visible through a configured fallback display, not
+through the intentionally absent serial stream.
+
+CI requires the architecture-specific `NORX_EARLY_UART_READY` marker in both
+QEMU runs before checking the later architecture gate. It keeps the raw serial
+stream for diagnosis and derives an ANSI/CR-free
 `*.stable.log` from it before applying smoke assertions. The stable file is
 the automation interface; the raw file remains available when a failure needs
 the original terminal control sequences.

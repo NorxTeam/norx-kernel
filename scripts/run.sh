@@ -5,6 +5,7 @@ arch="${1:-x86_64}"
 profile="${PROFILE:-dev}"
 mode="${MODE:-run}"
 qemu_display="${QEMU_DISPLAY:-gtk}"
+qemu_serial="${QEMU_SERIAL:-stdio}"
 
 case "$arch" in
     x86_64)
@@ -138,7 +139,7 @@ exec "$qemu" \
     $qemu_video_args \
     $usb_args \
     $network_args \
-    -serial stdio \
+    -serial "$qemu_serial" \
     -no-reboot \
     -no-shutdown \
     -drive "if=pflash,format=raw,readonly=on,file=$qemu_share/$firmware" \
