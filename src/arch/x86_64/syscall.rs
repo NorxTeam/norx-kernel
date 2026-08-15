@@ -59,7 +59,7 @@ static mut SWITCH_TO: u64 = 0;
 pub static mut PAGE_FAULT_TARGET_CONTEXT: u64 = 0;
 
 #[no_mangle]
-static mut KERNEL_STACK_TOP: u64 = 0;
+static mut SYSCALL_STACK_TOP: u64 = 0;
 
 #[no_mangle]
 static mut USER_RETURN_RSP_STACK: [u64; 4] = [0; 4];
@@ -114,7 +114,7 @@ norx_x86_64_syscall_entry:
     jae norx_x86_64_kernel_stack_overflow
     dec rax
     shl rax, 17
-    mov rdx, qword ptr [rip + KERNEL_STACK_TOP]
+    mov rdx, qword ptr [rip + SYSCALL_STACK_TOP]
     sub rdx, rax
     mov rsp, rdx
     and rsp, -16
@@ -265,10 +265,19 @@ extern "sysv64" {
 
 pub fn init() -> bool {
     unsafe {
-        KERNEL_STACK_TOP = crate::arch::tables::syscall_stack_top();
+        let kernel_stack_top = crate::arch::tables::kernel_stack_top();
+        let syscall_stack_top = crate::arch::tables::syscall_stack_top();
+        let kernel_stack_base =
+            kernel_stack_top.saturating_sub(crate::arch::tables::KERNEL_STACK_SIZE as u64);
+        let syscall_stack_base =
+            syscall_stack_top.saturating_sub(crate::arch::tables::SYSCALL_STACK_SIZE as u64);
+        if kernel_stack_base < syscall_stack_top && syscall_stack_base < kernel_stack_top {
+            return false;
+        }
+        SYSCALL_STACK_TOP = syscall_stack_top;
         USER_RETURN_DEPTH = 0;
         CONTEXT_VALID = [false; MAX_USER_CONTEXTS];
-        if KERNEL_STACK_TOP == 0 {
+        if kernel_stack_top == 0 || syscall_stack_top == 0 {
             return false;
         }
 
@@ -357,6 +366,19 @@ pub fn enter_user(registers: crate::elf::InitialRegisters) -> bool {
         );
     }
     true
+}
+
+pub fn return_debug_state() -> (u64, u64, u64, u64) {
+    unsafe {
+        let depth = USER_RETURN_DEPTH;
+        let saved_rsp = USER_RETURN_RSP_STACK[0];
+        let saved_return = if saved_rsp == 0 {
+            0
+        } else {
+            (saved_rsp as *const u64).read_volatile()
+        };
+        (depth, SYSCALL_STACK_TOP, saved_rsp, saved_return)
+    }
 }
 
 #[no_mangle]

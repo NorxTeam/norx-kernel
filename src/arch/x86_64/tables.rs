@@ -189,7 +189,8 @@ pub const USER_CODE_SELECTOR: u16 = 0x20 | 3;
 pub const TSS_SELECTOR: u16 = 0x28;
 
 const TSS_GDT_INDEX: usize = 5;
-const KERNEL_STACK_SIZE: usize = 512 * 1024;
+pub const KERNEL_STACK_SIZE: usize = 512 * 1024;
+pub const SYSCALL_STACK_SIZE: usize = 512 * 1024;
 
 #[repr(C, align(16))]
 struct KernelStack([u8; KERNEL_STACK_SIZE]);
@@ -230,6 +231,7 @@ static mut GDT: [u64; 7] = [
 ];
 
 static mut KERNEL_STACK: KernelStack = KernelStack([0; KERNEL_STACK_SIZE]);
+static mut SYSCALL_STACK: KernelStack = KernelStack([0; SYSCALL_STACK_SIZE]);
 static mut TSS: TaskStateSegment = TaskStateSegment::empty();
 static mut TSS_READY: bool = false;
 static mut IDT: [IdtEntry; 256] = [IdtEntry::missing(); 256];
@@ -282,8 +284,12 @@ fn load_gdt() {
     }
 }
 
+pub fn kernel_stack_top() -> u64 {
+    ((&raw const KERNEL_STACK) as u64) + KERNEL_STACK_SIZE as u64
+}
+
 pub fn syscall_stack_top() -> u64 {
-    kernel_stack_top()
+    ((&raw const SYSCALL_STACK) as u64) + SYSCALL_STACK_SIZE as u64
 }
 
 fn init_tss() {
@@ -311,10 +317,6 @@ fn init_tss() {
         *gdt.add(TSS_GDT_INDEX + 1) = high;
         TSS_READY = true;
     }
-}
-
-fn kernel_stack_top() -> u64 {
-    ((&raw const KERNEL_STACK) as u64) + KERNEL_STACK_SIZE as u64
 }
 
 fn load_idt() {
@@ -443,6 +445,15 @@ extern "x86-interrupt" fn invalid_opcode(stack: InterruptStackFrame) {
         stack.stack_pointer,
         stack.code_segment,
         stack.stack_segment
+    );
+    let (depth, stack_top, saved_rsp, saved_return) =
+        crate::arch::x86_64::syscall::return_debug_state();
+    crate::kprintln!(
+        "  x86 user-return: depth={} stack_top=0x{:016x} saved_rsp=0x{:016x} saved_return=0x{:016x}",
+        depth,
+        stack_top,
+        saved_rsp,
+        saved_return
     );
     crate::crash::fatal(crate::error::KernelError::cpu_exception(
         "invalid opcode",
