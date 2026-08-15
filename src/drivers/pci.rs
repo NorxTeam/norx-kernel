@@ -31,15 +31,8 @@ impl Device {
         if lower == 0 || lower == u32::MAX {
             return None;
         }
-        if lower & 1 != 0 {
-            return Some(Bar::Pio((lower & !3) as u16));
-        }
-        let base = if lower & 0x6 == 0x4 {
-            (self.read(offset + 4) as u64) << 32 | (lower as u64 & 0xffff_fff0)
-        } else {
-            lower as u64 & 0xffff_fff0
-        };
-        (base != 0).then_some(Bar::Mmio(base))
+        let upper = (lower & 0x6 == 0x4).then(|| self.read(offset + 4));
+        decode_bar(lower, upper)
     }
 
     pub fn enable(self, io: bool, memory: bool, bus_master: bool) -> bool {
@@ -107,7 +100,7 @@ pub fn find_class_vendor(class_code: u32, vendor: Option<u16>) -> Option<Device>
             }
             let candidate = Device::from_identity(device, identity);
             if vendor.is_none_or(|expected| expected == candidate.vendor)
-                && candidate.read(0x08) >> 8 & 0x00ff_ffff == class_code
+                && class_code_matches(candidate.read(0x08), class_code)
             {
                 return Some(candidate);
             }
@@ -134,4 +127,33 @@ pub fn contract_self_check() {
     };
     assert_eq!(address.slot, 3);
     assert_eq!(Bar::Pio(0x6000), Bar::Pio(0x6000));
+    assert!(class_code_matches(0x0100_0000, 0x0001_0000));
+    assert!(!class_code_matches(0x0200_0000, 0x0001_0000));
+    assert!(!class_code_matches(0x0100_0100, 0x0001_0000));
+    assert_eq!(decode_bar(0xfebf_8000, None), Some(Bar::Mmio(0xfebf_8000)));
+    assert_eq!(
+        decode_bar(0x0000_0004, Some(0x0000_0001)),
+        Some(Bar::Mmio(0x0000_0001_0000_0000))
+    );
+    assert_eq!(decode_bar(0x0000_0001, None), Some(Bar::Pio(0)));
+    assert_eq!(decode_bar(0, None), None);
+}
+
+const fn class_code_matches(config_class: u32, expected: u32) -> bool {
+    (config_class >> 8) & 0x00ff_ffff == expected
+}
+
+fn decode_bar(lower: u32, upper: Option<u32>) -> Option<Bar> {
+    if lower == 0 || lower == u32::MAX {
+        return None;
+    }
+    if lower & 1 != 0 {
+        return Some(Bar::Pio((lower & !3) as u16));
+    }
+    let base = if lower & 0x6 == 0x4 {
+        (upper? as u64) << 32 | (lower as u64 & 0xffff_fff0)
+    } else {
+        lower as u64 & 0xffff_fff0
+    };
+    (base != 0).then_some(Bar::Mmio(base))
 }
