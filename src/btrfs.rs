@@ -692,6 +692,7 @@ const TRANSACTION_DATA_PHASE: u8 = 0;
 const TRANSACTION_POINTER_PHASE: u8 = 1;
 const TRANSACTION_SUPERBLOCK_PHASE: u8 = 2;
 const MAX_FIXTURE_WRITES: usize = 64;
+const MAX_FIXTURE_FLUSHES: usize = 8;
 
 #[derive(Clone, Copy)]
 struct PendingSector {
@@ -819,6 +820,7 @@ impl Transaction {
     pub fn commit(self) -> Result<(), Error> {
         let mut written = [false; MAX_TRANSACTION_SECTORS];
         for phase in 0..=TRANSACTION_SUPERBLOCK_PHASE {
+            let mut phase_written = false;
             for (index, pending) in self.pending[..self.pending_count].iter().enumerate() {
                 if pending.phase != phase {
                     continue;
@@ -828,11 +830,12 @@ impl Transaction {
                     return Err(Error::Io);
                 }
                 written[index] = true;
+                phase_written = true;
             }
-        }
-        if !(self.flush)() {
-            self.rollback(&written);
-            return Err(Error::Io);
+            if phase_written && !(self.flush)() {
+                self.rollback(&written);
+                return Err(Error::Io);
+            }
         }
         Ok(())
     }
@@ -1028,6 +1031,8 @@ static mut FIXTURE_TX_MEDIA: [FixtureSector; MAX_TRANSACTION_SECTORS] =
     [FixtureSector::EMPTY; MAX_TRANSACTION_SECTORS];
 static mut FIXTURE_TX_WRITE_LOG: [u64; MAX_FIXTURE_WRITES] = [0; MAX_FIXTURE_WRITES];
 static mut FIXTURE_TX_WRITE_COUNT: usize = 0;
+static mut FIXTURE_TX_FLUSH_LOG: [usize; MAX_FIXTURE_FLUSHES] = [0; MAX_FIXTURE_FLUSHES];
+static mut FIXTURE_TX_FLUSH_COUNT: usize = 0;
 static mut FIXTURE_TX_FAIL_ON: usize = usize::MAX;
 
 fn fixture_transaction_read_sector(lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
@@ -1077,6 +1082,14 @@ fn fixture_transaction_write_sector(lba: u64, input: &[u8; SECTOR_SIZE]) -> bool
 }
 
 fn fixture_transaction_flush_cache() -> bool {
+    unsafe {
+        let flush_count = &mut *core::ptr::addr_of_mut!(FIXTURE_TX_FLUSH_COUNT);
+        let flush_log = &mut *core::ptr::addr_of_mut!(FIXTURE_TX_FLUSH_LOG);
+        if *flush_count < flush_log.len() {
+            flush_log[*flush_count] = *core::ptr::addr_of!(FIXTURE_TX_WRITE_COUNT);
+        }
+        *flush_count = flush_count.saturating_add(1);
+    }
     true
 }
 
@@ -1086,6 +1099,8 @@ fn reset_fixture_transaction() {
             [FixtureSector::EMPTY; MAX_TRANSACTION_SECTORS];
         *core::ptr::addr_of_mut!(FIXTURE_TX_WRITE_LOG) = [0; MAX_FIXTURE_WRITES];
         *core::ptr::addr_of_mut!(FIXTURE_TX_WRITE_COUNT) = 0;
+        *core::ptr::addr_of_mut!(FIXTURE_TX_FLUSH_LOG) = [0; MAX_FIXTURE_FLUSHES];
+        *core::ptr::addr_of_mut!(FIXTURE_TX_FLUSH_COUNT) = 0;
         *core::ptr::addr_of_mut!(FIXTURE_TX_FAIL_ON) = usize::MAX;
     }
 }
@@ -1155,10 +1170,16 @@ fn fixture_transaction_check() -> bool {
     }
     let write_log = unsafe { &*core::ptr::addr_of!(FIXTURE_TX_WRITE_LOG) };
     let write_count = unsafe { *core::ptr::addr_of!(FIXTURE_TX_WRITE_COUNT) };
+    let flush_log = unsafe { &*core::ptr::addr_of!(FIXTURE_TX_FLUSH_LOG) };
+    let flush_count = unsafe { *core::ptr::addr_of!(FIXTURE_TX_FLUSH_COUNT) };
     if write_count != 24
         || write_log[0] != 0x5000 / SECTOR_SIZE as u64
         || write_log[8] != 0x6000 / SECTOR_SIZE as u64
         || write_log[16] != SUPERBLOCK_OFFSET / SECTOR_SIZE as u64
+        || flush_count != 3
+        || flush_log[0] != 8
+        || flush_log[1] != 16
+        || flush_log[2] != 24
     {
         return false;
     }
