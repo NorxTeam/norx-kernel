@@ -66,6 +66,7 @@ pub struct Irq {
     pub kind: IrqKind,
     pub line: u32,
     pub owner: DeviceId,
+    pub registration: Option<crate::irq::RegistrationId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -172,7 +173,15 @@ impl Resource {
                 }
             }
             Self::Dma(buffer) => buffer.validate()?,
-            Self::Irq(_) => {}
+            Self::Irq(irq) => {
+                if let Some(registration) = irq.registration {
+                    if crate::irq::registration_owner(registration)
+                        != Some(crate::irq::IrqOwner::Device(irq.owner))
+                    {
+                        return Err(DriverError::InterruptOwnerMismatch);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -205,6 +214,9 @@ pub enum DriverError {
     MalformedDescriptor,
     DmaFailure,
     InterruptStorm,
+    InterruptOwnerMismatch,
+    InterruptPending,
+    InvalidInterruptRegistration,
 }
 
 const MAX_TRACE_EVENTS: usize = 128;
@@ -391,10 +403,38 @@ impl Device {
                 actual: self.state,
             });
         }
-        self.resources = [None; MAX_RESOURCES];
-        self.resource_len = 0;
-        trace_event(TraceOp::ResourceRelease, self, self.driver, true);
-        Ok(())
+        crate::arch::without_interrupts(|| {
+            for resource in self.resources[..self.resource_len].iter().flatten() {
+                let Resource::Irq(irq) = resource else {
+                    continue;
+                };
+                let Some(registration) = irq.registration else {
+                    continue;
+                };
+                if crate::irq::registration_owner(registration)
+                    != Some(crate::irq::IrqOwner::Device(irq.owner))
+                {
+                    return Err(DriverError::InterruptOwnerMismatch);
+                }
+                if crate::irq::registration_pending(registration) {
+                    return Err(DriverError::InterruptPending);
+                }
+            }
+            for resource in self.resources[..self.resource_len].iter().flatten() {
+                let Resource::Irq(irq) = resource else {
+                    continue;
+                };
+                let Some(registration) = irq.registration else {
+                    continue;
+                };
+                crate::irq::unregister_owned(registration, crate::irq::IrqOwner::Device(irq.owner))
+                    .map_err(|_| DriverError::InvalidInterruptRegistration)?;
+            }
+            self.resources = [None; MAX_RESOURCES];
+            self.resource_len = 0;
+            trace_event(TraceOp::ResourceRelease, self, self.driver, true);
+            Ok(())
+        })
     }
 
     pub fn bind_driver(&mut self, driver: DriverId) -> Result<(), DriverError> {
@@ -827,6 +867,10 @@ fn contract_dma_failure(_device: &mut Device) -> Result<(), DriverError> {
     Err(DriverError::DmaFailure)
 }
 
+fn contract_irq_hard() -> bool {
+    crate::irq::in_hard_context()
+}
+
 fn contract_probe_status(
     bus: &mut Bus,
     id: DeviceId,
@@ -1038,6 +1082,9 @@ pub fn contract_self_check() {
         DriverError::MalformedDescriptor,
         DriverError::DmaFailure,
         DriverError::InterruptStorm,
+        DriverError::InterruptOwnerMismatch,
+        DriverError::InterruptPending,
+        DriverError::InvalidInterruptRegistration,
     ];
 
     let mut bus = Bus::new(1, "platform", BusKind::Platform);
@@ -1081,6 +1128,17 @@ pub fn contract_self_check() {
             kind: IrqKind::Legacy,
             line: 4,
             owner: device.id,
+            registration: Some(
+                crate::irq::register_owned(
+                    device.id,
+                    IrqKind::Msi,
+                    0x1234,
+                    222,
+                    contract_irq_hard,
+                    None,
+                )
+                .expect("contract IRQ registration"),
+            ),
         }))
         .is_ok());
     assert!(device
@@ -1127,6 +1185,26 @@ pub fn contract_self_check() {
         })),
         Err(DriverError::InvalidAlignment)
     ));
+    let mismatched_registration = crate::irq::register_owned(
+        device.id,
+        IrqKind::MsiX,
+        0x1235,
+        223,
+        contract_irq_hard,
+        None,
+    )
+    .expect("mismatched IRQ contract registration");
+    let mut wrong_owner = Device::new(8, bus.id, bus.kind, "wrong-irq-owner", Class::Serial);
+    assert!(matches!(
+        wrong_owner.add_resource(Resource::Irq(Irq {
+            kind: IrqKind::MsiX,
+            line: 0x1235,
+            owner: wrong_owner.id,
+            registration: Some(mismatched_registration),
+        })),
+        Err(DriverError::InterruptOwnerMismatch)
+    ));
+    assert!(crate::irq::unregister(mismatched_registration).is_ok());
     assert!(probe(&mut device, driver).is_ok());
     assert!(publish(&mut device).is_ok());
     assert!(device.is_published());

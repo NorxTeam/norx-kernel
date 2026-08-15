@@ -239,7 +239,7 @@ pub fn init() -> bool {
     load_gdt();
     load_idt();
     unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) };
-    let timer_registration = crate::irq::register(
+    let timer_registration = crate::irq::register_system(
         crate::drivers::framework::IrqKind::Legacy,
         0,
         32,

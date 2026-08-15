@@ -270,11 +270,27 @@ unaligned parsing remain architecture/boot-parser internals.
 
 ### IRQ follow-up
 
-IRQ registration now carries `IrqKind`, line, vector, a bounded hard handler,
-and an optional deferred callback. x86 timer and aarch64 GIC timer hard
-handlers only increment atomic accounting; scheduler work runs in one bounded
-normal-context pass. MSI/MSI-X and per-device GIC routing remain deferred until
-their controller/device ownership contracts are added.
+IRQ registration now carries an opaque `RegistrationId` containing the slot,
+generation, and `IrqOwner`. Reusing a slot cannot invalidate an old handle;
+owner-mismatched teardown is rejected. `Resource::Irq.registration` links a
+device resource to that handle, and resource release unregisters it before
+clearing the device resource table.
+
+The hard callback is bounded and non-blocking: it may acknowledge device state
+and publish bounded atomic/queue work, but it must not run deferred work,
+register/unregister IRQs, sleep, allocate, log, or touch mutable driver state
+that normal-context code is concurrently updating. The dispatcher marks one
+pending bit per registration; `run_deferred()` drains one bounded pass, rejects
+reentrant calls, and runs callbacks only outside hard-interrupt context. Timer
+and driver callbacks are covered by the boot marker
+`NORX_DRIVER_IRQ_CONTRACT_OK v=1 ownership=1 deferred=1 callbacks=1 negative=1`.
+
+The required lifecycle is: prepare immutable IRQ state, register the callback,
+publish driver state and its `Resource::Irq`, then unmask hardware. Teardown
+masks hardware first, drains or rejects pending deferred work, unregisters the
+opaque handle, and only then releases driver state. Shared IRQs, MSI/MSI-X
+routing, per-CPU ownership, threaded IRQs, and high-throughput queues remain
+deferred until their controller contracts exist.
 
 ### Runtime tracing follow-up
 

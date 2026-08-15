@@ -399,7 +399,7 @@ pub extern "C" fn kernel_start() -> ! {
         let status = sched::status();
         let irq = irq::stats();
         bootlog::fail_fmt(format_args!(
-            "scheduler runtime accounting probe failed source={} ticks={} clock={} irq_timer={} pending={} spurious={} unhandled={} exceptions={} deferred={}",
+            "scheduler runtime accounting probe failed source={} ticks={} clock={} irq_timer={} pending={} spurious={} unhandled={} exceptions={} deferred={} hard_context_violations={}",
             arch::timer_source(),
             status.timer_ticks,
             status.clock,
@@ -409,6 +409,7 @@ pub extern "C" fn kernel_start() -> ! {
             irq.unhandled,
             irq.exceptions,
             irq.deferred,
+            irq.hard_context_violations,
         ));
         #[cfg(target_arch = "aarch64")]
         bootlog::fail("NORX_AARCH64_GIC_TIMER_IRQ_FAIL v=1 reason=scheduler-accounting");

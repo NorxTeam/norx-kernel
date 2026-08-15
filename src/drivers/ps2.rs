@@ -94,6 +94,8 @@ static MOUSE_HEAD: AtomicUsize = AtomicUsize::new(0);
 static MOUSE_TAIL: AtomicUsize = AtomicUsize::new(0);
 static KEYBOARD_DROPPED: AtomicU64 = AtomicU64::new(0);
 static MOUSE_DROPPED: AtomicU64 = AtomicU64::new(0);
+static mut KEYBOARD_IRQ_ID: Option<crate::irq::RegistrationId> = None;
+static mut MOUSE_IRQ_ID: Option<crate::irq::RegistrationId> = None;
 static mut KEYBOARD_QUEUE: [u8; QUEUE_CAPACITY] = [0; QUEUE_CAPACITY];
 static mut MOUSE_QUEUE: [u8; QUEUE_CAPACITY] = [0; QUEUE_CAPACITY];
 
@@ -313,10 +315,11 @@ pub fn register_irqs() -> bool {
     if IRQ_REGISTERED.load(Ordering::Acquire) {
         return true;
     }
-    let mut registrations = [None; 2];
-    let mut count = 0;
+    let mut keyboard_id = None;
+    let mut mouse_id = None;
     if KEYBOARD_PORT.load(Ordering::Acquire) {
-        let Ok(id) = crate::irq::register(
+        let Ok(id) = crate::irq::register_owned(
+            5,
             crate::drivers::framework::IrqKind::Legacy,
             1,
             33,
@@ -325,25 +328,68 @@ pub fn register_irqs() -> bool {
         ) else {
             return false;
         };
-        registrations[count] = Some(id);
-        count += 1;
+        keyboard_id = Some(id);
     }
     if MOUSE_PORT.load(Ordering::Acquire) {
-        let Ok(_id) = crate::irq::register(
+        let Ok(id) = crate::irq::register_owned(
+            6,
             crate::drivers::framework::IrqKind::Legacy,
             12,
             44,
             mouse_hard,
             None,
         ) else {
-            for id in registrations[..count].iter().flatten() {
-                let _ = crate::irq::unregister(*id);
+            if let Some(id) = keyboard_id {
+                let _ = crate::irq::unregister(id);
             }
             return false;
         };
+        mouse_id = Some(id);
+    }
+    unsafe {
+        KEYBOARD_IRQ_ID = keyboard_id;
+        MOUSE_IRQ_ID = mouse_id;
     }
     IRQ_REGISTERED.store(true, Ordering::Release);
     true
+}
+
+#[allow(dead_code)]
+pub fn unregister_irqs() -> bool {
+    if !IRQ_REGISTERED.load(Ordering::Acquire) {
+        return true;
+    }
+    if IRQ_ENABLED.swap(false, Ordering::AcqRel) {
+        if KEYBOARD_PORT.load(Ordering::Acquire) {
+            crate::arch::disable_legacy_irq(1);
+        }
+        if MOUSE_PORT.load(Ordering::Acquire) {
+            crate::arch::disable_legacy_irq(12);
+        }
+    }
+    let result = unsafe {
+        let keyboard = match core::ptr::read(core::ptr::addr_of!(KEYBOARD_IRQ_ID)) {
+            Some(id) if crate::irq::unregister(id).is_ok() => {
+                core::ptr::write(core::ptr::addr_of_mut!(KEYBOARD_IRQ_ID), None);
+                true
+            }
+            Some(_) => false,
+            None => true,
+        };
+        let mouse = match core::ptr::read(core::ptr::addr_of!(MOUSE_IRQ_ID)) {
+            Some(id) if crate::irq::unregister(id).is_ok() => {
+                core::ptr::write(core::ptr::addr_of_mut!(MOUSE_IRQ_ID), None);
+                true
+            }
+            Some(_) => false,
+            None => true,
+        };
+        keyboard && mouse
+    };
+    if result {
+        IRQ_REGISTERED.store(false, Ordering::Release);
+    }
+    result
 }
 
 pub fn enable_interrupts() -> bool {

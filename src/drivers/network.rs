@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicU16, Ordering};
+
 use crate::drivers::framework::{DmaBuffer, DmaDirection};
 use crate::drivers::pci;
 use crate::io::PioRegion;
@@ -340,6 +342,7 @@ struct Runtime {
     link_up: bool,
     irq: u8,
     interrupts: bool,
+    irq_registration: Option<crate::irq::RegistrationId>,
     tx_busy: bool,
     rx_packets: u64,
     tx_packets: u64,
@@ -348,6 +351,7 @@ struct Runtime {
 }
 
 static mut RUNTIME: Option<Runtime> = None;
+static IRQ_PORT_BASE: AtomicU16 = AtomicU16::new(0);
 
 pub fn contract_self_check() {
     let (available, used, total) = queue_layout(8).expect("valid virtio queue layout");
@@ -365,9 +369,14 @@ pub fn contract_self_check() {
 pub fn init() -> InitResult {
     match probe() {
         Ok(Some(mut runtime)) => {
-            runtime.interrupts = runtime.register_interrupt();
+            runtime.irq_registration = runtime.register_interrupt();
+            runtime.interrupts = runtime.irq_registration.is_some();
+            let irq = runtime.irq;
             let status = runtime.status();
             unsafe { core::ptr::addr_of_mut!(RUNTIME).write(Some(runtime)) };
+            if status.interrupts {
+                crate::arch::enable_legacy_irq(irq);
+            }
             InitResult::Ready(status)
         }
         Ok(None) => {
@@ -378,6 +387,28 @@ pub fn init() -> InitResult {
             unsafe { core::ptr::addr_of_mut!(RUNTIME).write(None) };
             InitResult::Failed(error)
         }
+    }
+}
+
+#[allow(dead_code)]
+pub fn shutdown() {
+    unsafe {
+        let runtime_slot = core::ptr::addr_of_mut!(RUNTIME);
+        let Some(runtime) = (*runtime_slot).as_mut() else {
+            return;
+        };
+        if let Some(registration) = runtime.irq_registration {
+            crate::arch::disable_legacy_irq(runtime.irq);
+            if crate::irq::unregister(registration).is_err() {
+                let _ = crate::irq::run_deferred();
+                if crate::irq::unregister(registration).is_err() {
+                    return;
+                }
+            }
+            runtime.irq_registration = None;
+        }
+        IRQ_PORT_BASE.store(0, Ordering::Release);
+        (*runtime_slot).take();
     }
 }
 
@@ -502,6 +533,7 @@ impl Runtime {
             link_up,
             irq: device.irq_line(),
             interrupts: false,
+            irq_registration: None,
             tx_busy: false,
             rx_packets: 0,
             tx_packets: 0,
@@ -510,22 +542,23 @@ impl Runtime {
         })
     }
 
-    fn register_interrupt(&mut self) -> bool {
+    fn register_interrupt(&mut self) -> Option<crate::irq::RegistrationId> {
         if self.irq > 15 {
-            return false;
+            return None;
         }
+        IRQ_PORT_BASE.store(self.io.base(), Ordering::Release);
         let vector = 32u32 + self.irq as u32;
-        let Ok(_) = crate::irq::register(
+        let Ok(id) = crate::irq::register_owned(
+            9,
             crate::drivers::framework::IrqKind::Legacy,
             self.irq as u32,
             vector,
             interrupt_hard,
             Some(interrupt_deferred),
         ) else {
-            return false;
+            return None;
         };
-        crate::arch::enable_legacy_irq(self.irq);
-        true
+        Some(id)
     }
 
     fn poll(&mut self) {
@@ -679,13 +712,10 @@ fn valid_packet(packet: &[u8]) -> bool {
 }
 
 fn interrupt_hard() -> bool {
-    unsafe {
-        let runtime = core::ptr::addr_of!(RUNTIME);
-        (*runtime)
-            .as_ref()
-            .and_then(|runtime| runtime.io.read_u8(ISR_STATUS))
-            .is_some_and(|status| status != 0)
-    }
+    let base = IRQ_PORT_BASE.load(Ordering::Acquire);
+    PioRegion::new(base, (ISR_STATUS + 1) as u16)
+        .and_then(|io| io.read_u8(ISR_STATUS))
+        .is_some_and(|status| status != 0)
 }
 
 fn interrupt_deferred() {

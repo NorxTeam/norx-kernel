@@ -120,6 +120,16 @@ pub fn init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
             matrix.passed, matrix.scenarios,
         ));
     }
+    let irq_contract = crate::irq::stats();
+    if matrix.passed == matrix.scenarios && irq_contract.hard_context_violations == 0 {
+        crate::bootlog::ok(
+            "NORX_DRIVER_IRQ_CONTRACT_OK v=1 ownership=1 deferred=1 callbacks=1 negative=1",
+        );
+    } else if irq_contract.hard_context_violations != 0 {
+        crate::bootlog::fail("NORX_DRIVER_IRQ_CONTRACT_FAIL v=1 reason=hard-context");
+    } else {
+        crate::bootlog::fail("NORX_DRIVER_IRQ_CONTRACT_FAIL v=1 reason=matrix");
+    }
     #[cfg(target_arch = "x86_64")]
     ps2::contract_self_check();
     #[cfg(target_arch = "x86_64")]

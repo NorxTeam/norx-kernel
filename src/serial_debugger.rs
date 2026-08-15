@@ -203,13 +203,14 @@ fn sched(debugger: &mut SerialDebugger) {
 fn irq(debugger: &mut SerialDebugger) {
     let stats = crate::irq::stats();
     debugger.write_fmt(format_args!(
-        "timer={} pending={} spurious={} unhandled={} deferred={} exceptions={}\n",
+        "timer={} pending={} spurious={} unhandled={} deferred={} exceptions={} hard_context_violations={}\n",
         stats.timer,
         stats.timer_pending,
         stats.spurious,
         stats.unhandled,
         stats.deferred,
         stats.exceptions,
+        stats.hard_context_violations,
     ));
 }
 

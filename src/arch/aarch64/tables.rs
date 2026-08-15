@@ -476,7 +476,7 @@ pub fn init() -> bool {
 pub fn register_timer_handler() -> bool {
     let info = crate::boot::info().interrupt_info;
     let timer_registration = if info.timer_irq != 0 {
-        crate::irq::register(
+        crate::irq::register_system(
             crate::drivers::framework::IrqKind::Gic,
             info.timer_irq,
             info.timer_irq,
@@ -495,7 +495,8 @@ pub fn register_timer_handler() -> bool {
         crate::irq::register_timer(id);
         crate::bootlog::ok_fmt(format_args!(
             "aarch64 GIC timer handler registered vector={} slot={}",
-            info.timer_irq, id
+            info.timer_irq,
+            id.slot()
         ));
     }
     registered

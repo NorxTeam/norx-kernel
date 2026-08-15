@@ -77,6 +77,11 @@ probe:
   permission failures, and deterministic traps;
 - the interrupt contract drives the bounded storm path and verifies that
   delivery accounting remains consistent under concurrent-style re-entry.
+- the driver IRQ contract verifies generation-bearing ownership, owner-checked
+  teardown, hard/deferred context separation, deferred coalescing, and failed
+  lifecycle cases. A successful boot emits
+  `NORX_DRIVER_IRQ_CONTRACT_OK v=1 ownership=1 deferred=1 callbacks=1 negative=1`;
+  a violation emits the versioned `NORX_DRIVER_IRQ_CONTRACT_FAIL` marker.
 
 Each group fails the boot assertion immediately; the following serial marker
 is emitted only after all groups have returned successfully:
