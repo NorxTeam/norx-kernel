@@ -655,10 +655,18 @@ userspace service merely for roadmap progress.
 
 ### Display contract follow-up
 
-The display path now has an explicit fixed-capacity contract around the
-firmware-provided framebuffer. Discovery validates geometry, publishes the
-current mode through a mode-list API, and permits selecting that mode without
-pretending that a firmware framebuffer can switch hardware modes.
+The display path now has an explicit versioned contract around the
+firmware-provided framebuffer. `NORX_DISPLAY_MODE_CONTRACT_OK v=1` defines the
+guest mode as the `RawFramebuffer` geometry and marks the current
+`ModePolicy::FirmwareFixed` policy. The host window is presentation-only: its
+scaling or resize cannot change guest mode. A future GOP or virtio-gpu mode
+change must use a controller-owned transaction that prepares the new backing,
+sets the scanout, publishes the new mode, and rolls back on failure.
+
+Discovery validates geometry, publishes the current mode through a mode-list
+API, and permits selecting that mode without pretending that a firmware
+framebuffer can switch hardware modes. Mode IDs are looked up by value rather
+than treated as array indexes, so future mode lists can use opaque stable IDs.
 
 Damage regions are bounded and validated against the active mode; `flush`
 consumes the queue and records the flush boundary for the current directly
@@ -675,7 +683,11 @@ single contiguous backing entry and submits the minimal 2D sequence:
 `RESOURCE_CREATE_2D`, `RESOURCE_ATTACH_BACKING`, `SET_SCANOUT`,
 `TRANSFER_TO_HOST_2D`, and `RESOURCE_FLUSH`. 3D, virgl, multiple resources,
 and mode switching are intentionally deferred; the firmware framebuffer stays
-the fallback when the optional GPU path is absent or fails.
+the fallback when the optional GPU path is absent or fails. The guest
+framebuffer rectangle must fit completely in the device scanout; a smaller
+scanout returns a mode mismatch instead of silently changing guest geometry.
+Diagnostics report `guest=WxH` and `scanout=WxH` separately, with
+`mode-switch=false`.
 
 ### Minimal network stack follow-up
 
@@ -705,15 +717,17 @@ reported `dns-result=Some(Ipv4Addr([1, 2, 3, 4]))`; the live QEMU resolver was
 also allowed to time out through the bounded error path. The malformed pre-fix
 IPv4 contract is covered by `net::contract_self_check`.
 
-The x86_64 display smoke reported `display ready mode=0 800x600 pitch=2400`
-and exercised mode listing/selection, damage queueing and flush, cursor on/off,
-and the explicit EDID unsupported result through serial-debugger. The
+The x86_64 display smoke reported `NORX_DISPLAY_MODE_CONTRACT_OK v=1`
+and `display ready mode=0 1280x800 pitch=5120`. On boots that reach the serial
+debugger, mode listing/selection, damage queueing and flush, cursor on/off,
+and the explicit EDID unsupported result can be exercised. The
 aarch64 UEFI smoke reported the explicit no-framebuffer fallback and still
 reached `kernel initialization complete` with serial diagnostics available.
-The x86_64 QEMU `virtio-vga` smoke reached
-`virtio-gpu ready ... controlq=8 scanout=1200x800 enabled=true 2d=true` and
-completed kernel initialization; a no-GPU boot keeps the firmware display
-fallback.
+The current x86_64 QEMU `virtio-vga` configuration reports a guest framebuffer
+larger than its advertised scanout, so the strict path returns `ModeMismatch`
+and keeps the firmware display fallback. A matched scanout is required before
+claiming a successful 2D virtio-gpu display backend; this mismatch is an
+intentional negative contract case, not host-window scaling.
 
 ## Verification
 

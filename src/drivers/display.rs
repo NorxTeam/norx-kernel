@@ -2,6 +2,28 @@ use crate::boot::{PixelFormat, RawFramebuffer};
 
 const MAX_MODES: usize = 8;
 const MAX_DAMAGE: usize = 32;
+pub const MODE_CONTRACT_VERSION: u8 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModePolicy {
+    FirmwareFixed,
+    ControllerTransactional,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModeContract {
+    pub version: u8,
+    pub firmware_policy: ModePolicy,
+    pub host_window_resize_changes_guest_mode: bool,
+    pub scanout_resize_changes_guest_mode: bool,
+}
+
+pub const MODE_CONTRACT: ModeContract = ModeContract {
+    version: MODE_CONTRACT_VERSION,
+    firmware_policy: ModePolicy::FirmwareFixed,
+    host_window_resize_changes_guest_mode: false,
+    scanout_resize_changes_guest_mode: false,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -28,6 +50,7 @@ pub struct Mode {
     pub stride: usize,
     pub bytes_per_pixel: usize,
     pub format: PixelFormat,
+    pub policy: ModePolicy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +82,8 @@ impl Cursor {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Status {
+    pub contract_version: u8,
+    pub mode_policy: ModePolicy,
     pub present: bool,
     pub active_mode: u16,
     pub mode_count: u8,
@@ -90,11 +115,20 @@ struct State {
 static mut STATE: Option<State> = None;
 
 pub fn contract_self_check() {
+    assert_eq!(MODE_CONTRACT.version, MODE_CONTRACT_VERSION);
+    assert_eq!(MODE_CONTRACT.firmware_policy, ModePolicy::FirmwareFixed);
+    const {
+        assert!(!MODE_CONTRACT.host_window_resize_changes_guest_mode);
+        assert!(!MODE_CONTRACT.scanout_resize_changes_guest_mode);
+    }
+    let _ = ModePolicy::ControllerTransactional;
     let _ = HotplugEvent::Connected;
     let _ = HotplugEvent::Disconnected;
     assert!(valid_geometry(640, 480, 2560, 4, 2560 * 480));
     assert!(!valid_geometry(640, 480, 100, 4, 2560 * 480));
     assert!(!valid_geometry(640, 480, 2560, 4, 1024));
+    assert_eq!(validate_scanout(800, 600, 1200, 800), Some((800, 600)));
+    assert!(validate_scanout(800, 600, 640, 480).is_none());
     assert!(valid_region(
         DamageRegion {
             x: 10,
@@ -206,7 +240,9 @@ pub fn queue_damage(region: DamageRegion) -> Result<(), Error> {
         let Some(state) = (&mut *core::ptr::addr_of_mut!(STATE)).as_mut() else {
             return Err(Error::NoDisplay);
         };
-        let mode = state.modes[state.active_mode as usize];
+        let Some(mode) = state.active_mode() else {
+            return Err(Error::InvalidMode);
+        };
         if !valid_region(region, mode.width, mode.height) {
             return Err(Error::InvalidRegion);
         }
@@ -236,7 +272,9 @@ pub fn set_cursor(cursor: Cursor) -> Result<(), Error> {
         let Some(state) = (&mut *core::ptr::addr_of_mut!(STATE)).as_mut() else {
             return Err(Error::NoDisplay);
         };
-        let mode = state.modes[state.active_mode as usize];
+        let Some(mode) = state.active_mode() else {
+            return Err(Error::InvalidMode);
+        };
         if cursor.visible
             && !valid_region(
                 DamageRegion {
@@ -261,8 +299,19 @@ pub fn poll_hotplug() -> Option<HotplugEvent> {
 }
 
 impl State {
+    fn active_mode(&self) -> Option<Mode> {
+        self.modes[..self.mode_count]
+            .iter()
+            .copied()
+            .find(|mode| mode.id == self.active_mode)
+    }
+
     fn status(&self) -> Status {
         Status {
+            contract_version: MODE_CONTRACT.version,
+            mode_policy: self
+                .active_mode()
+                .map_or(MODE_CONTRACT.firmware_policy, |mode| mode.policy),
             present: true,
             active_mode: self.active_mode,
             mode_count: self.mode_count as u8,
@@ -290,6 +339,7 @@ fn mode_from_raw(raw: RawFramebuffer) -> Option<Mode> {
         stride: raw.stride,
         bytes_per_pixel: raw.bytes_per_pixel,
         format: raw.format,
+        policy: MODE_CONTRACT.firmware_policy,
     })
 }
 
@@ -320,4 +370,17 @@ fn valid_region(region: DamageRegion, width: u32, height: u32) -> bool {
             .y
             .checked_add(region.height)
             .is_some_and(|end| end <= height)
+}
+
+pub fn validate_scanout(
+    guest_width: u32,
+    guest_height: u32,
+    scanout_width: u32,
+    scanout_height: u32,
+) -> Option<(u32, u32)> {
+    (guest_width != 0
+        && guest_height != 0
+        && scanout_width >= guest_width
+        && scanout_height >= guest_height)
+        .then_some((guest_width, guest_height))
 }

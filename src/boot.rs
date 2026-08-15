@@ -267,6 +267,7 @@ pub fn contract_self_check() {
     assert!(framebuffer(0x1000, 11, 4, 1, 24, PixelFormat::Rgb).is_none());
     assert!(framebuffer(0x1000, 12, 4, 1, 24, PixelFormat::Rgb).is_some());
     assert!(framebuffer(0x1000, u64::MAX, u64::MAX, 1, 32, PixelFormat::Rgb).is_none());
+    assert!(framebuffer(u64::MAX - 3, 16, 4, 1, 32, PixelFormat::Rgb).is_none());
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -503,6 +504,7 @@ fn framebuffer(
     let width = u32::try_from(width).ok()?;
     let height = u32::try_from(height).ok()?;
     let size = stride.checked_mul(height as usize)?;
+    base.checked_add(size as u64)?;
     Some(RawFramebuffer {
         base: base as *mut u8,
         size,
@@ -828,8 +830,10 @@ unsafe fn parse_fdt(address: usize) -> Option<BootInfo> {
     if framebuffer_base != 0 && framebuffer_size != 0 {
         let format = if framebuffer_format[..framebuffer_format_len].starts_with(b"r8g8b8a8") {
             PixelFormat::Rgb
-        } else {
+        } else if framebuffer_format[..framebuffer_format_len].starts_with(b"b8g8r8a8") {
             PixelFormat::Bgr
+        } else {
+            return None;
         };
         if let Some(fb) = framebuffer(
             framebuffer_base,
@@ -1055,7 +1059,8 @@ unsafe fn efi_framebuffer(system_table: u64) -> Option<RawFramebuffer> {
     {
         return None;
     }
-    let mode = read_u64(graphics as usize + 32)? as usize;
+    // EFI_GRAPHICS_OUTPUT_PROTOCOL: QueryMode, SetMode, Blt, then Mode.
+    let mode = read_u64(graphics as usize + 24)? as usize;
     let info = read_u64(mode + 8)? as usize;
     let width = read_u32(info + 4)? as u64;
     let height = read_u32(info + 8)? as u64;

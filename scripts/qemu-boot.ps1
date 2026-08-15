@@ -8,6 +8,7 @@ param(
     [string]$Esp,
     [string]$Vars,
     [string]$SerialLog,
+    [string]$Display = 'none',
     [string[]]$Marker = @(),
     [switch]$Interactive
 )
@@ -96,7 +97,7 @@ $qemuArgs = @(
     '-M', $machineName,
     '-cpu', $cpuName,
     '-m', '256M',
-    '-display', 'none',
+    '-display', $Display,
     '-no-reboot',
     '-no-shutdown'
 )

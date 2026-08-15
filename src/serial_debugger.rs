@@ -250,18 +250,20 @@ fn display(debugger: &mut SerialDebugger, args: &[&str]) {
                 stride: 0,
                 bytes_per_pixel: 0,
                 format: crate::boot::PixelFormat::Rgb,
+                policy: crate::drivers::display::ModePolicy::FirmwareFixed,
             }; 8];
             match crate::drivers::display::modes(&mut modes) {
                 Ok(count) => {
                     for mode in modes.iter().take(count) {
                         debugger.write_fmt(format_args!(
-                            "mode={} {}x{} stride={} bpp={} format={:?}\n",
+                            "mode={} {}x{} stride={} bpp={} format={:?} policy={:?}\n",
                             mode.id,
                             mode.width,
                             mode.height,
                             mode.stride,
                             mode.bytes_per_pixel,
                             mode.format,
+                            mode.policy,
                         ));
                     }
                 }
@@ -383,7 +385,9 @@ fn display(debugger: &mut SerialDebugger, args: &[&str]) {
         return;
     };
     debugger.write_fmt(format_args!(
-        "display present={} mode={} modes={} edid={} damage={} cursor={} hotplug={} flushes={}\n",
+        "display contract={} policy={:?} present={} mode={} modes={} edid={} damage={} cursor={} hotplug={} flushes={}\n",
+        status.contract_version,
+        status.mode_policy,
         status.present,
         status.active_mode,
         status.mode_count,

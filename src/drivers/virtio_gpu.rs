@@ -71,6 +71,7 @@ pub enum Error {
     InvalidCapability,
     InvalidUsedDescriptor,
     InvalidDisplayResponse(u32),
+    ModeMismatch,
     UnsupportedFeatures,
 }
 
@@ -86,6 +87,9 @@ pub struct Status {
     pub scanout_enabled: bool,
     pub scanout_width: u32,
     pub scanout_height: u32,
+    pub guest_mode_width: u32,
+    pub guest_mode_height: u32,
+    pub mode_switch_supported: bool,
     pub two_d: bool,
 }
 
@@ -532,6 +536,9 @@ impl ModernRuntime {
                 scanout_enabled: false,
                 scanout_width: 0,
                 scanout_height: 0,
+                guest_mode_width: 0,
+                guest_mode_height: 0,
+                mode_switch_supported: false,
                 two_d: false,
             },
         };
@@ -573,11 +580,13 @@ impl ModernRuntime {
         let Some(framebuffer_size) = u32::try_from(framebuffer.size).ok() else {
             return Err(Error::AddressTooWide);
         };
-        let display_width = self.status.scanout_width.min(framebuffer.width);
-        let display_height = self.status.scanout_height.min(framebuffer.height);
-        if display_width == 0 || display_height == 0 {
-            return Err(Error::InvalidDisplayResponse(0));
-        }
+        let (display_width, display_height) = crate::drivers::display::validate_scanout(
+            framebuffer.width,
+            framebuffer.height,
+            self.status.scanout_width,
+            self.status.scanout_height,
+        )
+        .ok_or(Error::ModeMismatch)?;
         let framebuffer_dma = DmaBuffer {
             physical: crate::address::PhysAddr::new(framebuffer.base as u64),
             virtual_address: crate::address::VirtAddr::new(framebuffer.base as usize),
@@ -625,6 +634,8 @@ impl ModernRuntime {
         self.expect_ok_nodata()?;
         self.status.two_d = true;
         self.status.scanout_enabled = true;
+        self.status.guest_mode_width = framebuffer.width;
+        self.status.guest_mode_height = framebuffer.height;
         Ok(())
     }
 
@@ -849,6 +860,9 @@ impl Runtime {
                 scanout_enabled: false,
                 scanout_width: 0,
                 scanout_height: 0,
+                guest_mode_width: 0,
+                guest_mode_height: 0,
+                mode_switch_supported: false,
                 two_d: false,
             },
         };

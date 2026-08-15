@@ -112,3 +112,23 @@ architecture may produce an empty or firmware-owned framebuffer while the
 serial contract still remains authoritative. Local runs use GTK plus
 `ramfb` on aarch64 (or `virtio-vga` on x86_64), so the same display path is
 visible during development.
+
+The Windows wrapper accepts `-Display none`, `-Display vnc=127.0.0.1:17`, or
+`-Display gtk` for the same host-backend comparison; these values are
+deliberately outside the guest display-mode contract.
+
+### Display mode contract
+
+The stable display gate is
+`NORX_DISPLAY_MODE_CONTRACT_OK v=1 guest=firmware-fixed host-scale=external scanout=separate`.
+It means that the guest mode is the geometry of the boot-provided
+`RawFramebuffer`; changing the QEMU host frontend or its window size is not a
+guest mode event. A virtio-gpu `scanout=WxH` value is device presentation
+geometry, not a replacement for the guest framebuffer mode. The virtio-gpu
+path must either use the complete guest rectangle or fail with a mode
+mismatch; it must not silently crop or scale it.
+
+When virtio-gpu is present, the ready line records both values:
+`guest=WxH scanout=WxH mode-switch=false`. A future controller-owned mode
+change gets a separate versioned transaction marker; the current firmware
+backend publishes one fixed mode and only accepts selecting that same mode.

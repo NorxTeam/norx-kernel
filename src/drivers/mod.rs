@@ -149,6 +149,10 @@ pub fn init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
     #[cfg(target_arch = "aarch64")]
     serial::pl011::contract_self_check();
     display::contract_self_check();
+    crate::bootlog::ok_fmt(format_args!(
+        "NORX_DISPLAY_MODE_CONTRACT_OK v={} guest=firmware-fixed host-scale=external scanout=separate",
+        display::MODE_CONTRACT_VERSION
+    ));
     block::contract_self_check();
     let mut ok = true;
     let display_state = match display::init(framebuffer) {
@@ -311,7 +315,7 @@ pub fn runtime_init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
         let gpu_state = match virtio_gpu::init(framebuffer) {
             virtio_gpu::InitResult::Ready(status) => {
                 crate::bootlog::ok_fmt(format_args!(
-                    "virtio-gpu ready pci={:02x}:{:02x}.{} vendor=0x{:04x} device=0x{:04x} irq={} controlq={} scanout={}x{} enabled={} 2d={}",
+                    "virtio-gpu ready pci={:02x}:{:02x}.{} vendor=0x{:04x} device=0x{:04x} irq={} controlq={} guest={}x{} scanout={}x{} enabled={} mode-switch={} 2d={}",
                     status.bus,
                     status.slot,
                     status.function,
@@ -319,9 +323,12 @@ pub fn runtime_init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
                     status.device,
                     status.irq,
                     status.control_queue,
+                    status.guest_mode_width,
+                    status.guest_mode_height,
                     status.scanout_width,
                     status.scanout_height,
                     status.scanout_enabled,
+                    status.mode_switch_supported,
                     status.two_d,
                 ));
                 framework::DeviceState::Ready
