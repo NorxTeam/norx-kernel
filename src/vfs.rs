@@ -801,6 +801,11 @@ impl PersistentMount {
         self.backend.write_file(path, input)
     }
 
+    fn sync(self) -> Result<(), Error> {
+        let _ = self.backend.stat("/")?;
+        crate::drivers::block::flush_cache().map_err(map_block_error)
+    }
+
     fn create_file(self, path: &str) -> Result<(), Error> {
         validate_persistent_path(path)?;
         if self.read_only() {
@@ -1013,6 +1018,8 @@ pub fn contract_self_check() {
     assert!(!PersistentBackendKind::Fat32.read_only());
     assert!(!PersistentBackendKind::Ext4.read_only());
     assert!(PersistentBackendKind::Btrfs.read_only());
+    assert_eq!(map_fat32_error(fat32::Error::NotEmpty), Error::NotEmpty);
+    assert_eq!(map_fat32_error(fat32::Error::FileTooLarge), Error::NoSpace);
     let mut persistent_path = PersistentPath::ROOT;
     assert_eq!(persistent_path.as_str(), Ok("/"));
     let mut component = Name::EMPTY;
@@ -1231,6 +1238,10 @@ pub fn unmount_mount(id: MountId) -> Result<(), Error> {
         {
             return Err(Error::Busy);
         }
+        if let Some(backend) = node.backend.persistent() {
+            // Keep the mount installed if the durable boundary cannot be reached.
+            backend.sync()?;
+        }
         unsafe {
             (&mut *core::ptr::addr_of_mut!(MOUNTS))[id.index()] = MountNode::EMPTY;
         }
@@ -1416,6 +1427,9 @@ pub fn release_dentry(handle: DentryHandle) -> Result<(), Error> {
 
 pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
     with_fs(|fs| {
+        if !options.read && !options.write {
+            return Err(Error::PermissionDenied);
+        }
         if options.truncate && !options.write {
             return Err(Error::PermissionDenied);
         }
@@ -1433,9 +1447,8 @@ pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
             if options.create && !writable && options.write {
                 return Err(Error::ReadOnly);
             }
-            if !options.read && !options.write {
-                return Err(Error::PermissionDenied);
-            }
+            let mut reserved_slot = None;
+            let mut created = false;
             let info = match backend.stat(path_str) {
                 Ok(info) => {
                     if options.create && options.exclusive {
@@ -1444,28 +1457,53 @@ pub fn open(path: &str, options: OpenOptions) -> Result<FileHandle, Error> {
                     info
                 }
                 Err(Error::NotFound) if options.create && writable => {
+                    reserved_slot = Some(
+                        fs.handles
+                            .iter()
+                            .position(|handle| !handle.used)
+                            .ok_or(Error::NoSpace)?,
+                    );
                     backend.create_file(path_str)?;
-                    backend.stat(path_str)?
+                    created = true;
+                    match backend.stat(path_str) {
+                        Ok(info) => info,
+                        Err(error) => {
+                            rollback_created_file(backend, path_str, created);
+                            return Err(error);
+                        }
+                    }
                 }
                 Err(Error::NotFound) if options.create => return Err(Error::ReadOnly),
                 Err(error) => return Err(error),
             };
             if info.kind == NodeType::Directory {
+                rollback_created_file(backend, path_str, created);
                 return Err(Error::IsDirectory);
             }
             if options.read && info.mode & 0o444 == 0 {
+                rollback_created_file(backend, path_str, created);
                 return Err(Error::PermissionDenied);
             }
             if options.write && info.mode & 0o222 == 0 {
+                rollback_created_file(backend, path_str, created);
                 return Err(Error::PermissionDenied);
             }
             if options.truncate {
-                backend.write_file(path_str, &[])?;
+                if reserved_slot.is_none() {
+                    reserved_slot = Some(
+                        fs.handles
+                            .iter()
+                            .position(|handle| !handle.used)
+                            .ok_or(Error::NoSpace)?,
+                    );
+                }
+                if let Err(error) = backend.write_file(path_str, &[]) {
+                    rollback_created_file(backend, path_str, created);
+                    return Err(error);
+                }
             }
-            let slot = fs
-                .handles
-                .iter()
-                .position(|handle| !handle.used)
+            let slot = reserved_slot
+                .or_else(|| fs.handles.iter().position(|handle| !handle.used))
                 .ok_or(Error::NoSpace)?;
             let handle = &mut fs.handles[slot];
             handle.used = true;
@@ -2508,6 +2546,12 @@ fn persistent_backend(id: MountId) -> Result<PersistentMount, Error> {
         .ok_or(Error::BackendUnsupported)
 }
 
+fn rollback_created_file(backend: PersistentMount, path: &str, created: bool) {
+    if created {
+        let _ = backend.unlink(path);
+    }
+}
+
 fn validate_persistent_path(path: &str) -> Result<(), Error> {
     let (components, count) = parse_path(path)?;
     if components
@@ -2550,8 +2594,10 @@ fn map_fat32_error(error: crate::fat32::Error) -> Error {
         crate::fat32::Error::AlreadyExists => Error::AlreadyExists,
         crate::fat32::Error::NotDirectory => Error::NotDirectory,
         crate::fat32::Error::IsDirectory => Error::IsDirectory,
+        crate::fat32::Error::NotEmpty => Error::NotEmpty,
         crate::fat32::Error::BufferTooSmall => Error::BackendError,
         crate::fat32::Error::ReadOnly => Error::ReadOnly,
+        crate::fat32::Error::FileTooLarge => Error::NoSpace,
         crate::fat32::Error::Io
         | crate::fat32::Error::InvalidBpb
         | crate::fat32::Error::BadClusterChain
