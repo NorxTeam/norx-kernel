@@ -74,6 +74,10 @@ pub fn current_ttbr0_value() -> u64 {
     read_ttbr0()
 }
 
+pub fn user_space_is_current(root: crate::address::PhysAddr) -> bool {
+    current_ttbr0_value() & ADDRESS_MASK == root.value()
+}
+
 pub fn switch_ttbr0(value: u64) {
     write_ttbr0(value);
 }

@@ -171,6 +171,10 @@ pub fn current_cr3_value() -> u64 {
     unsafe { current_cr3() }
 }
 
+pub fn user_space_is_current(root: crate::address::PhysAddr) -> bool {
+    current_cr3_value() & ADDRESS_MASK == root.value()
+}
+
 pub fn switch_cr3(value: u64) {
     unsafe { asm!("mov cr3, {}", in(reg) value, options(nostack, preserves_flags)) };
 }

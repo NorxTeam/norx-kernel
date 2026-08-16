@@ -484,6 +484,8 @@ pub const F_SETFD: UserWord = 2;
 pub const FD_CLOEXEC: UserWord = 1 << 0;
 pub const SPAWN_NEW_PROCESS_GROUP: UserWord = 1 << 0;
 pub const SPAWN_FOREGROUND: UserWord = 1 << 1;
+const SPAWN2_SUPPORTED_FLAGS: UserWord =
+    SPAWN_NEW_PROCESS_GROUP | SPAWN_FOREGROUND | SPAWN_INHERIT_CREDENTIALS | SPAWN_INHERIT_OPEN_FDS;
 pub const WAIT_NONBLOCK: UserWord = 1 << 0;
 pub const WAIT_EXITED: u32 = 1;
 pub const WAIT_SIGNALED: u32 = 2;
@@ -736,6 +738,12 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
             }
             let spec =
                 unsafe { core::ptr::read_unaligned(spec_bytes.as_ptr().cast::<SpawnSpec>()) };
+            if let Err(errno) = validate_spawn2_flags(spec.flags) {
+                return errno.return_value();
+            }
+            if let Err(errno) = validate_spawn2_process_group(spec.flags, spec.process_group) {
+                return errno.return_value();
+            }
             let path_length = match usize::try_from(spec.path_length) {
                 Ok(length) if length != 0 && length <= MAX_PATH => length,
                 _ => return Errno::Einval.return_value(),
@@ -762,15 +770,6 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Ok(count) => count,
                 Err(errno) => return errno.return_value(),
             };
-            if spec.flags
-                & !(SPAWN_NEW_PROCESS_GROUP
-                    | SPAWN_FOREGROUND
-                    | SPAWN_INHERIT_CREDENTIALS
-                    | SPAWN_INHERIT_OPEN_FDS)
-                != 0
-            {
-                return Errno::Einval.return_value();
-            }
             let mut path_bytes = [0u8; MAX_PATH];
             if crate::usercopy::copy_from_user(spec.path, &mut path_bytes[..path_length]).is_err() {
                 return Errno::Efault.return_value();
@@ -1649,6 +1648,25 @@ fn copy_user_path<'a>(
     Ok(path)
 }
 
+fn validate_spawn2_flags(flags: UserWord) -> Result<(), Errno> {
+    if flags & !SPAWN2_SUPPORTED_FLAGS != 0 {
+        Err(Errno::Einval)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_spawn2_process_group(flags: UserWord, process_group: UserWord) -> Result<(), Errno> {
+    if flags & SPAWN_NEW_PROCESS_GROUP == 0
+        && process_group != 0
+        && u32::try_from(process_group).is_err()
+    {
+        Err(Errno::Einval)
+    } else {
+        Ok(())
+    }
+}
+
 fn copy_user_string_vector<'a>(
     address: UserPointer,
     count: UserWord,
@@ -1838,6 +1856,54 @@ pub fn contract_self_check() {
     assert_eq!(SPAWN_NEW_PROCESS_GROUP | SPAWN_FOREGROUND, 3);
     assert_eq!(SPAWN_INHERIT_CREDENTIALS, 4);
     assert_eq!(SPAWN_INHERIT_OPEN_FDS, 8);
+    assert_eq!(SPAWN2_SUPPORTED_FLAGS, 0xf);
+    assert!(validate_spawn2_flags(SPAWN2_SUPPORTED_FLAGS).is_ok());
+    assert!(matches!(
+        validate_spawn2_flags(SPAWN2_SUPPORTED_FLAGS | (1 << 63)),
+        Err(Errno::Einval)
+    ));
+    assert!(validate_spawn2_process_group(0, 0).is_ok());
+    assert!(validate_spawn2_process_group(0, u32::MAX as UserWord).is_ok());
+    assert!(matches!(
+        validate_spawn2_process_group(0, (u32::MAX as UserWord) + 1),
+        Err(Errno::Einval)
+    ));
+    assert!(validate_spawn2_process_group(SPAWN_NEW_PROCESS_GROUP, UserWord::MAX).is_ok());
+    let mut path_storage = [0u8; MAX_PATH];
+    assert!(matches!(
+        copy_user_path(0, 1, &mut path_storage),
+        Err(Errno::Efault)
+    ));
+    assert!(matches!(
+        copy_user_path(0, 0, &mut path_storage),
+        Err(Errno::Einval)
+    ));
+    assert!(matches!(
+        copy_user_path(0, (MAX_PATH + 1) as UserWord, &mut path_storage),
+        Err(Errno::Einval)
+    ));
+    let mut argument_storage = [[0u8; MAX_SPAWN_STRING]; MAX_SPAWN_ARGUMENTS];
+    let mut argument_output = [&[][..]; MAX_SPAWN_ARGUMENTS];
+    let mut invalid_argument_storage = [[0u8; MAX_SPAWN_STRING]; MAX_SPAWN_ARGUMENTS];
+    let mut invalid_argument_output = [&[][..]; MAX_SPAWN_ARGUMENTS];
+    assert!(matches!(
+        copy_user_string_vector(
+            0,
+            1,
+            &mut invalid_argument_storage,
+            &mut invalid_argument_output,
+        ),
+        Err(Errno::Efault)
+    ));
+    assert!(matches!(
+        copy_user_string_vector(
+            0,
+            (MAX_SPAWN_ARGUMENTS + 1) as UserWord,
+            &mut argument_storage,
+            &mut argument_output,
+        ),
+        Err(Errno::E2big)
+    ));
     assert_eq!(WAIT_NONBLOCK, 1);
     assert_eq!(F_GETFD, 1);
     assert_eq!(F_SETFD, 2);
@@ -1857,6 +1923,7 @@ pub fn contract_self_check() {
         Errno::Einval,
         Errno::Enosys,
         Errno::Eoverflow,
+        Errno::E2big,
     ];
     let result = dispatch(u64::MAX, Args::empty());
     assert!(is_error(result));

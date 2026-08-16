@@ -302,12 +302,14 @@ norx_aarch64_exception_frame:
     adrp x10, SWITCH_SAVED_X28
     add x10, x10, :lo12:SWITCH_SAVED_X28
     str x28, [x10]
+    ldr x9, [sp, #112]
     adrp x10, SWITCH_SAVED_X29
     add x10, x10, :lo12:SWITCH_SAVED_X29
-    str x29, [x10]
+    str x9, [x10]
+    ldr x9, [sp, #120]
     adrp x10, SWITCH_SAVED_X30
     add x10, x10, :lo12:SWITCH_SAVED_X30
-    str x30, [x10]
+    str x9, [x10]
     mov x1, x0
     mov x0, sp
     bl norx_aarch64_switch_user_rust

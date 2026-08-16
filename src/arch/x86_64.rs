@@ -355,6 +355,10 @@ pub fn switch_to_user(root: crate::address::PhysAddr) -> bool {
     paging::switch_to_user(root)
 }
 
+pub fn user_space_is_current(root: crate::address::PhysAddr) -> bool {
+    paging::user_space_is_current(root)
+}
+
 pub fn restore_kernel_address_space() {
     paging::restore_kernel()
 }

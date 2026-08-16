@@ -68,6 +68,15 @@ fn main() {
             "userspace-c.elf",
         ),
         (
+            "spawn2",
+            rootfs
+                .join("tests")
+                .join("runtime")
+                .join(triple)
+                .join("spawn2-smoke.elf"),
+            "spawn2-smoke.elf",
+        ),
+        (
             "cxx",
             rootfs
                 .join("tests")

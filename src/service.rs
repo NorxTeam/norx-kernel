@@ -780,6 +780,10 @@ pub fn user_entry_self_check() -> bool {
             "c-runtime",
             option_env!("C_FIXTURE") == Some("external"),
         ) && run_user_fixture(
+            crate::elf::spawn2_image(),
+            "spawn2-smoke",
+            option_env!("SPAWN2_FIXTURE") == Some("external"),
+        ) && run_user_fixture(
             crate::elf::representative_cxx_image(),
             "cxx-runtime",
             option_env!("CXX_FIXTURE") == Some("external"),
@@ -1066,6 +1070,7 @@ fn image_for_user_path<'a>(path: &'a str) -> Result<(&'static [u8], &'a str), Sp
             return Ok((crate::elf::representative_image(), "rust-smoke"));
         }
         "/bin/c-runtime" => return Ok((crate::elf::representative_c_image(), "c-runtime")),
+        "/bin/spawn2-smoke" => return Ok((crate::elf::spawn2_image(), "spawn2-smoke")),
         "/bin/cxx-runtime" => {
             return Ok((crate::elf::representative_cxx_image(), "cxx-runtime"));
         }
@@ -1270,7 +1275,7 @@ fn spawn_user_path_resumable_with_args_and_credentials(
             },
         )?;
         let child = transaction.child;
-        let mut runtime = match crate::user_runtime::NativeRuntime::prepare_image(
+        let runtime = match crate::user_runtime::NativeRuntime::prepare_image(
             child,
             image,
             &plan,
@@ -1290,8 +1295,8 @@ fn spawn_user_path_resumable_with_args_and_credentials(
             let _ = crate::process::discard_child(transaction.parent, child);
             return Err(SpawnError::Runtime);
         };
+        let mut runtime = runtime;
         if runtime.activate_for_resumable().is_err() {
-            let mut runtime = runtime;
             let _ = runtime.discard();
             let _ = crate::process::discard_child(transaction.parent, child);
             return Err(SpawnError::Runtime);

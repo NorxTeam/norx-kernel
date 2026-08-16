@@ -296,8 +296,11 @@ impl AddressSpace {
     pub fn destroy(&mut self) -> Result<(), Error> {
         let root = self.root_frame.ok_or(Error::InvalidState)?;
         if self.active {
+            let current = crate::arch::user_space_is_current(root);
             crate::arch::user_space_reset(root);
-            crate::arch::restore_kernel_address_space();
+            if current {
+                crate::arch::restore_kernel_address_space();
+            }
             self.active = false;
         }
         if self.root_frame.is_none() || self.active {

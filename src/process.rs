@@ -983,7 +983,7 @@ impl ProcessTable {
         root: PhysAddr,
     ) -> Result<(), Error> {
         let record = self.process_mut(process)?;
-        if record.state != ProcessState::Running {
+        if !matches!(record.state, ProcessState::Creating | ProcessState::Running) {
             return Err(Error::InvalidState);
         }
         record.address_space_root = Some(root);
@@ -2343,6 +2343,186 @@ pub fn contract_self_check() {
     resource_table
         .close_fd(resource_parent, rollback_write_fd)
         .unwrap();
+
+    // Keep two staged transactions alive together: each child must hold its
+    // own reference, and a failed third transaction must not leak or disturb
+    // either successful inheritance.
+    let mut concurrent_table = ProcessTable::new();
+    let (concurrent_init, _) = concurrent_table.create_init().unwrap();
+    let (concurrent_parent, _) = concurrent_table
+        .spawn_child(concurrent_init, Credentials::BOOTSTRAP)
+        .unwrap();
+    let concurrent_file = crate::vfs::open("/hello.txt", crate::vfs::OpenOptions::read()).unwrap();
+    let concurrent_file_raw = concurrent_file.raw();
+    let concurrent_file_fd = concurrent_table
+        .open_fd(concurrent_parent, concurrent_file_raw, true, false)
+        .unwrap();
+    let (concurrent_pipe_read_raw, concurrent_pipe_write_raw) = crate::pipe::create().unwrap();
+    let concurrent_pipe_read_fd = concurrent_table
+        .open_fd(concurrent_parent, concurrent_pipe_read_raw, true, false)
+        .unwrap();
+    let concurrent_pipe_write_fd = concurrent_table
+        .open_fd(concurrent_parent, concurrent_pipe_write_raw, false, true)
+        .unwrap();
+    let (first_concurrent_child, first_concurrent_thread) = concurrent_table
+        .spawn_child_staged(concurrent_parent, Credentials::BOOTSTRAP)
+        .unwrap();
+    let (second_concurrent_child, second_concurrent_thread) = concurrent_table
+        .spawn_child_staged(concurrent_parent, Credentials::BOOTSTRAP)
+        .unwrap();
+    let concurrent_sources = [
+        FileDescriptor::from_raw(0),
+        FileDescriptor::from_raw(1),
+        FileDescriptor::from_raw(2),
+    ];
+    concurrent_table
+        .inherit_open_fds(
+            concurrent_parent,
+            first_concurrent_child,
+            concurrent_sources,
+        )
+        .unwrap();
+    concurrent_table
+        .inherit_open_fds(
+            concurrent_parent,
+            second_concurrent_child,
+            concurrent_sources,
+        )
+        .unwrap();
+    for child in [first_concurrent_child, second_concurrent_child] {
+        assert_eq!(
+            concurrent_table
+                .fd_info(child, FileDescriptor::from_raw(3))
+                .unwrap()
+                .0,
+            concurrent_file_raw
+        );
+        assert_eq!(
+            concurrent_table
+                .fd_info(child, FileDescriptor::from_raw(4))
+                .unwrap()
+                .0,
+            concurrent_pipe_read_raw
+        );
+        assert_eq!(
+            concurrent_table
+                .fd_info(child, FileDescriptor::from_raw(5))
+                .unwrap()
+                .0,
+            concurrent_pipe_write_raw
+        );
+    }
+
+    let (invalid_concurrent_child, _invalid_concurrent_thread) = concurrent_table
+        .spawn_child_staged(concurrent_parent, Credentials::BOOTSTRAP)
+        .unwrap();
+    assert_eq!(
+        concurrent_table.inherit_open_fds(
+            concurrent_parent,
+            invalid_concurrent_child,
+            [
+                FileDescriptor::from_raw(0),
+                FileDescriptor::from_raw(1),
+                FileDescriptor::from_raw(31),
+            ],
+        ),
+        Err(Error::InvalidFd)
+    );
+    assert_eq!(
+        concurrent_table.fd_info(invalid_concurrent_child, FileDescriptor::from_raw(3)),
+        Err(Error::InvalidFd)
+    );
+    concurrent_table
+        .abort_child(concurrent_parent, invalid_concurrent_child)
+        .unwrap();
+
+    let (capacity_concurrent_child, _capacity_concurrent_thread) = concurrent_table
+        .spawn_child_staged(concurrent_parent, Credentials::BOOTSTRAP)
+        .unwrap();
+    concurrent_table
+        .process_mut(capacity_concurrent_child)
+        .unwrap()
+        .session
+        .max_fds = 5;
+    assert_eq!(
+        concurrent_table.inherit_open_fds(
+            concurrent_parent,
+            capacity_concurrent_child,
+            concurrent_sources,
+        ),
+        Err(Error::FdCapacity)
+    );
+    assert_eq!(
+        concurrent_table.fd_info(capacity_concurrent_child, FileDescriptor::from_raw(3)),
+        Err(Error::InvalidFd)
+    );
+    concurrent_table
+        .abort_child(concurrent_parent, capacity_concurrent_child)
+        .unwrap();
+
+    concurrent_table
+        .close_fd(concurrent_parent, concurrent_file_fd)
+        .unwrap();
+    concurrent_table
+        .close_fd(concurrent_parent, concurrent_pipe_read_fd)
+        .unwrap();
+    assert_eq!(
+        crate::vfs::read_raw(concurrent_file_raw, &mut [0; 1]),
+        Ok(1)
+    );
+    assert_eq!(
+        crate::pipe::write_raw(concurrent_pipe_write_raw, &[0x5a]),
+        Ok(1)
+    );
+
+    for fd in [3, 4, 5] {
+        concurrent_table
+            .close_fd(first_concurrent_child, FileDescriptor::from_raw(fd))
+            .unwrap();
+    }
+    assert_eq!(
+        crate::vfs::read_raw(concurrent_file_raw, &mut [0; 1]),
+        Ok(1)
+    );
+    assert_eq!(
+        crate::pipe::write_raw(concurrent_pipe_write_raw, &[0x5a]),
+        Ok(1)
+    );
+
+    for fd in [3, 4, 5] {
+        concurrent_table
+            .close_fd(second_concurrent_child, FileDescriptor::from_raw(fd))
+            .unwrap();
+    }
+    assert_eq!(
+        crate::vfs::duplicate_raw(concurrent_file_raw),
+        Err(crate::vfs::Error::InvalidHandle)
+    );
+    assert_eq!(
+        crate::pipe::write_raw(concurrent_pipe_write_raw, &[0x5a]),
+        Err(crate::pipe::Error::BrokenPipe)
+    );
+    concurrent_table
+        .close_fd(concurrent_parent, concurrent_pipe_write_fd)
+        .unwrap();
+    assert_eq!(
+        crate::pipe::close_raw(concurrent_pipe_write_raw),
+        Err(crate::pipe::Error::InvalidHandle)
+    );
+    concurrent_table
+        .abort_child(concurrent_parent, first_concurrent_child)
+        .unwrap();
+    concurrent_table
+        .abort_child(concurrent_parent, second_concurrent_child)
+        .unwrap();
+    assert_eq!(
+        concurrent_table.thread_state(first_concurrent_thread),
+        Err(Error::InvalidId)
+    );
+    assert_eq!(
+        concurrent_table.thread_state(second_concurrent_thread),
+        Err(Error::InvalidId)
+    );
 }
 
 #[cfg(test)]

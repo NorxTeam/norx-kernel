@@ -379,6 +379,5 @@ extern "C" fn norx_aarch64_switch_user_rust(
     if !crate::arch::switch_to_user(root) {
         return core::ptr::null();
     }
-    let target = context_pointer(to);
-    target
+    context_pointer(to)
 }

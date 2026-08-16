@@ -662,6 +662,10 @@ pub(crate) fn representative_c_image() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/userspace-c.elf"))
 }
 
+pub(crate) fn spawn2_image() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/spawn2-smoke.elf"))
+}
+
 pub(crate) fn representative_cxx_image() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/userspace-cxx.elf"))
 }
