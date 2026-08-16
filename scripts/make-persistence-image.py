@@ -14,6 +14,7 @@ RESERVED_SECTORS = 32
 FAT_COUNT = 2
 SECTORS_PER_CLUSTER = 1
 PERSISTENCE_CLUSTER = 3
+SEED_CLUSTER = 4
 PERSISTENCE_SIZE = SECTOR_SIZE
 
 
@@ -25,7 +26,21 @@ def put_u32(buffer: bytearray, offset: int, value: int) -> None:
     struct.pack_into("<I", buffer, offset, value)
 
 
-def build_image(sectors: int, sequence: int) -> bytes:
+def short_name(name: str) -> bytes:
+    parts = name.upper().split(".")
+    if len(parts) != 2 or not parts[0] or not parts[1] or len(parts[0]) > 8 or len(parts[1]) > 3:
+        raise ValueError("seed name must be an 8.3 filename")
+    if any(not (char.isalnum() or char in "_$~-") for char in "".join(parts)):
+        raise ValueError("seed name contains unsupported characters")
+    return parts[0].ljust(8).encode("ascii") + parts[1].ljust(3).encode("ascii")
+
+
+def build_image(
+    sectors: int,
+    sequence: int,
+    seed_name: str | None = None,
+    seed_data: bytes = b"",
+) -> bytes:
     if sectors < DEFAULT_SECTORS:
         raise ValueError("the image must contain at least 128K sectors")
     fat_size = 0
@@ -44,6 +59,13 @@ def build_image(sectors: int, sequence: int) -> bytes:
         raise ValueError("the geometry is not FAT32-sized")
     if PERSISTENCE_CLUSTER > cluster_count + 1:
         raise ValueError("the persistence cluster is outside the data region")
+    seed_clusters = (len(seed_data) + SECTOR_SIZE - 1) // SECTOR_SIZE
+    if seed_name is not None:
+        if not seed_data:
+            raise ValueError("the seed file must not be empty")
+        short_name(seed_name)
+        if SEED_CLUSTER + seed_clusters - 1 > cluster_count + 1:
+            raise ValueError("the seed file is too large for the image")
 
     image = bytearray(sectors * SECTOR_SIZE)
     boot = memoryview(image)[:SECTOR_SIZE]
@@ -81,6 +103,13 @@ def build_image(sectors: int, sequence: int) -> bytes:
         put_u32(image, offset + 4, 0xFFFFFFFF)
         put_u32(image, offset + 2 * 4, 0x0FFFFFFF)
         put_u32(image, offset + PERSISTENCE_CLUSTER * 4, 0x0FFFFFFF)
+        if seed_name is not None:
+            for index in range(seed_clusters):
+                cluster = SEED_CLUSTER + index
+                next_cluster = (
+                    cluster + 1 if index + 1 < seed_clusters else 0x0FFFFFFF
+                )
+                put_u32(image, offset + cluster * 4, next_cluster)
 
     data_offset = (RESERVED_SECTORS + FAT_COUNT * fat_size) * SECTOR_SIZE
     root_offset = data_offset
@@ -90,8 +119,18 @@ def build_image(sectors: int, sequence: int) -> bytes:
     root[26:28] = struct.pack("<H", PERSISTENCE_CLUSTER)
     root[28:32] = struct.pack("<I", PERSISTENCE_SIZE)
 
+    if seed_name is not None:
+        seed_entry = root[32:64]
+        seed_entry[0:11] = short_name(seed_name)
+        seed_entry[11] = 0x20
+        seed_entry[26:28] = struct.pack("<H", SEED_CLUSTER)
+        seed_entry[28:32] = struct.pack("<I", len(seed_data))
+
     file_offset = data_offset + (PERSISTENCE_CLUSTER - 2) * SECTOR_SIZE
     image[file_offset : file_offset + 8] = struct.pack("<Q", sequence)
+    if seed_name is not None:
+        seed_offset = data_offset + (SEED_CLUSTER - 2) * SECTOR_SIZE
+        image[seed_offset : seed_offset + len(seed_data)] = seed_data
     return bytes(image)
 
 
@@ -100,6 +139,8 @@ def main() -> int:
     parser.add_argument("output", type=Path)
     parser.add_argument("--sectors", type=int, default=DEFAULT_SECTORS)
     parser.add_argument("--sequence", type=int, default=0)
+    parser.add_argument("--seed-file", type=Path)
+    parser.add_argument("--seed-name", default="NORXELF.ELF")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     if args.output.exists() and not args.force:
@@ -107,7 +148,13 @@ def main() -> int:
     if args.sequence < 0 or args.sequence >= 1 << 64:
         parser.error("--sequence must fit in an unsigned 64-bit value")
     try:
-        data = build_image(args.sectors, args.sequence)
+        seed_data = args.seed_file.read_bytes() if args.seed_file else b""
+        data = build_image(
+            args.sectors,
+            args.sequence,
+            args.seed_name if args.seed_file else None,
+            seed_data,
+        )
     except ValueError as error:
         parser.error(str(error))
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -494,6 +494,20 @@ pub fn contract_self_check() {
     assert!(!supervisor.endpoint_active(handle).unwrap());
     supervisor.unregister(handle).unwrap();
     assert_eq!(supervisor.state(handle), Err(Error::InvalidHandle));
+
+    assert!(image_for_user_path("/bin/rust-smoke").is_ok());
+    assert!(is_vfs_user_path("/storage/service.elf"));
+    assert!(!is_vfs_user_path("/storage/../bin/rust-smoke"));
+    assert!(matches!(
+        read_vfs_image("/tmp/host-image"),
+        Err(SpawnError::InvalidPath)
+    ));
+    assert!(read_vfs_image("/storage/__norx_missing_spawn_fixture__").is_err());
+    let malformed = [0u8; 64];
+    assert_eq!(
+        crate::elf::parse(&malformed, crate::elf::Machine::current(), 0),
+        Err(crate::elf::Error::BadMagic)
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -913,6 +927,138 @@ pub enum SpawnError {
 }
 
 const SPAWN_INHERIT_CREDENTIALS: u64 = 1 << 2;
+const MAX_VFS_ELF_IMAGE: usize = 16 * 1024;
+const VFS_USER_PATH_PREFIX: &str = "/storage/";
+
+struct VfsImage {
+    bytes: [u8; MAX_VFS_ELF_IMAGE],
+    length: usize,
+}
+
+impl VfsImage {
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.length]
+    }
+}
+
+fn is_vfs_user_path(path: &str) -> bool {
+    let Some(remainder) = path.strip_prefix(VFS_USER_PATH_PREFIX) else {
+        return false;
+    };
+    !remainder.is_empty()
+        && !path.as_bytes().contains(&0)
+        && !remainder
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
+}
+
+fn map_vfs_spawn_error(error: crate::vfs::Error) -> SpawnError {
+    match error {
+        crate::vfs::Error::NotFound => SpawnError::NotFound,
+        crate::vfs::Error::InvalidPath | crate::vfs::Error::NameTooLong => SpawnError::InvalidPath,
+        _ => SpawnError::InvalidState,
+    }
+}
+
+fn read_vfs_image(path: &str) -> Result<VfsImage, SpawnError> {
+    if !is_vfs_user_path(path) {
+        return Err(SpawnError::InvalidPath);
+    }
+    let handle =
+        crate::vfs::open(path, crate::vfs::OpenOptions::read()).map_err(map_vfs_spawn_error)?;
+    let result = (|| {
+        let stat = crate::vfs::stat_handle(handle).map_err(map_vfs_spawn_error)?;
+        if stat.kind != crate::vfs::NodeType::Regular
+            || stat.size == 0
+            || stat.size > MAX_VFS_ELF_IMAGE
+        {
+            return Err(SpawnError::Elf);
+        }
+
+        let mut bytes = [0; MAX_VFS_ELF_IMAGE];
+        let mut length = 0;
+        while length < stat.size {
+            let read = crate::vfs::read_handle(handle, &mut bytes[length..stat.size])
+                .map_err(map_vfs_spawn_error)?;
+            if read == 0 || read > stat.size - length {
+                return Err(SpawnError::Elf);
+            }
+            length += read;
+        }
+        let final_stat = crate::vfs::stat_handle(handle).map_err(map_vfs_spawn_error)?;
+        if final_stat.kind != crate::vfs::NodeType::Regular || final_stat.size != stat.size {
+            return Err(SpawnError::Elf);
+        }
+
+        Ok(VfsImage { bytes, length })
+    })();
+    let close = crate::vfs::close(handle);
+    match (result, close) {
+        (Ok(image), Ok(())) => Ok(image),
+        (Ok(_), Err(_)) => Err(SpawnError::InvalidState),
+        (Err(error), _) => Err(error),
+    }
+}
+
+fn user_path_label(path: &str) -> Result<&str, SpawnError> {
+    if path.as_bytes().contains(&0) {
+        return Err(SpawnError::InvalidPath);
+    }
+    if let Ok((_, label)) = image_for_user_path(path) {
+        return Ok(label);
+    }
+    if !is_vfs_user_path(path) {
+        return Err(SpawnError::NotFound);
+    }
+    let label = path
+        .rsplit('/')
+        .find(|component| !component.is_empty())
+        .ok_or(SpawnError::InvalidPath)?;
+    if matches!(label, "." | "..") {
+        return Err(SpawnError::InvalidPath);
+    }
+    Ok(label)
+}
+
+fn with_user_image<R>(
+    path: &str,
+    f: impl FnOnce(&[u8], &str) -> Result<R, SpawnError>,
+) -> Result<R, SpawnError> {
+    if path.as_bytes().contains(&0) {
+        return Err(SpawnError::InvalidPath);
+    }
+    if let Ok((image, label)) = image_for_user_path(path) {
+        return f(image, label);
+    }
+    if !is_vfs_user_path(path) {
+        return Err(SpawnError::NotFound);
+    }
+    let label = user_path_label(path)?;
+    let image = read_vfs_image(path)?;
+    f(image.as_slice(), label)
+}
+
+pub fn vfs_image_prepare_smoke(path: &str) -> Result<(), SpawnError> {
+    with_user_image(path, |image, _label| {
+        let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE, 61);
+        let plan = crate::elf::parse(image, crate::elf::Machine::current(), load_bias)
+            .map_err(|_| SpawnError::Elf)?;
+        let mut runtime = crate::user_runtime::NativeRuntime::prepare_image(
+            ProcessId::INIT,
+            image,
+            &plan,
+            crate::address_space::AslrHook::new(61),
+            &[b"vfs-elf-smoke"],
+            &[],
+        )
+        .map_err(|_| SpawnError::Runtime)?;
+        if runtime.root_frame().is_none() {
+            let _ = runtime.discard();
+            return Err(SpawnError::Runtime);
+        }
+        runtime.discard().map_err(|_| SpawnError::Runtime)
+    })
+}
 
 fn image_for_user_path<'a>(path: &'a str) -> Result<(&'static [u8], &'a str), SpawnError> {
     let image = match path {
@@ -940,98 +1086,96 @@ fn image_for_user_path<'a>(path: &'a str) -> Result<(&'static [u8], &'a str), Sp
 }
 
 pub fn spawn_user_path(path: &str) -> Result<u32, SpawnError> {
-    let (image, label) = image_for_user_path(path)?;
-    if path.as_bytes().contains(&0) {
-        return Err(SpawnError::InvalidPath);
-    }
-
-    let parent = crate::process::current_process_id().ok_or(SpawnError::InvalidState)?;
-    let parent_root = crate::process::address_space_root(parent)
-        .map_err(|_| SpawnError::InvalidState)?
-        .ok_or(SpawnError::InvalidState)?;
-    crate::arch::restore_kernel_address_space();
-    let credentials = match label {
-        "sudo-smoke" => Credentials {
-            real_uid: 1000,
-            effective_uid: 1000,
-            saved_uid: 1000,
-            real_gid: 1000,
-            effective_gid: 1000,
-            saved_gid: 1000,
-            capabilities: (1u64 << (crate::process::Capability::Mount as u8))
-                | (1u64 << (crate::process::Capability::PrivilegeDelegation as u8)),
-        },
-        _ => Credentials {
-            capabilities: match label {
-                "login-smoke" => 1u64 << (crate::process::Capability::SessionAdmin as u8),
-                "userctl-smoke" => 1u64 << (crate::process::Capability::AccountAdmin as u8),
-                _ => 0,
+    with_user_image(path, |image, label| {
+        let parent = crate::process::current_process_id().ok_or(SpawnError::InvalidState)?;
+        let parent_root = crate::process::address_space_root(parent)
+            .map_err(|_| SpawnError::InvalidState)?
+            .ok_or(SpawnError::InvalidState)?;
+        crate::arch::restore_kernel_address_space();
+        let credentials = match label {
+            "sudo-smoke" => Credentials {
+                real_uid: 1000,
+                effective_uid: 1000,
+                saved_uid: 1000,
+                real_gid: 1000,
+                effective_gid: 1000,
+                saved_gid: 1000,
+                capabilities: (1u64 << (crate::process::Capability::Mount as u8))
+                    | (1u64 << (crate::process::Capability::PrivilegeDelegation as u8)),
             },
-            ..Credentials::BOOTSTRAP
-        },
-    };
-    let (child, thread) =
-        crate::process::spawn_child_current(credentials).map_err(|error| match error {
-            crate::process::Error::ProcessCapacity | crate::process::Error::ThreadCapacity => {
-                SpawnError::Capacity
+            _ => Credentials {
+                capabilities: match label {
+                    "login-smoke" => 1u64 << (crate::process::Capability::SessionAdmin as u8),
+                    "userctl-smoke" => 1u64 << (crate::process::Capability::AccountAdmin as u8),
+                    _ => 0,
+                },
+                ..Credentials::BOOTSTRAP
+            },
+        };
+        let (child, thread) =
+            crate::process::spawn_child_current(credentials).map_err(|error| match error {
+                crate::process::Error::ProcessCapacity | crate::process::Error::ThreadCapacity => {
+                    SpawnError::Capacity
+                }
+                _ => SpawnError::InvalidState,
+            })?;
+        let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE, 53);
+        let plan = match crate::elf::parse(image, crate::elf::Machine::current(), load_bias) {
+            Ok(plan) => plan,
+            Err(_) => {
+                let _ = crate::process::discard_child(parent, child);
+                return Err(SpawnError::Elf);
             }
-            _ => SpawnError::InvalidState,
-        })?;
-    let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE, 53);
-    let plan = match crate::elf::parse(image, crate::elf::Machine::current(), load_bias) {
-        Ok(plan) => plan,
-        Err(_) => {
+        };
+        let arguments = [label.as_bytes()];
+        let environment: [&[u8]; 0] = [];
+        let mut runtime = match crate::user_runtime::NativeRuntime::prepare_image(
+            child,
+            image,
+            &plan,
+            crate::address_space::AslrHook::new(53),
+            &arguments,
+            &environment,
+        ) {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                let _ = crate::process::discard_child(parent, child);
+                return Err(SpawnError::Runtime);
+            }
+        };
+        let Some(root) = runtime.root_frame() else {
+            let _ = runtime.discard();
             let _ = crate::process::discard_child(parent, child);
-            return Err(SpawnError::Elf);
-        }
-    };
-    let arguments = [label.as_bytes()];
-    let environment: [&[u8]; 0] = [];
-    let mut runtime = match crate::user_runtime::NativeRuntime::prepare_image(
-        child,
-        image,
-        &plan,
-        crate::address_space::AslrHook::new(53),
-        &arguments,
-        &environment,
-    ) {
-        Ok(runtime) => runtime,
-        Err(_) => {
+            return Err(SpawnError::Runtime);
+        };
+        if crate::process::attach_address_space(child, root).is_err()
+            || crate::process::switch_to_user(child, thread).is_err()
+        {
+            let _ = runtime.discard();
             let _ = crate::process::discard_child(parent, child);
             return Err(SpawnError::Runtime);
         }
-    };
-    let Some(root) = runtime.root_frame() else {
-        let _ = runtime.discard();
-        let _ = crate::process::discard_child(parent, child);
-        return Err(SpawnError::Runtime);
-    };
-    if crate::process::attach_address_space(child, root).is_err()
-        || crate::process::switch_to_user(child, thread).is_err()
-    {
-        let _ = runtime.discard();
-        let _ = crate::process::discard_child(parent, child);
-        return Err(SpawnError::Runtime);
-    }
-    let start_failed = runtime.start().is_err();
-    let enter_failed = !start_failed && runtime.enter_user_quiet().is_err();
-    if start_failed || enter_failed || !runtime.is_exited() {
+        let start_failed = runtime.start().is_err();
+        let enter_failed = !start_failed && runtime.enter_user_quiet().is_err();
+        if start_failed || enter_failed || !runtime.is_exited() {
+            let _ = crate::process::clear_address_space(child);
+            let _ = crate::process::discard_child(parent, child);
+            let _ = crate::process::restore_process(parent);
+            let _ = crate::arch::switch_to_user(parent_root);
+            return Err(SpawnError::Runtime);
+        }
         let _ = crate::process::clear_address_space(child);
-        let _ = crate::process::discard_child(parent, child);
-        let _ = crate::process::restore_process(parent);
-        let _ = crate::arch::switch_to_user(parent_root);
-        return Err(SpawnError::Runtime);
-    }
-    let _ = crate::process::clear_address_space(child);
-    if crate::process::restore_process(parent).is_err() || !crate::arch::switch_to_user(parent_root)
-    {
-        return Err(SpawnError::InvalidState);
-    }
-    Ok(child.get())
+        if crate::process::restore_process(parent).is_err()
+            || !crate::arch::switch_to_user(parent_root)
+        {
+            return Err(SpawnError::InvalidState);
+        }
+        Ok(child.get())
+    })
 }
 
 pub fn spawn_user_path_resumable(path: &str) -> Result<u32, SpawnError> {
-    let (_, label) = image_for_user_path(path)?;
+    let label = user_path_label(path)?;
     let arguments = [label.as_bytes()];
     spawn_user_path_resumable_with_args(path, &arguments, &[])
 }
@@ -1103,86 +1247,80 @@ fn spawn_user_path_resumable_with_args_and_credentials(
     flags: u64,
     credentials_override: Option<Credentials>,
 ) -> Result<crate::process::SpawnTransaction, SpawnError> {
-    let (image, _label) = image_for_user_path(path)?;
-    if path.as_bytes().contains(&0) {
-        return Err(SpawnError::InvalidPath);
-    }
-    let credentials = match credentials_override {
-        Some(credentials) => credentials,
-        None if flags & SPAWN_INHERIT_CREDENTIALS != 0 => {
-            crate::process::current_credentials().map_err(|_| SpawnError::InvalidState)?
-        }
-        None => Credentials {
-            capabilities: 0,
-            ..Credentials::BOOTSTRAP
-        },
-    };
-    let transaction =
-        crate::process::spawn_child_current_staged(credentials).map_err(|error| match error {
-            crate::process::Error::ProcessCapacity | crate::process::Error::ThreadCapacity => {
-                SpawnError::Capacity
+    with_user_image(path, |image, _label| {
+        let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE, 53);
+        let plan = crate::elf::parse(image, crate::elf::Machine::current(), load_bias)
+            .map_err(|_| SpawnError::Elf)?;
+        let credentials = match credentials_override {
+            Some(credentials) => credentials,
+            None if flags & SPAWN_INHERIT_CREDENTIALS != 0 => {
+                crate::process::current_credentials().map_err(|_| SpawnError::InvalidState)?
             }
-            _ => SpawnError::InvalidState,
-        })?;
-    let child = transaction.child;
-    let load_bias = crate::elf::load_bias_for_image(image, USER_SERVICE_BASE, 53);
-    let plan = match crate::elf::parse(image, crate::elf::Machine::current(), load_bias) {
-        Ok(plan) => plan,
-        Err(_) => {
+            None => Credentials {
+                capabilities: 0,
+                ..Credentials::BOOTSTRAP
+            },
+        };
+        let transaction = crate::process::spawn_child_current_staged(credentials).map_err(
+            |error| match error {
+                crate::process::Error::ProcessCapacity | crate::process::Error::ThreadCapacity => {
+                    SpawnError::Capacity
+                }
+                _ => SpawnError::InvalidState,
+            },
+        )?;
+        let child = transaction.child;
+        let mut runtime = match crate::user_runtime::NativeRuntime::prepare_image(
+            child,
+            image,
+            &plan,
+            crate::address_space::AslrHook::new(53),
+            &arguments,
+            &environment,
+        ) {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                let _ = crate::process::discard_child(transaction.parent, child);
+                return Err(SpawnError::Runtime);
+            }
+        };
+        let Some(root) = runtime.root_frame() else {
+            let mut runtime = runtime;
+            let _ = runtime.discard();
             let _ = crate::process::discard_child(transaction.parent, child);
-            return Err(SpawnError::Elf);
-        }
-    };
-    let mut runtime = match crate::user_runtime::NativeRuntime::prepare_image(
-        child,
-        image,
-        &plan,
-        crate::address_space::AslrHook::new(53),
-        &arguments,
-        &environment,
-    ) {
-        Ok(runtime) => runtime,
-        Err(_) => {
+            return Err(SpawnError::Runtime);
+        };
+        if runtime.activate_for_resumable().is_err() {
+            let mut runtime = runtime;
+            let _ = runtime.discard();
             let _ = crate::process::discard_child(transaction.parent, child);
             return Err(SpawnError::Runtime);
         }
-    };
-    let Some(root) = runtime.root_frame() else {
-        let mut runtime = runtime;
-        let _ = runtime.discard();
-        let _ = crate::process::discard_child(transaction.parent, child);
-        return Err(SpawnError::Runtime);
-    };
-    if runtime.activate_for_resumable().is_err() {
-        let mut runtime = runtime;
-        let _ = runtime.discard();
-        let _ = crate::process::discard_child(transaction.parent, child);
-        return Err(SpawnError::Runtime);
-    }
-    if crate::process::attach_address_space(child, root).is_err()
-        || crate::user_runtime::install(child, runtime).is_err()
-    {
-        let _ = crate::user_runtime::discard(child);
-        let _ = crate::process::clear_address_space(child);
-        let _ = crate::process::discard_child(transaction.parent, child);
-        return Err(SpawnError::Runtime);
-    }
-    let registers = match crate::user_runtime::start(child) {
-        Ok(registers) => registers,
-        Err(_) => {
+        if crate::process::attach_address_space(child, root).is_err()
+            || crate::user_runtime::install(child, runtime).is_err()
+        {
             let _ = crate::user_runtime::discard(child);
             let _ = crate::process::clear_address_space(child);
             let _ = crate::process::discard_child(transaction.parent, child);
             return Err(SpawnError::Runtime);
         }
-    };
-    if crate::process::install_user_context(transaction.thread.get(), registers).is_err() {
-        let _ = crate::user_runtime::discard(child);
-        let _ = crate::process::clear_address_space(child);
-        let _ = crate::process::discard_child(transaction.parent, child);
-        return Err(SpawnError::Runtime);
-    }
-    Ok(transaction)
+        let registers = match crate::user_runtime::start(child) {
+            Ok(registers) => registers,
+            Err(_) => {
+                let _ = crate::user_runtime::discard(child);
+                let _ = crate::process::clear_address_space(child);
+                let _ = crate::process::discard_child(transaction.parent, child);
+                return Err(SpawnError::Runtime);
+            }
+        };
+        if crate::process::install_user_context(transaction.thread.get(), registers).is_err() {
+            let _ = crate::user_runtime::discard(child);
+            let _ = crate::process::clear_address_space(child);
+            let _ = crate::process::discard_child(transaction.parent, child);
+            return Err(SpawnError::Runtime);
+        }
+        Ok(transaction)
+    })
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

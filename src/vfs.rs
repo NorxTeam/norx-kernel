@@ -1689,6 +1689,12 @@ pub fn read_handle(handle: FileHandle, output: &mut [u8]) -> Result<usize, Error
             if output.is_empty() {
                 return Ok(0);
             }
+            let size = usize::try_from(info.size).map_err(|_| Error::OffsetOutOfRange)?;
+            if description.offset == 0 && output.len() >= size {
+                let length = backend.read_file(path_str, output)?;
+                fs.handles[slot].offset = length;
+                return Ok(length);
+            }
             let mut data = [0u8; FILE_MAX];
             let length = backend.read_file(path_str, &mut data)?;
             let available = length.saturating_sub(description.offset);

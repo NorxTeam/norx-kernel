@@ -2206,6 +2206,143 @@ pub fn contract_self_check() {
             .to_kind,
         ThreadKind::User
     );
+
+    let mut resource_table = ProcessTable::new();
+    let (resource_init, _) = resource_table.create_init().unwrap();
+    let (resource_parent, _) = resource_table
+        .spawn_child(resource_init, Credentials::BOOTSTRAP)
+        .unwrap();
+    let file = crate::vfs::open("/hello.txt", crate::vfs::OpenOptions::read()).unwrap();
+    let file_raw = file.raw();
+    let file_fd = resource_table
+        .open_fd(resource_parent, file_raw, true, false)
+        .unwrap();
+    resource_table
+        .set_close_on_exec(resource_parent, file_fd, true)
+        .unwrap();
+    let (pipe_read_raw, pipe_write_raw) = crate::pipe::create().unwrap();
+    let pipe_read_fd = resource_table
+        .open_fd(resource_parent, pipe_read_raw, true, false)
+        .unwrap();
+    let pipe_write_fd = resource_table
+        .open_fd(resource_parent, pipe_write_raw, false, true)
+        .unwrap();
+    let (resource_child, resource_child_thread) = resource_table
+        .spawn_child_staged(resource_parent, Credentials::BOOTSTRAP)
+        .unwrap();
+    resource_table
+        .inherit_open_fds(
+            resource_parent,
+            resource_child,
+            [
+                FileDescriptor::from_raw(0),
+                FileDescriptor::from_raw(1),
+                FileDescriptor::from_raw(2),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        resource_table
+            .fd_info(resource_child, FileDescriptor::from_raw(3))
+            .unwrap()
+            .0,
+        file_raw
+    );
+    assert!(
+        resource_table
+            .fd_info(resource_child, FileDescriptor::from_raw(3))
+            .unwrap()
+            .1
+    );
+    assert_eq!(
+        resource_table
+            .fd_info(resource_child, FileDescriptor::from_raw(4))
+            .unwrap()
+            .0,
+        pipe_read_raw
+    );
+    assert_eq!(
+        resource_table
+            .fd_info(resource_child, FileDescriptor::from_raw(5))
+            .unwrap()
+            .0,
+        pipe_write_raw
+    );
+    resource_table.close_fd(resource_parent, file_fd).unwrap();
+    assert_eq!(crate::vfs::read_raw(file_raw, &mut [0; 1]), Ok(1));
+    resource_table
+        .close_fd(resource_child, FileDescriptor::from_raw(3))
+        .unwrap();
+    assert_eq!(
+        crate::vfs::duplicate_raw(file_raw),
+        Err(crate::vfs::Error::InvalidHandle)
+    );
+    resource_table
+        .close_fd(resource_parent, pipe_read_fd)
+        .unwrap();
+    assert_eq!(crate::pipe::write_raw(pipe_write_raw, &[0x5a]), Ok(1));
+    resource_table
+        .close_fd(resource_child, FileDescriptor::from_raw(4))
+        .unwrap();
+    assert_eq!(
+        crate::pipe::write_raw(pipe_write_raw, &[0x5a]),
+        Err(crate::pipe::Error::BrokenPipe)
+    );
+    resource_table
+        .close_fd(resource_child, FileDescriptor::from_raw(5))
+        .unwrap();
+    resource_table
+        .close_fd(resource_parent, pipe_write_fd)
+        .unwrap();
+    resource_table
+        .publish_child(resource_child, resource_child_thread)
+        .unwrap();
+    resource_table.exit(resource_child, 0).unwrap();
+    assert_eq!(
+        resource_table.wait(resource_parent, Some(resource_child)),
+        Ok((resource_child, 0))
+    );
+
+    let (rollback_read_raw, rollback_write_raw) = crate::pipe::create().unwrap();
+    let rollback_read_fd = resource_table
+        .open_fd(resource_parent, rollback_read_raw, true, false)
+        .unwrap();
+    let rollback_write_fd = resource_table
+        .open_fd(resource_parent, rollback_write_raw, false, true)
+        .unwrap();
+    let (rollback_child, _rollback_thread) = resource_table
+        .spawn_child_staged(resource_parent, Credentials::BOOTSTRAP)
+        .unwrap();
+    resource_table
+        .process_mut(rollback_child)
+        .unwrap()
+        .session
+        .max_fds = 4;
+    assert_eq!(
+        resource_table.inherit_open_fds(
+            resource_parent,
+            rollback_child,
+            [
+                FileDescriptor::from_raw(0),
+                FileDescriptor::from_raw(1),
+                FileDescriptor::from_raw(2),
+            ],
+        ),
+        Err(Error::FdCapacity)
+    );
+    resource_table
+        .abort_child(resource_parent, rollback_child)
+        .unwrap();
+    resource_table
+        .close_fd(resource_parent, rollback_read_fd)
+        .unwrap();
+    assert_eq!(
+        crate::pipe::write_raw(rollback_write_raw, &[0x5a]),
+        Err(crate::pipe::Error::BrokenPipe)
+    );
+    resource_table
+        .close_fd(resource_parent, rollback_write_fd)
+        .unwrap();
 }
 
 #[cfg(test)]

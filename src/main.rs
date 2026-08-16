@@ -160,6 +160,27 @@ fn persistent_vfs_mount_smoke(
             vfs::close(reopened)?;
             vfs::sync_path(PATH)?;
             bootlog::ok("persistent VFS writable FAT32 create/write/fsync/readback passed");
+
+            const EXTERNAL_IMAGE: &str = "/storage/NORXELF.ELF";
+            match vfs::stat(EXTERNAL_IMAGE) {
+                Ok(info) if info.kind == vfs::NodeType::Regular => {
+                    match service::vfs_image_prepare_smoke(EXTERNAL_IMAGE) {
+                        Ok(()) => bootlog::ok(
+                            "persistent VFS ELF read/parse/prepare/discard smoke passed",
+                        ),
+                        Err(error) => {
+                            bootlog::fail_fmt(format_args!(
+                                "persistent VFS ELF prepare failed: {:?}",
+                                error
+                            ));
+                            return Err(vfs::Error::BackendError);
+                        }
+                    }
+                }
+                Ok(_) => return Err(vfs::Error::IsDirectory),
+                Err(vfs::Error::NotFound) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(count)
     })();
