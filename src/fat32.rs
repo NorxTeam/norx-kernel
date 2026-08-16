@@ -37,6 +37,7 @@ pub enum Error {
     ReadOnly,
     AlreadyExists,
     Unsupported,
+    HardLinkUnsupported,
     NotEmpty,
     InvalidPersistenceRecord,
 }
@@ -632,6 +633,29 @@ impl Mount {
             return Err(Error::IsDirectory);
         }
         self.remove_entry(location)
+    }
+
+    pub fn link(self, from: &str, to: &str) -> Result<(), Error> {
+        if self.writer.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        let (from_components, from_count) = components(from)?;
+        for component in from_components.iter().take(from_count) {
+            if *component != "." && *component != ".." {
+                validate_lfn_name(component)?;
+            }
+        }
+        let (to_components, to_count) = components(to)?;
+        for component in to_components.iter().take(to_count) {
+            if *component != "." && *component != ".." {
+                validate_lfn_name(component)?;
+            }
+        }
+        validate_lfn_name(to_components[to_count - 1])?;
+        // FAT32 has no inode or nlink field. The current bounded writer also
+        // frees a file chain on unlink and updates one directory entry on a
+        // size/cluster change, so publishing an alias would not be safe.
+        Err(Error::HardLinkUnsupported)
     }
 
     pub fn rmdir(self, path: &str) -> Result<(), Error> {
@@ -1768,6 +1792,9 @@ fn fixture_check() -> bool {
     {
         return false;
     }
+    if read_only_volume.link("/Long Name.txt", "/LINK.TXT") != Err(Error::ReadOnly) {
+        return false;
+    }
     let Ok(root) = read_only_volume.stat("/") else {
         return false;
     };
@@ -1839,6 +1866,13 @@ fn fixture_check() -> bool {
         return false;
     };
     if length != 13 || &updated[..length] != b"FAT32 update\n" {
+        return false;
+    }
+    if volume.link("relative", "/LINK.TXT") != Err(Error::InvalidPath)
+        || volume.link("/Long Name.txt", "/invalid:name.txt") != Err(Error::InvalidPath)
+        || volume.link("/Long Name.txt", "/LINK.TXT") != Err(Error::HardLinkUnsupported)
+        || volume.stat("/LINK.TXT") != Err(Error::NotFound)
+    {
         return false;
     }
     if volume.create_file("/invalid:name.txt") != Err(Error::InvalidPath)

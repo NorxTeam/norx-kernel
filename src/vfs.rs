@@ -620,6 +620,14 @@ impl PersistentBackend {
         }
     }
 
+    fn link(self, old_path: &str, new_path: &str) -> Result<(), Error> {
+        match self {
+            Self::Fat32(mount) => mount.link(old_path, new_path).map_err(map_fat32_error),
+            Self::Ext4(_) => Err(Error::BackendUnsupported),
+            Self::Btrfs(_) => Err(Error::ReadOnly),
+        }
+    }
+
     fn rmdir(self, path: &str) -> Result<(), Error> {
         match self {
             Self::Fat32(mount) => mount.rmdir(path).map_err(map_fat32_error),
@@ -839,6 +847,15 @@ impl PersistentMount {
         self.backend.rename(old_path, new_path)
     }
 
+    fn link(self, old_path: &str, new_path: &str) -> Result<(), Error> {
+        validate_persistent_path(old_path)?;
+        validate_persistent_path(new_path)?;
+        if self.read_only() {
+            return Err(Error::ReadOnly);
+        }
+        self.backend.link(old_path, new_path)
+    }
+
     fn rmdir(self, path: &str) -> Result<(), Error> {
         validate_persistent_path(path)?;
         if self.read_only() {
@@ -1019,6 +1036,10 @@ pub fn contract_self_check() {
     assert!(!PersistentBackendKind::Ext4.read_only());
     assert!(PersistentBackendKind::Btrfs.read_only());
     assert_eq!(map_fat32_error(fat32::Error::NotEmpty), Error::NotEmpty);
+    assert_eq!(
+        map_fat32_error(fat32::Error::HardLinkUnsupported),
+        Error::BackendUnsupported
+    );
     assert_eq!(map_fat32_error(fat32::Error::FileTooLarge), Error::NoSpace);
     let mut persistent_path = PersistentPath::ROOT;
     assert_eq!(persistent_path.as_str(), Ok("/"));
@@ -2079,10 +2100,23 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), Error> {
 
 pub fn link(old_path: &str, new_path: &str) -> Result<(), Error> {
     with_fs(|fs| {
-        if locate_persistent_path(fs, old_path, NamespaceId::ROOT)?.is_some()
-            || locate_persistent_path(fs, new_path, NamespaceId::ROOT)?.is_some()
-        {
-            return Err(Error::ReadOnly);
+        let old_persistent = locate_persistent_path(fs, old_path, NamespaceId::ROOT)?;
+        let new_persistent = locate_persistent_path(fs, new_path, NamespaceId::ROOT)?;
+        if old_persistent.is_some() || new_persistent.is_some() {
+            let Some((old_mount, old_path)) = old_persistent else {
+                return Err(Error::InvalidPath);
+            };
+            let Some((new_mount, new_path)) = new_persistent else {
+                return Err(Error::InvalidPath);
+            };
+            if old_mount != new_mount {
+                return Err(Error::InvalidPath);
+            }
+            let backend = persistent_backend(old_mount)?;
+            if mount_flags(old_mount)?.read_only || backend.read_only() {
+                return Err(Error::ReadOnly);
+            }
+            return backend.link(old_path.as_str()?, new_path.as_str()?);
         }
         let (old_mount, old_inode) = resolve_mount(fs, old_path, NamespaceId::ROOT)?;
         if fs.inodes[old_inode as usize].kind == NodeType::Directory {
@@ -2594,6 +2628,7 @@ fn map_fat32_error(error: crate::fat32::Error) -> Error {
         crate::fat32::Error::AlreadyExists => Error::AlreadyExists,
         crate::fat32::Error::NotDirectory => Error::NotDirectory,
         crate::fat32::Error::IsDirectory => Error::IsDirectory,
+        crate::fat32::Error::HardLinkUnsupported => Error::BackendUnsupported,
         crate::fat32::Error::NotEmpty => Error::NotEmpty,
         crate::fat32::Error::BufferTooSmall => Error::BackendError,
         crate::fat32::Error::ReadOnly => Error::ReadOnly,

@@ -49,14 +49,22 @@ use core::panic::PanicInfo;
 
 fn persistent_vfs_mount_smoke(
     source: vfs::MountSource,
-) -> Result<(vfs::MountId, usize), vfs::Error> {
+) -> Result<(vfs::MountId, usize, bool), vfs::Error> {
     match vfs::stat("/storage") {
         Ok(stat) if stat.kind == vfs::NodeType::Directory => {}
         Ok(_) => return Err(vfs::Error::InvalidMountTarget),
         Err(vfs::Error::NotFound) => vfs::mkdir("/storage")?,
         Err(error) => return Err(error),
     }
-    let mount = vfs::mount(source, "/storage", vfs::MountFlags::read_only())?;
+    let writable = matches!(source, vfs::MountSource::Fat32 | vfs::MountSource::Ext4)
+        && drivers::block::persistent()
+        && !drivers::block::read_only();
+    let flags = if writable {
+        vfs::MountFlags::defaults()
+    } else {
+        vfs::MountFlags::read_only()
+    };
+    let mount = vfs::mount(source, "/storage", flags)?;
     let result = (|| {
         let root = vfs::stat("/storage")?;
         if root.kind != vfs::NodeType::Directory {
@@ -116,12 +124,51 @@ fn persistent_vfs_mount_smoke(
             vfs::close(reopened)?;
             break;
         }
+        if writable && source == vfs::MountSource::Fat32 {
+            const PATH: &str = "/storage/NORX.VFS";
+            const PAYLOAD: &[u8] = b"NORX VFS persistent write v1\n";
+            let handle = vfs::open(
+                PATH,
+                vfs::OpenOptions {
+                    read: true,
+                    write: true,
+                    create: true,
+                    truncate: true,
+                    append: false,
+                    exclusive: false,
+                    mode: 0o644,
+                },
+            )?;
+            let written = vfs::write_handle(handle, PAYLOAD)?;
+            vfs::sync_handle(handle)?;
+            vfs::seek_from(handle, 0, 0)?;
+            let mut readback = [0u8; 64];
+            let read = vfs::read_handle(handle, &mut readback)?;
+            if written != PAYLOAD.len() || read != PAYLOAD.len() || readback[..read] != *PAYLOAD {
+                let _ = vfs::close(handle);
+                return Err(vfs::Error::BackendError);
+            }
+            vfs::close(handle)?;
+
+            let reopened = vfs::open(PATH, vfs::OpenOptions::read())?;
+            let mut reopened_data = [0u8; 64];
+            let reopened_read = vfs::read_handle(reopened, &mut reopened_data)?;
+            if reopened_read != PAYLOAD.len() || reopened_data[..reopened_read] != *PAYLOAD {
+                let _ = vfs::close(reopened);
+                return Err(vfs::Error::BackendError);
+            }
+            vfs::close(reopened)?;
+            vfs::sync_path(PATH)?;
+            bootlog::ok("persistent VFS writable FAT32 create/write/fsync/readback passed");
+        }
         Ok(count)
     })();
-    if result.is_err() {
-        let _ = vfs::unmount_mount(mount);
+    let unmount = vfs::unmount_mount(mount);
+    match (result, unmount) {
+        (Ok(count), Ok(())) => Ok((mount, count, writable)),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
     }
-    result.map(|count| (mount, count))
 }
 
 #[no_mangle]
@@ -572,12 +619,13 @@ pub extern "C" fn kernel_start() -> ! {
             continue;
         }
         match persistent_vfs_mount_smoke(source) {
-            Ok((mount, entries)) => {
+            Ok((mount, entries, writable)) => {
                 bootlog::ok_fmt(format_args!(
-                    "persistent VFS mount source={:?} mount={} root_entries={} read_only=true",
+                    "persistent VFS mount source={:?} mount={} root_entries={} read_only={}",
                     source,
                     mount.raw(),
                     entries,
+                    !writable,
                 ));
                 break;
             }
