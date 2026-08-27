@@ -1,6 +1,7 @@
 use crate::address_space::{AddressSpace, AslrHook, PageFlags, PAGE_SIZE, USER_LIMIT};
 use crate::elf::{InitialRegisters, LoadPlan};
 use crate::process::ProcessId;
+use core::cell::UnsafeCell;
 
 const MAX_WRITE: usize = 256;
 
@@ -31,6 +32,15 @@ pub struct NativeRuntime {
     started: bool,
     exited: bool,
 }
+
+const MAX_RUNTIME_SLOTS: usize = 32;
+
+struct RuntimeStore(UnsafeCell<[Option<NativeRuntime>; MAX_RUNTIME_SLOTS]>);
+
+unsafe impl Sync for RuntimeStore {}
+
+static RUNTIME_STORE: RuntimeStore =
+    RuntimeStore(UnsafeCell::new([const { None }; MAX_RUNTIME_SLOTS]));
 
 impl NativeRuntime {
     pub fn prepare(
@@ -113,6 +123,9 @@ impl NativeRuntime {
         };
         if image.is_some() {
             address_space
+                .load(stack.string_base(), stack.string_bytes())
+                .map_err(Error::AddressSpace)?;
+            address_space
                 .load_words(stack.stack_pointer, stack.words())
                 .map_err(Error::AddressSpace)?;
         }
@@ -130,37 +143,66 @@ impl NativeRuntime {
             return Err(Error::InvalidState);
         }
         self.started = true;
-        crate::bootlog::info_fmt(format_args!(
+        crate::bootlog::ok_fmt(format_args!(
             "native init start entry=0x{:x} stack=0x{:x}",
             self.registers.instruction_pointer, self.registers.stack_pointer
         ));
         Ok(self.registers)
     }
 
-    #[allow(dead_code)]
+    pub fn activate_for_resumable(&mut self) -> Result<(), Error> {
+        if self.started || self.exited || self.address_space.is_active() {
+            return Err(Error::InvalidState);
+        }
+        self.address_space.activate().map_err(Error::AddressSpace)
+    }
+
     pub fn enter_user(&mut self) -> Result<(), Error> {
+        self.enter_user_inner(true, true)
+    }
+
+    pub fn enter_user_quiet(&mut self) -> Result<(), Error> {
+        self.enter_user_inner(false, true)
+    }
+
+    #[allow(dead_code)]
+    pub fn enter_user_resumable(&mut self, log: bool) -> Result<(), Error> {
+        self.enter_user_inner(log, false)
+    }
+
+    fn enter_user_inner(&mut self, log: bool, destroy: bool) -> Result<(), Error> {
         if !self.started || self.exited || self.address_space.is_active() {
             return Err(Error::InvalidState);
         }
         let root = self.address_space.root_frame().ok_or(Error::InvalidState)?;
-        crate::bootlog::info("native user entry: activating address space");
-        self.address_space.activate().map_err(Error::AddressSpace)?;
-        crate::bootlog::info("native user entry: address space active");
-        crate::bootlog::info("native user entry: switching TTBR0");
-        if !crate::arch::switch_to_user(root) {
+        if log {
+            crate::bootlog::ok("native user entry: activating address space");
+        }
+        let activated = self.address_space.activate();
+        activated.map_err(Error::AddressSpace)?;
+        if log {
+            crate::bootlog::ok("native user entry: address space active");
+            crate::bootlog::ok("native user entry: switching TTBR0");
+        }
+        let switched = crate::arch::switch_to_user(root);
+        if !switched {
             crate::arch::restore_kernel_address_space();
             let _ = self.address_space.destroy();
             return Err(Error::UserEntryUnavailable);
         }
-        crate::bootlog::info("native user entry: TTBR0 active, entering EL0");
+        if log {
+            crate::bootlog::ok("native user entry: TTBR0 active, entering EL0");
+        }
         if !crate::arch::enter_user(self.registers) {
             crate::arch::restore_kernel_address_space();
             let _ = self.address_space.destroy();
             return Err(Error::UserEntryUnavailable);
         }
         crate::arch::restore_kernel_address_space();
-        self.address_space.destroy().map_err(Error::AddressSpace)?;
-        self.exited = true;
+        if destroy {
+            self.address_space.destroy().map_err(Error::AddressSpace)?;
+            self.exited = true;
+        }
         Ok(())
     }
 
@@ -170,6 +212,10 @@ impl NativeRuntime {
 
     pub fn registers(&self) -> InitialRegisters {
         self.registers
+    }
+
+    pub fn root_frame(&self) -> Option<crate::address::PhysAddr> {
+        self.address_space.root_frame()
     }
 
     pub fn alloc(&mut self, bytes: usize) -> Result<usize, Error> {
@@ -211,7 +257,7 @@ impl NativeRuntime {
         if bytes.len() > MAX_WRITE {
             return Err(Error::OutputTooLong);
         }
-        crate::bootlog::info_fmt(format_args!(
+        crate::bootlog::ok_fmt(format_args!(
             "native init serial write bytes={}",
             bytes.len()
         ));
@@ -224,13 +270,72 @@ impl NativeRuntime {
         }
         self.address_space.destroy().map_err(Error::AddressSpace)?;
         self.exited = true;
-        crate::bootlog::info_fmt(format_args!("native init exited status={}", status));
+        crate::bootlog::ok_fmt(format_args!("native init exited status={}", status));
+        Ok(())
+    }
+
+    pub fn discard(&mut self) -> Result<(), Error> {
+        if self.exited {
+            return Ok(());
+        }
+        self.address_space.destroy().map_err(Error::AddressSpace)?;
+        self.exited = true;
         Ok(())
     }
 
     pub fn is_exited(&self) -> bool {
         self.exited
     }
+}
+
+fn runtime_index(process: ProcessId) -> Option<usize> {
+    let slot = (process.get() & 0xffff) as usize;
+    (slot != 0 && slot <= MAX_RUNTIME_SLOTS).then_some(slot - 1)
+}
+
+pub fn install(process: ProcessId, runtime: NativeRuntime) -> Result<(), Error> {
+    let index = runtime_index(process).ok_or(Error::InvalidState)?;
+    crate::arch::without_interrupts(|| unsafe {
+        let slots = &mut *RUNTIME_STORE.0.get();
+        if slots[index].is_some() {
+            return Err(Error::InvalidState);
+        }
+        slots[index] = Some(runtime);
+        Ok(())
+    })
+}
+
+pub fn start(process: ProcessId) -> Result<InitialRegisters, Error> {
+    let index = runtime_index(process).ok_or(Error::InvalidState)?;
+    crate::arch::without_interrupts(|| unsafe {
+        (&mut *RUNTIME_STORE.0.get())[index]
+            .as_mut()
+            .ok_or(Error::InvalidState)?
+            .start()
+    })
+}
+
+#[allow(dead_code)]
+pub fn enter_resumable(process: ProcessId, log: bool) -> Result<(), Error> {
+    let index = runtime_index(process).ok_or(Error::InvalidState)?;
+    crate::arch::without_interrupts(|| unsafe {
+        (&mut *RUNTIME_STORE.0.get())[index]
+            .as_mut()
+            .ok_or(Error::InvalidState)?
+            .enter_user_resumable(log)
+    })
+}
+
+pub fn take(process: ProcessId) -> Option<NativeRuntime> {
+    let index = runtime_index(process)?;
+    crate::arch::without_interrupts(|| unsafe { (&mut *RUNTIME_STORE.0.get())[index].take() })
+}
+
+pub fn discard(process: ProcessId) -> Result<(), Error> {
+    let Some(mut runtime) = take(process) else {
+        return Ok(());
+    };
+    runtime.discard()
 }
 
 fn align_up(value: usize, alignment: usize) -> Option<usize> {

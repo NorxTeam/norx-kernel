@@ -8,7 +8,7 @@ pub const USER_LIMIT: usize = 0x0000_8000_0000_0000;
 #[cfg(target_arch = "aarch64")]
 pub const USER_LIMIT: usize = 0x0000_1000_0000_0000;
 
-const MAX_MAPPINGS: usize = 64;
+const MAX_MAPPINGS: usize = 128;
 const MAX_TABLE_FRAMES: usize = 192;
 const INITIAL_STACK_PAGES: usize = 2;
 const MAX_STACK_PAGES: usize = 8;

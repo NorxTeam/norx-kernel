@@ -11,7 +11,7 @@ tables, missing hashes, unsafe names, oversized metadata, and unsupported
 relocations fail closed. TLS file/memory sizes and alignment are bounded.
 
 Library lookup is deliberately VFS-only: the staged policy searches
-`/lib` then `/lib64`, accepts a single basename, and never interprets host
+`/lib`, accepts a single basename, and never interprets host
 filesystem paths, environment variables, or untrusted path components.
 
 The boot smoke contract runs a main image with one `libdep.so`, resolves an

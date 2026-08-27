@@ -1,4 +1,4 @@
-# Nordix native runtime boundary
+# Native runtime boundary
 
 `user_runtime::NativeRuntime` is the bounded first runtime around an ELF
 `LoadPlan`. It maps each validated PT_LOAD page into a process-owned

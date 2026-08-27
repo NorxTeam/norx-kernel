@@ -2,12 +2,14 @@ use core::arch::asm;
 
 const LAZY_PAGES: usize = 16;
 const TABLE_PAGES: usize = 32;
-const DIRECT_MAP_BYTES: usize = 16 * 1024 * 1024;
+const HUGE_PAGE_BYTES: usize = 2 * 1024 * 1024;
+const DIRECT_MAP_LIMIT: usize = 1usize << 47;
 pub const DIRECT_MAP_BASE: usize = 0xffff_8000_0000_0000;
 
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_USER: u64 = 1 << 2;
+const PTE_HUGE: u64 = 1 << 7;
 const PTE_NX: u64 = 1 << 63;
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 
@@ -38,6 +40,7 @@ pub struct Stats {
 static mut TABLE_POOL: [Page; TABLE_PAGES] = [Page::data(); TABLE_PAGES];
 static mut TABLE_POOL_NEXT: usize = 0;
 static mut DIRECT_MAP_READY: bool = false;
+static mut DIRECT_MAP_BYTES: usize = 0;
 static mut NORX_CR3_READY: bool = false;
 static mut NORX_CR3: u64 = 0;
 
@@ -46,27 +49,54 @@ pub fn init_direct_map() -> bool {
         if DIRECT_MAP_READY {
             return true;
         }
+        let firmware_limit = current_cr3().saturating_add(4096);
+        let Some(limit) = usize::try_from(crate::memory::physical_limit().max(firmware_limit)).ok()
+        else {
+            return false;
+        };
+        let Some(bytes) = limit
+            .checked_add(HUGE_PAGE_BYTES - 1)
+            .map(|value| value & !(HUGE_PAGE_BYTES - 1))
+        else {
+            return false;
+        };
+        if bytes == 0 || bytes > DIRECT_MAP_LIMIT {
+            return false;
+        }
         let cr0 = disable_write_protect();
         let mut mapped = true;
         let mut physical = 0usize;
-        while physical < DIRECT_MAP_BYTES {
-            if !map_to(DIRECT_MAP_BASE + physical, physical as u64) {
+        while physical < bytes {
+            if !map_huge_to(DIRECT_MAP_BASE + physical, physical as u64) {
                 mapped = false;
                 break;
             }
-            physical += 4096;
-            if physical.is_multiple_of(4096 * 256) {
+            physical += HUGE_PAGE_BYTES;
+            if physical.is_multiple_of(HUGE_PAGE_BYTES * 2) {
                 crate::bootlog::pulse();
             }
         }
         restore_cr0(cr0);
+        if mapped {
+            DIRECT_MAP_BYTES = bytes;
+        }
         DIRECT_MAP_READY = mapped;
         mapped
     }
 }
 
 pub fn map_lazy_page(virtual_address: usize) -> bool {
-    unsafe { map_page(virtual_address) }
+    if !virtual_address.is_multiple_of(4096)
+        || !(crate::vm::LAZY_BASE..crate::vm::LAZY_BASE + LAZY_PAGES * 4096)
+            .contains(&virtual_address)
+    {
+        return false;
+    }
+    let status = stats();
+    if !status.direct_map_ready || !status.norx_cr3_ready {
+        return false;
+    }
+    crate::arch::without_interrupts(|| unsafe { map_page(virtual_address) })
 }
 
 pub fn direct_map_ptr(physical: u64) -> Option<*mut u8> {
@@ -118,7 +148,9 @@ pub fn user_space_prepare(root: crate::address::PhysAddr) -> bool {
         let Some(destination) = direct_map_ptr(root.value()).map(|ptr| ptr.cast::<u64>()) else {
             return false;
         };
-        let source = (current_cr3() & ADDRESS_MASK) as *const u64;
+        let Some(source) = direct_map_ptr(NORX_CR3).map(|ptr| ptr.cast::<u64>()) else {
+            return false;
+        };
         for index in 0..512 {
             destination
                 .add(index)
@@ -287,25 +319,30 @@ pub fn init_norx_cr3() -> bool {
         }
 
         let old_cr3 = current_cr3();
-        if TABLE_POOL_NEXT == TABLE_PAGES {
-            return false;
-        }
-        let new_p4_address = (&raw mut TABLE_POOL[TABLE_POOL_NEXT]) as usize;
-        let cr0 = disable_write_protect();
-        if !make_mapping_writable(new_p4_address) {
-            restore_cr0(cr0);
-            return false;
-        }
-        let Some(new_p4) = table_frame() else {
-            restore_cr0(cr0);
+        let Some(new_p4) = crate::memory::alloc_frame() else {
+            crate::bootlog::fail("cannot allocate new root table frame");
             return false;
         };
-        let old = (old_cr3 & 0x000f_ffff_ffff_f000) as *const u64;
-        let new = new_p4 as *mut u64;
+        let Some(old) = direct_map_ptr(old_cr3 & ADDRESS_MASK).map(|ptr| ptr.cast::<u64>()) else {
+            crate::bootlog::fail_fmt(format_args!(
+                "firmware CR3 outside direct map cr3=0x{:x} bytes=0x{:x}",
+                old_cr3, DIRECT_MAP_BYTES
+            ));
+            let _ = crate::memory::free_frame(new_p4);
+            return false;
+        };
+        let Some(new) = direct_map_ptr(new_p4).map(|ptr| ptr.cast::<u64>()) else {
+            crate::bootlog::fail_fmt(format_args!(
+                "new CR3 outside direct map frame=0x{:x} bytes=0x{:x}",
+                new_p4, DIRECT_MAP_BYTES
+            ));
+            let _ = crate::memory::free_frame(new_p4);
+            return false;
+        };
+        core::ptr::write_bytes(new, 0, 512);
         for i in 0..512 {
             new.add(i).write_volatile(old.add(i).read_volatile());
         }
-        restore_cr0(cr0);
         NORX_CR3 = new_p4;
         asm!("mov cr3, {}", in(reg) new_p4, options(nostack, preserves_flags));
         NORX_CR3_READY = true;
@@ -317,7 +354,7 @@ pub fn pte_flags(virtual_address: usize) -> Option<u64> {
     unsafe {
         let mut cr3: u64;
         asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
-        let p4 = (cr3 & 0x000f_ffff_ffff_f000) as *const u64;
+        let p4 = direct_map_ptr(cr3 & ADDRESS_MASK)?.cast::<u64>() as *const u64;
 
         let p4_i = (virtual_address >> 39) & 0x1ff;
         let p3_i = (virtual_address >> 30) & 0x1ff;
@@ -328,24 +365,29 @@ pub fn pte_flags(virtual_address: usize) -> Option<u64> {
         if e4 & PTE_PRESENT == 0 {
             return None;
         }
-        let p3 = (e4 & 0x000f_ffff_ffff_f000) as *const u64;
-        let e3 = *p3.add(p3_i);
+        let p3 = direct_map_ptr(e4 & ADDRESS_MASK)?.cast::<u64>() as *const u64;
+        let e3 = p3.add(p3_i).read_volatile();
         if e3 & PTE_PRESENT == 0 || e3 & (1 << 7) != 0 {
             return Some(e3);
         }
-        let p2 = (e3 & 0x000f_ffff_ffff_f000) as *const u64;
-        let e2 = *p2.add(p2_i);
+        let p2 = direct_map_ptr(e3 & ADDRESS_MASK)?.cast::<u64>() as *const u64;
+        let e2 = p2.add(p2_i).read_volatile();
         if e2 & PTE_PRESENT == 0 || e2 & (1 << 7) != 0 {
             return Some(e2);
         }
-        let p1 = (e2 & 0x000f_ffff_ffff_f000) as *const u64;
-        let e1 = *p1.add(p1_i);
+        let p1 = direct_map_ptr(e2 & ADDRESS_MASK)?.cast::<u64>() as *const u64;
+        let e1 = p1.add(p1_i).read_volatile();
         if e1 & PTE_PRESENT == 0 {
             None
         } else {
             Some(e1)
         }
     }
+}
+
+pub fn pte_frame(virtual_address: usize) -> Option<u64> {
+    let entry = pte_flags(virtual_address)?;
+    (entry & PTE_PRESENT != 0 && entry & PTE_HUGE == 0).then_some(entry & ADDRESS_MASK)
 }
 
 unsafe fn map_page(virtual_address: usize) -> bool {
@@ -361,11 +403,37 @@ unsafe fn map_page_inner(virtual_address: usize) -> bool {
         return false;
     };
 
-    map_to(virtual_address, frame)
+    if map_to(virtual_address, frame) {
+        true
+    } else {
+        let _ = crate::memory::free_frame(frame);
+        false
+    }
 }
 
 unsafe fn map_to(virtual_address: usize, frame: u64) -> bool {
-    map_to_flags(virtual_address, frame, PTE_PRESENT | PTE_WRITABLE)
+    map_to_flags(virtual_address, frame, PTE_PRESENT | PTE_WRITABLE | PTE_NX)
+}
+
+unsafe fn map_huge_to(virtual_address: usize, frame: u64) -> bool {
+    let p4_i = (virtual_address >> 39) & 0x1ff;
+    let p3_i = (virtual_address >> 30) & 0x1ff;
+    let p2_i = (virtual_address >> 21) & 0x1ff;
+
+    let cr3 = current_cr3();
+    let p4 = (cr3 & 0x000f_ffff_ffff_f000) as *mut u64;
+    let Some(p3) = next_table(p4.add(p4_i)) else {
+        return false;
+    };
+    let Some(p2) = next_table(p3.add(p3_i)) else {
+        return false;
+    };
+    let entry = p2.add(p2_i);
+    if *entry & PTE_PRESENT != 0 {
+        return false;
+    }
+    *entry = frame | PTE_PRESENT | PTE_WRITABLE | PTE_HUGE;
+    true
 }
 
 unsafe fn map_to_flags(virtual_address: usize, frame: u64, flags: u64) -> bool {
@@ -375,19 +443,25 @@ unsafe fn map_to_flags(virtual_address: usize, frame: u64, flags: u64) -> bool {
     let p1_i = (virtual_address >> 12) & 0x1ff;
 
     let cr3 = current_cr3();
-    let p4 = (cr3 & 0x000f_ffff_ffff_f000) as *mut u64;
-
-    let Some(p3) = next_table(p4.add(p4_i)) else {
-        return false;
-    };
-    let Some(p2) = next_table(p3.add(p3_i)) else {
-        return false;
-    };
-    let Some(p1) = next_table(p2.add(p2_i)) else {
+    let Some(p4) = direct_map_ptr(cr3 & ADDRESS_MASK).map(|ptr| ptr.cast::<u64>()) else {
         return false;
     };
 
-    *p1.add(p1_i) = frame | flags;
+    let Some(p3) = next_runtime_table(p4.add(p4_i)) else {
+        return false;
+    };
+    let Some(p2) = next_runtime_table(p3.add(p3_i)) else {
+        return false;
+    };
+    let Some(p1) = next_runtime_table(p2.add(p2_i)) else {
+        return false;
+    };
+
+    let entry = p1.add(p1_i);
+    if *entry & PTE_PRESENT != 0 {
+        return false;
+    }
+    *entry = frame | flags;
     asm!("invlpg [{}]", in(reg) virtual_address, options(nostack, preserves_flags));
     true
 }
@@ -423,6 +497,24 @@ unsafe fn next_table(entry: *mut u64) -> Option<*mut u64> {
     Some((*entry & 0x000f_ffff_ffff_f000) as *mut u64)
 }
 
+unsafe fn next_runtime_table(entry: *mut u64) -> Option<*mut u64> {
+    let value = entry.read_volatile();
+    if value & PTE_HUGE != 0 {
+        return None;
+    }
+    if value & PTE_PRESENT == 0 {
+        let frame = crate::memory::alloc_frame()?;
+        let Some(table) = direct_map_ptr(frame).map(|ptr| ptr.cast::<u64>()) else {
+            let _ = crate::memory::free_frame(frame);
+            return None;
+        };
+        core::ptr::write_bytes(table, 0, 512);
+        entry.write_volatile(frame | PTE_PRESENT | PTE_WRITABLE);
+        return Some(table);
+    }
+    direct_map_ptr(value & ADDRESS_MASK).map(|ptr| ptr.cast::<u64>())
+}
+
 unsafe fn table_frame() -> Option<u64> {
     if TABLE_POOL_NEXT == TABLE_PAGES {
         return None;
@@ -437,7 +529,10 @@ unsafe fn lazy_frame(index: usize) -> Option<u64> {
         return None;
     }
     let frame = crate::memory::alloc_frame()?;
-    zero_physical_frame(frame)?;
+    if zero_physical_frame(frame).is_none() {
+        let _ = crate::memory::free_frame(frame);
+        return None;
+    }
     Some(frame)
 }
 

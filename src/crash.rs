@@ -98,11 +98,11 @@ pub fn init() -> bool {
                 "previous boot interrupted sequence={}",
                 record.sequence
             )),
-            STATE_READY => crate::bootlog::info_fmt(format_args!(
+            STATE_READY => crate::bootlog::ok_fmt(format_args!(
                 "previous boot completed sequence={}",
                 record.sequence
             )),
-            STATE_CHECKPOINT => crate::bootlog::info_fmt(format_args!(
+            STATE_CHECKPOINT => crate::bootlog::ok_fmt(format_args!(
                 "previous boot reached pre-architecture checkpoint sequence={}",
                 record.sequence
             )),
@@ -143,7 +143,7 @@ pub fn init() -> bool {
         crate::bootlog::warn("persistent warm-reboot record write failed");
         return false;
     }
-    crate::bootlog::info_fmt(format_args!(
+    crate::bootlog::ok_fmt(format_args!(
         "persistent warm-reboot log backing ready source={} records={} sequence={}",
         source, RECORDS, current.sequence,
     ));
@@ -173,6 +173,7 @@ pub fn mark_checkpoint() -> bool {
 }
 
 pub fn fatal(error: KernelError) -> ! {
+    crate::bootlog::quickinit_overlay_crash(error.title());
     let first_panic = unsafe {
         if PANIC_ACTIVE {
             false
@@ -216,7 +217,7 @@ fn append_current(mut record: Record) -> bool {
     if !write_persistent(&sector) {
         return false;
     }
-    crate::bootlog::info_fmt(format_args!(
+    crate::bootlog::ok_fmt(format_args!(
         "persistent warm-reboot record committed state={} slot={} sequence={}",
         record.state, slot, record.sequence,
     ));

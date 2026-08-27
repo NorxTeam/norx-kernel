@@ -28,6 +28,7 @@ mod memory;
 #[cfg(target_arch = "x86_64")]
 mod net;
 mod paging;
+mod pipe;
 mod process;
 mod sched;
 mod serial_debugger;
@@ -35,6 +36,7 @@ mod service;
 mod syscall;
 mod time;
 mod timer;
+mod tty;
 mod user_runtime;
 mod usercopy;
 mod vfs;
@@ -54,14 +56,14 @@ pub fn kernel_start() -> ! {
     net::contract_self_check();
     let boot = boot::info();
     #[cfg(target_arch = "x86_64")]
-    bootlog::info("VGA fallback initialized");
+    bootlog::ok("VGA fallback initialized");
     if let Some(raw) = boot.framebuffer {
         log::init_framebuffer(raw);
     }
     bootlog::title();
-    bootlog::info("interrupt, MMIO, PIO, and DMA boundary checks passed");
+    bootlog::ok("interrupt, MMIO, PIO, and DMA boundary checks passed");
     boot::contract_self_check();
-    bootlog::info("boot hand-off and parser boundary checks passed");
+    bootlog::ok("boot hand-off and parser boundary checks passed");
     bootlog::start(0, "accepting GRUB hand-off");
     bootlog::ok_fmt(format_args!(
         "GRUB hand-off accepted arch={} memory={} modules={}",
@@ -69,7 +71,7 @@ pub fn kernel_start() -> ! {
         boot.memory_len,
         boot.modules_len
     ));
-    bootlog::info_fmt(format_args!(
+    bootlog::ok_fmt(format_args!(
         "EFI system table {}",
         if boot.efi_system_table == 0 {
             "absent"
@@ -79,7 +81,10 @@ pub fn kernel_start() -> ! {
     ));
     if !boot.cmdline().is_empty() {
         bootlog::start(1, "reading kernel command line");
-        bootlog::info(boot.cmdline());
+        bootlog::ok_fmt(format_args!(
+            "kernel command line accepted: {}",
+            boot.cmdline()
+        ));
     }
     if let Some(raw) = boot.framebuffer {
         bootlog::start(2, "initializing framebuffer");
@@ -101,28 +106,28 @@ pub fn kernel_start() -> ! {
         bootlog::fail("driver framework capacity exhausted");
     }
     crash::contract_self_check();
-    bootlog::info("persistent boot-record encoding and checksum checks passed");
+    bootlog::ok("persistent boot-record encoding and checksum checks passed");
     if crash::init() {
         bootlog::ok("persistent warm-reboot log initialized");
         if crash::mark_checkpoint() {
-            bootlog::info("persistent pre-architecture boot checkpoint committed");
+            bootlog::ok("persistent pre-architecture boot checkpoint committed");
         }
     } else {
         bootlog::warn("persistent warm-reboot log unavailable; panic context remains serial-only");
     }
     bootlog::start(1, "checking virtual filesystem");
     fat32::contract_self_check();
-    bootlog::info("FAT32 parser, long-name, and safe-write checks passed");
+    bootlog::ok("FAT32 parser, long-name, and safe-write checks passed");
     bootlog::start(2, "checking FAT32 volumes");
     match fat32::probe_ramdisk() {
-        Ok(volume) => bootlog::info_fmt(format_args!(
+        Ok(volume) => bootlog::ok_fmt(format_args!(
             "FAT32 read-only volume sectors={} clusters={} root={}",
             volume.geometry().total_sectors,
             volume.geometry().cluster_count,
             volume.geometry().root_cluster,
         )),
         Err(fat32::Error::InvalidBpb) => {
-            bootlog::info("FAT32 volume absent; ramfs remains the writable root")
+            bootlog::warn("FAT32 volume absent; ramfs remains the writable root")
         }
         Err(error) => bootlog::warn_fmt(format_args!(
             "FAT32 probe failed: {:?}; ramfs remains the writable root",
@@ -130,10 +135,10 @@ pub fn kernel_start() -> ! {
         )),
     }
     ext4::contract_self_check();
-    bootlog::info("ext4 superblock, extent, directory, permission, and journal checks passed");
+    bootlog::ok("ext4 superblock, extent, directory, permission, and journal checks passed");
     bootlog::start(3, "checking ext4 volumes");
     match ext4::probe_ramdisk() {
-        Ok(volume) => bootlog::info_fmt(format_args!(
+        Ok(volume) => bootlog::ok_fmt(format_args!(
             "ext4 read-only volume blocks={} block_size={} groups={} journal={}",
             volume.geometry().blocks,
             volume.geometry().block_size,
@@ -141,7 +146,7 @@ pub fn kernel_start() -> ! {
             volume.geometry().has_journal,
         )),
         Err(ext4::Error::InvalidSuperblock) => {
-            bootlog::info("ext4 volume absent; ramfs remains the writable root")
+            bootlog::warn("ext4 volume absent; ramfs remains the writable root")
         }
         Err(error) => bootlog::warn_fmt(format_args!(
             "ext4 probe failed: {:?}; ramfs remains the writable root",
@@ -149,17 +154,17 @@ pub fn kernel_start() -> ! {
         )),
     }
     btrfs::contract_self_check();
-    bootlog::info("btrfs superblock, checksum, tree, and subvolume checks passed");
+    bootlog::ok("btrfs superblock, checksum, tree, and subvolume checks passed");
     bootlog::start(0, "checking btrfs volumes");
     match btrfs::probe_ramdisk() {
-        Ok(volume) => bootlog::info_fmt(format_args!(
+        Ok(volume) => bootlog::ok_fmt(format_args!(
             "btrfs read-only volume bytes={} nodesize={} chunks={}",
             volume.geometry().total_bytes,
             volume.geometry().nodesize,
             volume.geometry().chunks,
         )),
         Err(btrfs::Error::InvalidSuperblock) => {
-            bootlog::info("btrfs volume absent; ramfs remains the writable root")
+            bootlog::warn("btrfs volume absent; ramfs remains the writable root")
         }
         Err(error) => bootlog::warn_fmt(format_args!(
             "btrfs probe failed: {:?}; ramfs remains the writable root",
@@ -211,75 +216,79 @@ pub fn kernel_start() -> ! {
     bootlog::start(0, "checking interrupt controller");
     arch::init_interrupt_controller();
     syscall::contract_self_check();
-    bootlog::info_fmt(format_args!(
+    bootlog::ok_fmt(format_args!(
         "syscall ABI v{} table entries={} args={} error=negative",
         syscall::ABI_VERSION,
         syscall::TABLE.len(),
         syscall::MAX_ARGS,
     ));
     usercopy::contract_self_check();
-    bootlog::info(
+    bootlog::ok(
         "user pointer validation and fault boundary checks passed; process user pages unavailable",
     );
     process::contract_self_check();
-    bootlog::info(
+    bootlog::ok(
         "process PID/TID, parent-child, credentials, FD, signal, event, and wait model checks passed",
     );
-    bootlog::info(
+    bootlog::ok(
         "capability authorization checks passed; UID alone cannot bypass privileged operations",
     );
     ipc::contract_self_check();
-    bootlog::info(
+    pipe::contract_self_check();
+    tty::contract_self_check();
+    bootlog::ok(
         "IPC channel, shared-memory ring, event queue, wait-queue, ownership, and blocking checks passed",
     );
     service::contract_self_check();
-    bootlog::info(
+    bootlog::ok(
         "driver-service supervisor lifecycle, user-thread attachment, restart, and resource revoke checks passed",
     );
     if process::init_runtime() {
-        bootlog::info(
-            "process runtime initialized with init PID/TID and safe syscall scheduling boundary",
+        tty::init();
+        tty::runtime_contract_self_check();
+        bootlog::ok(
+            "process runtime initialized with init PID/TID, FD lifecycle, process groups, and serial TTY boundary",
         );
         syscall::runtime_contract_self_check();
-        bootlog::info("syscall exit/wait/getpid/gettid/yield/sleep/close runtime checks passed");
+        bootlog::ok("syscall exit/wait/getpid/gettid/yield/sleep/close runtime checks passed");
     } else {
         bootlog::fail("process runtime initialization failed");
     }
     address_space::contract_self_check();
-    bootlog::info(
+    bootlog::ok(
         "address-space user isolation, page-table ownership, guard stack, ASLR, W^X, and teardown checks passed",
     );
     elf::contract_self_check();
-    bootlog::info(
+    bootlog::ok(
         "ELF64 headers, PT_LOAD bounds, zero-fill, W^X, entry, stack, auxv, and register checks passed",
     );
     dynamic::contract_self_check();
-    bootlog::info(
+    bootlog::ok(
         "ET_DYN/PIE dynamic metadata, PT_INTERP, symbol lookup, RELA, TLS, and bounded loader checks passed",
     );
     dynamic::smoke_self_check();
-    bootlog::info(
+    bootlog::ok(
         "dynamic-linker smoke shared object, missing dependency, relocation, VFS path, and clean exit checks passed",
     );
     user_runtime::contract_self_check();
-    bootlog::info(
+    bootlog::ok(
         "native init runtime mapping, serial/FD write, bounded alloc, and clean exit checks passed",
     );
     exec::contract_self_check();
-    bootlog::info(
+    bootlog::ok(
         "exec replacement prepare/rollback, interpreter selection, and close-on-exec checks passed",
     );
     wasm::contract_self_check();
-    bootlog::info(
+    bootlog::ok(
         "Wasm verifier/interpreter integer, control, linear-memory, fuel, stack, import, handle, and cancellation checks passed",
     );
-    bootlog::info_fmt(format_args!(
+    bootlog::ok_fmt(format_args!(
         "Wasm interpreter profile iterations=32 ticks={}",
         wasm::profile_self_check(),
     ));
     let portable_sample = wasm::sample_profile_self_check();
     let native_sample = user_runtime::sample_profile_self_check();
-    bootlog::info_fmt(format_args!(
+    bootlog::ok_fmt(format_args!(
         "sample compare portable startup_ticks={} module_bytes={} linear_memory={} host_calls={} native startup_ticks={} elf_bytes={} user_memory={} syscalls={}",
         portable_sample.startup_ticks,
         portable_sample.module_bytes,
@@ -290,28 +299,37 @@ pub fn kernel_start() -> ! {
         native_sample.user_memory_bytes,
         native_sample.syscall_count,
     ));
-    bootlog::info(
+    bootlog::ok(
         "integrated staged QEMU smoke process/ELF/file/memory/dynamic/VM/fault/permission/teardown checks passed",
     );
-    bootlog::info(
+    bootlog::ok(
         "legacy universal machine-code payload, architecture-neutral syscall probe, and generic test execution path absent",
     );
-    bootlog::info(
+    bootlog::ok(
         "kernel/user trust boundary and capability transfer model documented; IPC grants deferred",
     );
     bootlog::start(1, "initializing syscall entry");
     arch::init_syscalls();
-    paging::init();
-    if service::user_entry_self_check() {
-        #[cfg(target_arch = "x86_64")]
-        bootlog::info("real x86_64 user-mode service entry, syscall exit, address-space activation, and return checks passed");
-        #[cfg(target_arch = "aarch64")]
-        bootlog::info(
-            "real aarch64 EL0 service entry, SVC exit, TTBR0 activation, and return checks passed",
-        );
-    } else {
-        bootlog::info("real user-mode service entry deferred on aarch64 until TTBR0/EL0 activation is implemented");
+    if !paging::init() {
+        bootlog::fail("kernel paging initialization failed");
+        arch::halt();
     }
+    bootlog::quickinit_overlay_stage("checking lazy page faults", 94);
+    vm::init();
+    #[cfg(target_arch = "x86_64")]
+    if vm::contract_self_check() {
+        bootlog::ok("x86_64 lazy page faults allocate, zero, and map through the direct map");
+    } else {
+        bootlog::fail("x86_64 lazy page fault path unavailable");
+    }
+    bootlog::start(1, "checking userspace init boundary");
+    let userspace_init_ok = service::user_entry_self_check();
+    if userspace_init_ok {
+        bootlog::ok("quickinit PID 1 hand-off passed; kernel boot log sequence resumed");
+    } else {
+        bootlog::fail("quickinit PID 1 unavailable; deterministic recovery path remains active");
+    }
+    bootlog::quickinit_overlay_stage("starting system services", 93);
     bootlog::start(1, "probing runtime buses");
     if drivers::runtime_init(boot.framebuffer) {
         bootlog::ok("runtime bus probing complete");
@@ -342,16 +360,16 @@ pub fn kernel_start() -> ! {
                 ));
             }
             net::InitResult::Unsupported => {
-                bootlog::info("network stack deferred; virtio-net unavailable");
+                bootlog::warn("network stack deferred; virtio-net unavailable");
             }
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
         bootlog::start(2, "initializing network stack");
-        bootlog::info("network stack unsupported on aarch64 bring-up");
+        bootlog::warn("network stack unsupported on aarch64 bring-up");
     }
-    vm::init();
+    bootlog::quickinit_overlay_stage("initializing virtual memory", 96);
     bootlog::start(1, "checking scheduler");
     sched::self_check();
     bootlog::ok("scheduler self-check passed");
@@ -367,23 +385,30 @@ pub fn kernel_start() -> ! {
     }
     bootlog::start(3, "selecting timer source");
     if timer_ready {
-        bootlog::info("timer source irq");
+        bootlog::ok("timer source irq");
     } else {
-        bootlog::info("timer source polling");
+        bootlog::warn("timer source polling");
     }
     bootlog::start(0, "reporting architecture");
     bootlog::ok_fmt(format_args!("architecture {}", arch::NAME));
     bootlog::start(1, "reading timer ticks");
     bootlog::ok_fmt(format_args!("timer ticks {}", time::ticks()));
-    bootlog::start(2, "checking future OS hand-off");
-    bootlog::warn("future OS bootloader hand-off deferred");
+    bootlog::quickinit_overlay_stage("finalizing userspace services", 99);
+    bootlog::start(2, "checking userspace init hand-off");
+    if userspace_init_ok {
+        bootlog::ok("quickinit PID 1 contract checked; kernel hand-off remains ordered");
+    } else {
+        bootlog::warn("quickinit PID 1 contract failed; recovery path remains active");
+    }
     bootlog::start(3, "finalizing kernel initialization");
     bootlog::ok("kernel initialization complete");
-    if crash::mark_ready() {
+    let warm_reboot_ready = crash::mark_ready();
+    if warm_reboot_ready {
         bootlog::ok("persistent warm-reboot status committed");
     } else {
         bootlog::warn("persistent warm-reboot status commit failed");
     }
+    bootlog::quickinit_overlay_complete(userspace_init_ok && warm_reboot_ready);
     serial_debugger::run()
 }
 

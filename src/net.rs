@@ -590,7 +590,7 @@ impl Stack {
             )?;
             self.transmit(&reply[..length])
         } else if kind == 0 && packet.length >= 8 {
-            crate::bootlog::info("ICMP echo reply received");
+            crate::bootlog::ok("ICMP echo reply received");
             Ok(())
         } else {
             Ok(())
@@ -638,7 +638,7 @@ impl Stack {
             self.tcp.sequence = self.tcp.sequence.wrapping_add(1);
             self.send_tcp_segment(0x010, &[])?;
             self.tcp.state = TcpState::Established;
-            crate::bootlog::info("TCP diagnostic socket established");
+            crate::bootlog::ok("TCP diagnostic socket established");
             return Ok(());
         }
         if self.tcp.state != TcpState::Established {
@@ -1335,7 +1335,7 @@ impl Stack {
                 self.dhcp_dns = dns;
                 self.dhcp = DhcpState::Requesting;
                 self.dhcp_retries = 0;
-                crate::bootlog::info("DHCP offer received; requesting lease");
+                crate::bootlog::ok("DHCP offer received; requesting lease");
                 self.send_dhcp_request()
             }
             5 if self.dhcp == DhcpState::Requesting => {
@@ -1532,7 +1532,7 @@ impl Stack {
                 );
                 self.dns.result = Some(address);
                 self.dns.pending = false;
-                crate::bootlog::info("DNS A record received");
+                crate::bootlog::ok("DNS A record received");
                 return Ok(());
             }
             cursor += length;

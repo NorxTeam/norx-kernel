@@ -129,11 +129,11 @@ pub fn init_timer_interrupts() -> bool {
     let input_ok = crate::drivers::ps2::enable_interrupts();
     let ps2 = crate::drivers::ps2::status();
     if input_ok && ps2.controller {
-        crate::bootlog::info("ps/2 IRQ1/IRQ12 routing enabled");
+        crate::bootlog::ok("ps/2 IRQ1/IRQ12 routing enabled");
     } else if !input_ok && ps2.controller {
         crate::bootlog::warn("ps/2 interrupt routing unavailable; input remains polled");
     } else {
-        crate::bootlog::info("ps/2 IRQ routing skipped; controller unavailable");
+        crate::bootlog::warn("ps/2 IRQ routing skipped; controller unavailable");
     }
     unsafe { asm!("sti", options(nomem, nostack, preserves_flags)) };
     true
@@ -299,4 +299,16 @@ pub fn zero_physical_page(physical: crate::address::PhysAddr) -> bool {
 
 pub fn enter_user(registers: crate::elf::InitialRegisters) -> bool {
     syscall::enter_user(registers)
+}
+
+pub fn install_user_context(thread: u32, registers: crate::elf::InitialRegisters) -> bool {
+    syscall::install_user_context(thread, registers)
+}
+
+pub fn request_user_switch(from: u32, to: u32) {
+    syscall::request_user_switch(from, to)
+}
+
+pub fn has_user_context(thread: u32) -> bool {
+    syscall::has_user_context(thread)
 }

@@ -45,7 +45,7 @@ fn ps2_state() -> framework::DeviceState {
 #[cfg(target_arch = "aarch64")]
 fn ps2_state() -> framework::DeviceState {
     crate::bootlog::start(1, "initializing ps/2 controller");
-    crate::bootlog::info("ps/2 controller unsupported on aarch64");
+    crate::bootlog::warn("ps/2 controller unsupported on aarch64");
     framework::DeviceState::Unsupported
 }
 
@@ -94,14 +94,14 @@ fn mouse_state() -> framework::DeviceState {
 #[cfg(target_arch = "aarch64")]
 fn mouse_state() -> framework::DeviceState {
     crate::bootlog::start(3, "initializing ps/2 mouse");
-    crate::bootlog::info("ps/2 mouse unsupported on aarch64");
+    crate::bootlog::warn("ps/2 mouse unsupported on aarch64");
     framework::DeviceState::Unsupported
 }
 
 #[cfg(target_arch = "aarch64")]
 fn keyboard_state() -> framework::DeviceState {
     crate::bootlog::start(2, "initializing ps/2 keyboard");
-    crate::bootlog::info("ps/2 keyboard unsupported on aarch64");
+    crate::bootlog::warn("ps/2 keyboard unsupported on aarch64");
     framework::DeviceState::Unsupported
 }
 
@@ -110,7 +110,7 @@ pub fn init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
     framework::contract_self_check();
     let matrix = framework::matrix_self_check();
     if matrix.passed == matrix.scenarios {
-        crate::bootlog::info_fmt(format_args!(
+        crate::bootlog::ok_fmt(format_args!(
             "driver failure matrix passed scenarios={} absent=true timeout=true hot-unplug=true malformed=true dma=true interrupt-storm=true",
             matrix.scenarios,
         ));
@@ -271,7 +271,7 @@ pub fn runtime_init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
                 framework::DeviceState::Ready
             }
             usb::xhci::InitResult::Unsupported => {
-                crate::bootlog::info("xHCI controller not found; USB stack deferred");
+                crate::bootlog::warn("xHCI controller not found; USB stack deferred");
                 framework::DeviceState::Unsupported
             }
             usb::xhci::InitResult::Failed(error) => {
@@ -317,7 +317,7 @@ pub fn runtime_init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
                 framework::DeviceState::Ready
             }
             virtio_gpu::InitResult::Unsupported => {
-                crate::bootlog::info(
+                crate::bootlog::warn(
                     "virtio-gpu controller not found; firmware framebuffer retained",
                 );
                 framework::DeviceState::Unsupported
@@ -366,7 +366,7 @@ pub fn runtime_init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
                 framework::DeviceState::Ready
             }
             audio::InitResult::Unsupported => {
-                crate::bootlog::info("AC'97 audio controller not found; silent fallback active");
+                crate::bootlog::warn("AC'97 audio controller not found; silent fallback active");
                 framework::DeviceState::Unsupported
             }
             audio::InitResult::Failed(error) => {
@@ -416,7 +416,7 @@ pub fn runtime_init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
                 framework::DeviceState::Ready
             }
             network::InitResult::Unsupported => {
-                crate::bootlog::info("virtio-net controller not found; networking deferred");
+                crate::bootlog::warn("virtio-net controller not found; networking deferred");
                 framework::DeviceState::Unsupported
             }
             network::InitResult::Failed(error) => {
@@ -443,7 +443,7 @@ pub fn runtime_init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
     {
         let _ = framebuffer;
         crate::bootlog::start(1, "probing PCI USB host controllers");
-        crate::bootlog::info("xHCI controller unsupported on aarch64 bring-up");
+        crate::bootlog::warn("xHCI controller unsupported on aarch64 bring-up");
         let mut ok = framework::register(
             framework::Driver::new(
                 7,
@@ -454,7 +454,7 @@ pub fn runtime_init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
             framework::DeviceState::Unsupported,
         );
         crate::bootlog::start(2, "probing PCI AC'97 audio controller");
-        crate::bootlog::info("AC'97 audio unsupported on aarch64; silent fallback active");
+        crate::bootlog::warn("AC'97 audio unsupported on aarch64; silent fallback active");
         ok &= framework::register(
             framework::Driver::new(
                 8,
@@ -465,7 +465,7 @@ pub fn runtime_init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
             framework::DeviceState::Unsupported,
         );
         crate::bootlog::start(3, "probing PCI virtio-net controllers");
-        crate::bootlog::info("virtio-net unsupported on aarch64 bring-up; networking deferred");
+        crate::bootlog::warn("virtio-net unsupported on aarch64 bring-up; networking deferred");
         ok &= framework::register(
             framework::Driver::new(
                 9,
@@ -476,7 +476,7 @@ pub fn runtime_init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
             framework::DeviceState::Unsupported,
         );
         crate::bootlog::start(2, "probing PCI virtio-gpu controller");
-        crate::bootlog::info(
+        crate::bootlog::warn(
             "virtio-gpu unsupported on aarch64 bring-up; firmware framebuffer retained",
         );
         ok &= framework::register(

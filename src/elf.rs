@@ -133,7 +133,9 @@ pub struct InitialStack {
     pub word_count: usize,
     words: [u64; MAX_STACK_WORDS],
     bytes: [u8; MAX_STACK_BYTES],
-    byte_count: usize,
+    string_base: usize,
+    string_offset: usize,
+    string_length: usize,
 }
 
 impl InitialStack {
@@ -187,6 +189,8 @@ impl InitialStack {
             )?;
         }
 
+        let string_base = cursor;
+        let string_length = stack_top - string_base;
         let word_bytes = word_count
             .checked_mul(core::mem::size_of::<u64>())
             .ok_or(Error::StackOverflow)?;
@@ -224,7 +228,9 @@ impl InitialStack {
             word_count,
             words,
             bytes,
-            byte_count,
+            string_base,
+            string_offset: string_base - stack_bottom,
+            string_length,
         })
     }
 
@@ -233,7 +239,11 @@ impl InitialStack {
     }
 
     pub fn string_bytes(&self) -> &[u8] {
-        &self.bytes[..self.byte_count]
+        &self.bytes[self.string_offset..self.string_offset + self.string_length]
+    }
+
+    pub fn string_base(&self) -> usize {
+        self.string_base
     }
 
     pub fn words(&self) -> &[u64] {
@@ -631,19 +641,51 @@ pub(crate) fn service_image(machine: Machine) -> [u8; PAGE_SIZE + 16] {
 }
 
 pub(crate) fn representative_image() -> &'static [u8] {
-    include_bytes!(concat!(env!("OUT_DIR"), "/nordix-userspace-smoke.elf"))
+    include_bytes!(concat!(env!("OUT_DIR"), "/userspace-smoke.elf"))
 }
 
 pub(crate) fn quickinit_image() -> &'static [u8] {
-    include_bytes!(concat!(env!("OUT_DIR"), "/nordix-quickinit.elf"))
+    include_bytes!(concat!(env!("OUT_DIR"), "/quickinit.elf"))
 }
 
 pub(crate) fn representative_c_image() -> &'static [u8] {
-    include_bytes!(concat!(env!("OUT_DIR"), "/nordix-userspace-c.elf"))
+    include_bytes!(concat!(env!("OUT_DIR"), "/userspace-c.elf"))
 }
 
 pub(crate) fn representative_cxx_image() -> &'static [u8] {
-    include_bytes!(concat!(env!("OUT_DIR"), "/nordix-userspace-cxx.elf"))
+    include_bytes!(concat!(env!("OUT_DIR"), "/userspace-cxx.elf"))
+}
+
+pub(crate) fn nsh_image() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/nsh.elf"))
+}
+
+pub(crate) fn coreutils_image() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/coreutils.elf"))
+}
+
+pub(crate) fn userdb_image() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/userdb-smoke.elf"))
+}
+
+pub(crate) fn getty_image() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/getty-smoke.elf"))
+}
+
+pub(crate) fn login_image() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/login-smoke.elf"))
+}
+
+pub(crate) fn passwd_image() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/passwd-smoke.elf"))
+}
+
+pub(crate) fn userctl_image() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/userctl-smoke.elf"))
+}
+
+pub(crate) fn sudo_image() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/sudo-smoke.elf"))
 }
 
 pub(crate) fn load_bias_for_image(image: &[u8], dynamic_bias: usize) -> usize {

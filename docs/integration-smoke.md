@@ -31,9 +31,9 @@ addition, the native userspace gate must emit all three success markers on both
 architectures:
 
 ```text
-nordix-rust-smoke: external userspace ELF exited cleanly
-nordix-c-runtime: external userspace ELF exited cleanly
-nordix-cxx-runtime: external userspace ELF exited cleanly
+rust-smoke: external userspace ELF exited cleanly
+c-runtime: external userspace ELF exited cleanly
+cxx-runtime: external userspace ELF exited cleanly
 ```
 
 Those markers prove actual static ELF instruction execution, syscall entry,

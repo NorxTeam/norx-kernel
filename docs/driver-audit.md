@@ -46,7 +46,7 @@ lifecycle, interrupt registration API, DMA API, or driver-owned error type.
 | aarch64 exception vectors | Static vector table and EL-specific system registers | synchronous syscall stub and fatal exception handler | `arch::aarch64::tables` installs VBAR and owns the vector image. GIC discovery, IRQ acknowledgement, and timer IRQ delivery are absent. |
 | RAM block layer | `static mut RAMDISK`, 32 sectors of 512 bytes, fixed request queue | `vfs`, serial `block` diagnostic | `drivers::block` owns geometry, request lifetime, bounded completion, MBR partition discovery, read-only state, and write-through cache policy. The RAM backend has no persistent teardown because it is boot-owned memory. |
 | Driver registry | Static 32-entry metadata array and length | boot initialization and `drivers` debugger command | `framework` owns storage, but callers ignore the `bool` result. Registration is only a status display and does not own hardware or bind a driver. |
-| Physical frames | Static range table and monotonic allocator | x86 paging lazy mapper | `memory` owns allocation; paging consumes frames and never frees them. This is an adjacent memory contract, not a device DMA allocator. |
+| Physical frames | Static range table and monotonic allocator | x86 paging lazy mapper | `memory` owns allocation; paging returns a frame when a lazy leaf cannot be installed. This is an adjacent memory contract, not a device DMA allocator. |
 | Direct map/page tables | x86 static table pool and page-table entries | paging and lazy fault path | `arch::x86_64::paging` owns the pool and mappings. The current interface exposes raw pointers/physical addresses and has no mapping lifetime or concurrency contract. |
 
 The ownership conclusion is deliberately simple: every current “driver” is
@@ -581,7 +581,9 @@ before unmount. Mount nodes carry source, parent, flags, and propagation
 metadata. Read-only mounts reject all mutating operations, and unmount rejects
 the root, child mounts, open handles, and live dentries. Namespace creation
 gets an independent root mount over the same validated ramfs backend; the
-fixed-capacity model is deliberate until process-visible file tables exist.
+fixed-capacity model is deliberate. Process-visible tables now hold bounded
+local VFS/pipe descriptors, while descriptor inheritance across concurrent
+processes remains part of the scheduler/spawn2 follow-up.
 
 The serial debugger exposes `vfs` inspection plus `vfs mount <target>`,
 `vfs umount <id>`, `vfs lookup <path>`, and `vfs namespace`. Thus mount sources

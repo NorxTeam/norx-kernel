@@ -8,7 +8,7 @@ exist.
 
 ## ABI contract
 
-- `ABI_VERSION = 1` remains the userspace-visible ABI version.
+- `ABI_VERSION = 2` is the userspace-visible ABI version.
 - Syscalls use six 64-bit logical arguments and return either a non-negative
   result or the unsigned representation of a negative errno.
 - The libc syscall shim owns architecture details: x86_64 `syscall` register
@@ -22,15 +22,23 @@ exist.
 
 The first layer wraps the runtime slice already defined by the kernel:
 `read`, `write`, `exit`, `wait`, `getpid`, `gettid`, `yield`, `sleep`, and
-`close`. `read`/`write` initially cover the bounded stdio contract (serial
-input and console output); filesystem-backed descriptors and blocking streams
-are not implied. `errno`, fixed-width types, bounded string/memory helpers, and
-a small process/fd API are provided as ordinary userspace code. No wrapper
-falls back to host I/O.
+`close`. `open`, `pipe`, and `dup2` now cover bounded VFS/pipe descriptors;
+serial input remains nonblocking and concurrent blocking streams are not
+implied. `errno`, fixed-width types, bounded string/memory helpers, and a
+small process/fd API are provided as ordinary userspace code. No wrapper falls
+back to host I/O.
 
 The initial binaries are static and use the existing bounded native runtime.
 `execve`, `mmap`/heap growth, signals, threads, and dynamic linking are added
 to the libc surface only when their kernel contracts are present.
+
+The v2 header and Rust SDK publish `open`, `pipe`, `dup2`, `wait_status`,
+`spawn2`, process-group, serial-TTY, and bounded filesystem calls. The kernel
+backs bounded file/pipe I/O, directory metadata/enumeration, hard links,
+`wait_status`, process-group authorization, one serial controlling TTY, and
+static-image `spawn2` with bounded non-empty argv/environment vectors.
+Symlinks, dynamic linking, and host filesystem compatibility remain outside
+this ABI.
 
 ## Compatibility boundary
 

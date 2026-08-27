@@ -2,8 +2,9 @@
 
 This is the contract for the first userspace process layer. It is deliberately
 separate from the current scheduler smoke tasks: `sched::Task` remains a
-kernel scheduling probe until the address-space contract in
-`docs/address-space.md` is connected to a context switcher.
+kernel scheduling probe. User threads now have a bounded architecture context
+for cooperative syscall-boundary switching; timer preemption and the remaining
+blocking/wakeup policy are still follow-up work.
 
 ## Fixed identities and ownership
 
@@ -35,9 +36,11 @@ The scheduler selects `TaskId`, while the task owns a `ThreadId`; a thread
 owns the saved register context and a user thread points at one process
 address space. The process-table contract charges running threads, makes
 block/wakeup and preemption explicit, and validates a switch only from
-`Running` to `Ready` and `Ready` to `Running`. Architecture register save and
-CR3/TTBR installation remain the next context-switch integration step. No
-process state is modified from a hard IRQ handler.
+`Running` to `Ready` and `Ready` to `Running`. x86_64 and AArch64 now save the
+syscall-boundary register frame and install the selected process address space
+before returning to user mode. Timer preemption, blocking wait queues, and
+floating-point/TLS context remain deferred. No process state is modified from
+a hard IRQ handler.
 
 ## File descriptors and VFS
 
@@ -56,8 +59,8 @@ slots never cross the syscall boundary.
 ## Credentials and events
 
 Credentials contain real/effective/saved UID and GID values plus a fixed
-capability bitset (`Mount`, `RawIo`, `NetAdmin`, `NetRaw`, `MemoryMap`, and
-`DeviceAdmin`). Authorization checks consume the effective credentials and the
+capability bitset (`Mount`, `RawIo`, `NetAdmin`, `NetRaw`, `MemoryMap`,
+`DeviceAdmin`, `PrivilegeDelegation`, and `AccountAdmin`). Authorization checks consume the effective credentials and the
 operation's capability requirement; UID 0 without the capability is denied,
 so there is no implicit global-root escape hatch. A process owns a bounded
 signal/event bitmap and a pending queue. Delivery is recorded as pending state
@@ -74,10 +77,14 @@ Waking a waiter and reparenting an orphan happen under the same process-table
 lock. Invalid parent relationships, double reap, and wait without a matching
 child return explicit errno values.
 
-The design intentionally excludes fork/clone and copy-on-write until the
-address-space contract is implemented and tested. It also excludes signals
-that require user stack construction until the safe user-memory path is tied
-to process-owned page tables.
+The current boot path creates the reserved PID 1 process before entering the
+embedded quickinit ELF. PID 1 may spawn and reap the bounded bootstrap child;
+after its deterministic hand-off exit, the kernel reactivates the init thread
+to continue the ordered boot log and recovery path. The design still
+intentionally excludes fork/clone and copy-on-write until the address-space
+contract is expanded. It also excludes signals that require user stack
+construction until the safe user-memory path is tied to process-owned page
+tables.
 
 The trust boundary and future kernel-mediated capability-transfer rules are
 defined in `docs/security-boundary.md`; this process model's credentials are

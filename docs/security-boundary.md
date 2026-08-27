@@ -24,7 +24,8 @@ operation must pin or copy its user data before it can sleep.
 
 1. `Credentials.capabilities` is an ambient, kernel-owned authorization set
    for coarse operations such as `Mount`, `RawIo`, `NetAdmin`, `NetRaw`,
-   `MemoryMap`, and `DeviceAdmin`. It is checked against effective credentials;
+`MemoryMap`, `DeviceAdmin`, and the narrowly scoped `PrivilegeDelegation` bit.
+It is checked against effective credentials;
    real/saved UID and GID values do not grant an implicit bypass.
 2. A resource capability is a generation-tagged handle to one kernel object
    (for example an IPC endpoint, VFS description, device, or shared-memory
@@ -58,4 +59,9 @@ The kernel currently enforces the credential checks, process/FD ownership,
 usercopy validation, W^X address-space ownership, VFS namespace rules, and
 Wasm handle revocation. IPC endpoints, shared-memory grants, and a public
 transfer syscall are intentionally deferred to the next section of the
-Roadmap; until then no capability-transfer API is advertised.
+The delegated-spawn ABI is intentionally not a general capability-transfer
+API. A caller with `PrivilegeDelegation` may request only a subset of its own
+ambient capabilities, and the kernel rejects `SessionAdmin` and
+`PrivilegeDelegation` in the child. The child receives explicit UID/GID values
+and bounded argv/environment vectors; supplementary groups, mutable policy
+files, and file-backed open-exec handles remain separate follow-up ABI work.
