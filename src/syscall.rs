@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "Staged ABI and hardware hooks are not all enabled in the bootstrap profile"
+)]
+
 pub const ABI_VERSION: u16 = 2;
 pub const MAX_ARGS: usize = 6;
 const MAX_IO: usize = 1024;
@@ -5,6 +10,7 @@ const MAX_PATH: usize = 256;
 const MAX_SPAWN_ARGUMENTS: usize = 16;
 const MAX_SPAWN_ENVIRONMENT: usize = 16;
 const MAX_SPAWN_STRING: usize = 256;
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 pub type UserWord = u64;
 pub type UserPointer = u64;
@@ -44,6 +50,8 @@ pub enum Number {
     SetSession = 410,
     GetCredentials = 411,
     SpawnDelegated = 412,
+    GetSessionCapability = 413,
+    ValidateSessionCapability = 414,
     Mkdir = 420,
     Rmdir = 421,
     Unlink = 422,
@@ -57,6 +65,9 @@ pub enum Number {
     Fstat = 430,
     Fchmod = 431,
     Fcntl = 432,
+    UserDbLoad = 433,
+    UserDbCommit = 434,
+    Nanosleep = 435,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,7 +84,7 @@ pub struct Metadata {
     pub restart: RestartPolicy,
 }
 
-pub const TABLE: [Metadata; 38] = [
+pub const TABLE: [Metadata; 43] = [
     Metadata {
         number: Number::Read,
         name: "read",
@@ -225,6 +236,18 @@ pub const TABLE: [Metadata; 38] = [
         restart: RestartPolicy::Restartable,
     },
     Metadata {
+        number: Number::GetSessionCapability,
+        name: "get_session_capability",
+        arguments: 0,
+        restart: RestartPolicy::Never,
+    },
+    Metadata {
+        number: Number::ValidateSessionCapability,
+        name: "validate_session_capability",
+        arguments: 3,
+        restart: RestartPolicy::Never,
+    },
+    Metadata {
         number: Number::Mkdir,
         name: "mkdir",
         arguments: 3,
@@ -302,6 +325,24 @@ pub const TABLE: [Metadata; 38] = [
         arguments: 3,
         restart: RestartPolicy::Never,
     },
+    Metadata {
+        number: Number::UserDbLoad,
+        name: "userdb_load",
+        arguments: 3,
+        restart: RestartPolicy::Never,
+    },
+    Metadata {
+        number: Number::UserDbCommit,
+        name: "userdb_commit",
+        arguments: 2,
+        restart: RestartPolicy::Never,
+    },
+    Metadata {
+        number: Number::Nanosleep,
+        name: "nanosleep",
+        arguments: 3,
+        restart: RestartPolicy::Restartable,
+    },
 ];
 
 #[repr(C)]
@@ -319,9 +360,10 @@ impl Args {
 }
 
 #[repr(u64)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Errno {
     Eperm = 1,
+    Eio = 5,
     Enoent = 2,
     Enomem = 12,
     Enotty = 25,
@@ -344,6 +386,7 @@ pub enum Errno {
     Exdev = 18,
     Erofs = 30,
     E2big = 7,
+    Ebadmsg = 74,
 }
 
 impl Errno {
@@ -378,6 +421,9 @@ pub struct WaitStatus {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SpawnSpec {
+    pub abi_version: u16,
+    pub size: u16,
+    pub reserved0: u32,
     pub path: UserPointer,
     pub path_length: UserWord,
     pub argv: UserPointer,
@@ -389,11 +435,16 @@ pub struct SpawnSpec {
     pub stderr_fd: UserWord,
     pub process_group: UserWord,
     pub flags: UserWord,
+    pub reserved: u32,
+    pub reserved1: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct DelegatedSpawnSpec {
+    pub abi_version: u16,
+    pub size: u16,
+    pub reserved0: u32,
     pub path: UserPointer,
     pub path_length: UserWord,
     pub argv: UserPointer,
@@ -408,6 +459,7 @@ pub struct DelegatedSpawnSpec {
     pub target_uid: u32,
     pub target_gid: u32,
     pub reserved: u32,
+    pub reserved1: u32,
     pub capabilities: u64,
 }
 
@@ -430,6 +482,9 @@ pub struct Credentials {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SessionSpec {
+    pub abi_version: u16,
+    pub size: u16,
+    pub reserved0: u32,
     pub credentials: Credentials,
     pub cwd: UserPointer,
     pub cwd_length: UserWord,
@@ -448,6 +503,16 @@ pub struct Stat {
     pub size: u64,
     pub links: u32,
     pub inode: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct UserDbLoadInfo {
+    pub state: u32,
+    pub reserved: u32,
+    pub owner_uid: u32,
+    pub owner_gid: u32,
+    pub generation: u64,
 }
 
 #[repr(C)]
@@ -471,6 +536,16 @@ pub struct DirEntry {
     pub name_length: u32,
     pub name: [u8; 32],
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StructHeader {
+    abi_version: u16,
+    size: u16,
+    reserved: u32,
+}
+
+const MAX_VERSIONED_STRUCT_SIZE: usize = core::mem::size_of::<DelegatedSpawnSpec>();
 
 pub const OPEN_READ: UserWord = 1 << 0;
 pub const OPEN_WRITE: UserWord = 1 << 1;
@@ -706,6 +781,49 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Err(_) => Errno::Einval.return_value(),
             }
         }
+        value if value == Number::Nanosleep as UserWord => {
+            let seconds = args.values[0] as i64;
+            let nanoseconds = args.values[1] as i64;
+            if seconds < 0 || !(0..NANOS_PER_SECOND as i64).contains(&nanoseconds) {
+                return Errno::Einval.return_value();
+            }
+            let remainder = args.values[2];
+            if remainder != 0
+                && crate::usercopy::validate(remainder, core::mem::size_of::<Timespec>()).is_err()
+            {
+                return Errno::Efault.return_value();
+            }
+            let requested = Timespec {
+                seconds,
+                nanoseconds,
+            };
+            let duration = match nanosleep_ticks(seconds, nanoseconds) {
+                Ok(duration) => duration,
+                Err(errno) => {
+                    if copy_timespec_to_user(remainder, &requested).is_err() {
+                        return Errno::Efault.return_value();
+                    }
+                    return errno.return_value();
+                }
+            };
+            let zero = Timespec {
+                seconds: 0,
+                nanoseconds: 0,
+            };
+            if copy_timespec_to_user(remainder, &zero).is_err() {
+                return Errno::Efault.return_value();
+            }
+            match crate::process::sleep_current_ticks(duration, false) {
+                Ok(Some(_)) => SWITCH_TO_USER,
+                Ok(None) => 0,
+                Err(_) => {
+                    if copy_timespec_to_user(remainder, &requested).is_err() {
+                        return Errno::Efault.return_value();
+                    }
+                    Errno::Einval.return_value()
+                }
+            }
+        }
         value if value == Number::Spawn as UserWord => {
             let address = args.values[0];
             let length = match usize::try_from(args.values[1]) {
@@ -728,16 +846,13 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
             }
         }
         value if value == Number::Spawn2 as UserWord => {
-            if crate::usercopy::validate(args.values[0], core::mem::size_of::<SpawnSpec>()).is_err()
-            {
-                return Errno::Efault.return_value();
+            let spec = match copy_user_versioned_struct::<SpawnSpec>(args.values[0]) {
+                Ok(spec) => spec,
+                Err(errno) => return errno.return_value(),
+            };
+            if let Err(errno) = validate_reserved(&[spec.reserved, spec.reserved1]) {
+                return errno.return_value();
             }
-            let mut spec_bytes = [0u8; core::mem::size_of::<SpawnSpec>()];
-            if crate::usercopy::copy_from_user(args.values[0], &mut spec_bytes).is_err() {
-                return Errno::Efault.return_value();
-            }
-            let spec =
-                unsafe { core::ptr::read_unaligned(spec_bytes.as_ptr().cast::<SpawnSpec>()) };
             if let Err(errno) = validate_spawn2_flags(spec.flags) {
                 return errno.return_value();
             }
@@ -802,55 +917,38 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 u32::try_from(source_fds[1]),
                 u32::try_from(source_fds[2]),
             ) {
-                (Ok(stdin), Ok(stdout), Ok(stderr)) => [stdin, stdout, stderr],
+                (Ok(stdin), Ok(stdout), Ok(stderr)) => {
+                    [stdin as UserWord, stdout as UserWord, stderr as UserWord]
+                }
                 _ => {
                     discard_spawn(transaction);
                     return Errno::Ebadf.return_value();
                 }
             };
-            if let Err(error) = crate::process::inherit_spawn_fds(
+            if let Err(error) = finalize_spawn(
                 transaction,
                 source_fds,
+                spec.process_group,
+                spec.flags,
                 spec.flags & SPAWN_INHERIT_OPEN_FDS != 0,
             ) {
-                discard_spawn(transaction);
                 return match error {
                     crate::process::Error::InvalidFd => Errno::Ebadf.return_value(),
                     crate::process::Error::FdCapacity => Errno::Eagain.return_value(),
+                    crate::process::Error::InvalidState => Errno::Eagain.return_value(),
                     _ => Errno::Eperm.return_value(),
                 };
-            }
-            let requested_group = if spec.flags & SPAWN_NEW_PROCESS_GROUP != 0 {
-                child_id
-            } else {
-                crate::process::ProcessId::from_raw(spec.process_group as u32)
-            };
-            if (spec.flags & SPAWN_NEW_PROCESS_GROUP != 0 || spec.process_group != 0)
-                && crate::process::set_process_group_for_spawn(transaction, requested_group)
-                    .is_err()
-            {
-                discard_spawn(transaction);
-                return Errno::Eperm.return_value();
-            }
-            if crate::process::publish_spawn(transaction).is_err() {
-                discard_spawn(transaction);
-                return Errno::Eagain.return_value();
             }
             child_id.get() as UserWord
         }
         value if value == Number::SpawnDelegated as UserWord => {
-            if crate::usercopy::validate(args.values[0], core::mem::size_of::<DelegatedSpawnSpec>())
-                .is_err()
-            {
-                return Errno::Efault.return_value();
-            }
-            let mut spec_bytes = [0u8; core::mem::size_of::<DelegatedSpawnSpec>()];
-            if crate::usercopy::copy_from_user(args.values[0], &mut spec_bytes).is_err() {
-                return Errno::Efault.return_value();
-            }
-            let spec = unsafe {
-                core::ptr::read_unaligned(spec_bytes.as_ptr().cast::<DelegatedSpawnSpec>())
+            let spec = match copy_user_versioned_struct::<DelegatedSpawnSpec>(args.values[0]) {
+                Ok(spec) => spec,
+                Err(errno) => return errno.return_value(),
             };
+            if let Err(errno) = validate_reserved(&[spec.reserved, spec.reserved1]) {
+                return errno.return_value();
+            }
             let caller = match crate::process::current_credentials() {
                 Ok(credentials) => credentials,
                 Err(_) => return Errno::Eperm.return_value(),
@@ -866,6 +964,9 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
             }
             if spec.flags & !(SPAWN_NEW_PROCESS_GROUP | SPAWN_FOREGROUND) != 0 {
                 return Errno::Einval.return_value();
+            }
+            if let Err(errno) = validate_spawn2_process_group(spec.flags, spec.process_group) {
+                return errno.return_value();
             }
             let path_length = match usize::try_from(spec.path_length) {
                 Ok(length) if length != 0 && length <= MAX_PATH => length,
@@ -927,32 +1028,28 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                     }
                     Err(_) => return Errno::Einval.return_value(),
                 };
+            let child_id = transaction.child;
             if finalize_spawn(
                 transaction,
-                spec.stdin_fd,
-                spec.stdout_fd,
-                spec.stderr_fd,
+                [spec.stdin_fd, spec.stdout_fd, spec.stderr_fd],
                 spec.process_group,
                 spec.flags,
+                false,
             )
             .is_err()
             {
                 return Errno::Eperm.return_value();
             }
-            transaction.child.get() as UserWord
+            child_id.get() as UserWord
         }
         value if value == Number::SetSession as UserWord => {
-            if crate::usercopy::validate(args.values[0], core::mem::size_of::<SessionSpec>())
-                .is_err()
-            {
-                return Errno::Efault.return_value();
+            let spec = match copy_user_versioned_struct::<SessionSpec>(args.values[0]) {
+                Ok(spec) => spec,
+                Err(errno) => return errno.return_value(),
+            };
+            if let Err(errno) = validate_reserved(&[spec.reserved]) {
+                return errno.return_value();
             }
-            let mut spec_bytes = [0u8; core::mem::size_of::<SessionSpec>()];
-            if crate::usercopy::copy_from_user(args.values[0], &mut spec_bytes).is_err() {
-                return Errno::Efault.return_value();
-            }
-            let spec =
-                unsafe { core::ptr::read_unaligned(spec_bytes.as_ptr().cast::<SessionSpec>()) };
             let cwd_length = match usize::try_from(spec.cwd_length) {
                 Ok(length) if length != 0 && length <= crate::process::MAX_SESSION_CWD => length,
                 _ => return Errno::Einval.return_value(),
@@ -1016,6 +1113,33 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
             match crate::usercopy::copy_to_user(args.values[0], bytes) {
                 Ok(_) => 0,
                 Err(_) => Errno::Efault.return_value(),
+            }
+        }
+        value if value == Number::GetSessionCapability as UserWord => {
+            match crate::process::current_session_capability() {
+                Ok(capability) => capability.raw(),
+                Err(_) => Errno::Eperm.return_value(),
+            }
+        }
+        value if value == Number::ValidateSessionCapability as UserWord => {
+            let capability = match crate::process::SessionCapability::from_raw(args.values[0]) {
+                Some(capability) => capability,
+                None => return Errno::Einval.return_value(),
+            };
+            let target_uid = match u32::try_from(args.values[2]) {
+                Ok(target_uid) => target_uid,
+                Err(_) => return Errno::Einval.return_value(),
+            };
+            match crate::process::validate_session_capability(
+                capability,
+                args.values[1],
+                target_uid,
+            ) {
+                Ok(()) => 0,
+                Err(crate::process::Error::PermissionDenied)
+                | Err(crate::process::Error::InvalidId)
+                | Err(crate::process::Error::InvalidState) => Errno::Eperm.return_value(),
+                Err(_) => Errno::Einval.return_value(),
             }
         }
         value if value == Number::Open as UserWord => {
@@ -1203,9 +1327,20 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Ok(count) => count,
                 Err(error) => return vfs_errno(error).return_value(),
             };
-            for (index, entry) in entries.iter().take(count).enumerate() {
+            if crate::vfs::validate_directory_entries(count, capacity, &entries).is_err() {
+                return Errno::Einval.return_value();
+            }
+            let entries = match entries.get(..count) {
+                Some(entries) => entries,
+                None => return Errno::Einval.return_value(),
+            };
+            for (index, entry) in entries.iter().enumerate() {
                 let mut name = [0u8; 32];
-                name[..entry.name_length].copy_from_slice(&entry.name[..entry.name_length]);
+                let entry_name = match entry.name.get(..entry.name_length) {
+                    Some(name) => name,
+                    None => return Errno::Einval.return_value(),
+                };
+                name[..entry.name_length].copy_from_slice(entry_name);
                 let output = DirEntry {
                     kind: match entry.kind {
                         crate::vfs::NodeType::Regular => STAT_REGULAR,
@@ -1264,6 +1399,80 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
             match crate::vfs::sync_path(path) {
                 Ok(()) => 0,
                 Err(error) => vfs_errno(error).return_value(),
+            }
+        }
+        value if value == Number::UserDbLoad as UserWord => {
+            let capacity = match usize::try_from(args.values[1]) {
+                Ok(capacity) if capacity <= crate::userdb::MAX_PAYLOAD_BYTES => capacity,
+                _ => return Errno::E2big.return_value(),
+            };
+            if capacity == 0
+                || crate::usercopy::validate(args.values[0], capacity).is_err()
+                || crate::usercopy::validate(args.values[2], core::mem::size_of::<UserDbLoadInfo>())
+                    .is_err()
+            {
+                return if capacity == 0 {
+                    Errno::E2big.return_value()
+                } else {
+                    Errno::Efault.return_value()
+                };
+            }
+            let actor = match crate::process::current_credentials() {
+                Ok(actor) => actor,
+                Err(_) => return Errno::Eperm.return_value(),
+            };
+            let mut payload = [0u8; crate::userdb::MAX_PAYLOAD_BYTES];
+            let metadata = match crate::userdb::load(&mut payload, actor) {
+                Ok(metadata) => metadata,
+                Err(error) => return userdb_errno(error).return_value(),
+            };
+            if metadata.generation == 0 {
+                return Errno::Ebadmsg.return_value();
+            }
+            let payload_length = metadata.payload_length;
+            if payload_length > capacity {
+                return Errno::E2big.return_value();
+            }
+            if crate::usercopy::copy_to_user(args.values[0], &payload[..payload_length]).is_err() {
+                return Errno::Efault.return_value();
+            }
+            let info = UserDbLoadInfo {
+                state: metadata.state,
+                reserved: 0,
+                owner_uid: metadata.owner_uid,
+                owner_gid: metadata.owner_gid,
+                generation: metadata.generation,
+            };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&info as *const UserDbLoadInfo).cast::<u8>(),
+                    core::mem::size_of::<UserDbLoadInfo>(),
+                )
+            };
+            if crate::usercopy::copy_to_user(args.values[2], bytes).is_err() {
+                return Errno::Efault.return_value();
+            }
+            payload_length as UserWord
+        }
+        value if value == Number::UserDbCommit as UserWord => {
+            let length = match usize::try_from(args.values[1]) {
+                Ok(length) if length != 0 && length <= crate::userdb::MAX_PAYLOAD_BYTES => length,
+                _ => return Errno::E2big.return_value(),
+            };
+            if crate::usercopy::validate(args.values[0], length).is_err() {
+                return Errno::Efault.return_value();
+            }
+            let actor = match crate::process::current_credentials() {
+                Ok(actor) => actor,
+                Err(_) => return Errno::Eperm.return_value(),
+            };
+            let mut payload = [0u8; crate::userdb::MAX_PAYLOAD_BYTES];
+            if crate::usercopy::copy_from_user(args.values[0], &mut payload[..length]).is_err() {
+                return Errno::Efault.return_value();
+            }
+            match crate::userdb::commit(&payload[..length], actor) {
+                Ok(_) => 0,
+                Err(error) => userdb_errno(error).return_value(),
             }
         }
         value if value == Number::Seek as UserWord => {
@@ -1512,6 +1721,7 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Err(crate::tty::Error::PermissionDenied) => Errno::Eperm.return_value(),
                 Err(crate::tty::Error::InvalidGroup) => Errno::Einval.return_value(),
                 Err(crate::tty::Error::InvalidWindow) => Errno::Einval.return_value(),
+                Err(error) => tty_errno(error).return_value(),
             }
         }
         value if value == Number::TtySetForeground as UserWord => {
@@ -1531,6 +1741,7 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Err(crate::tty::Error::PermissionDenied) => Errno::Eperm.return_value(),
                 Err(crate::tty::Error::InvalidGroup) => Errno::Einval.return_value(),
                 Err(crate::tty::Error::InvalidWindow) => Errno::Einval.return_value(),
+                Err(error) => tty_errno(error).return_value(),
             }
         }
         value if value == Number::TtyGetInfo as UserWord => {
@@ -1559,6 +1770,7 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Err(crate::tty::Error::InvalidGroup | crate::tty::Error::InvalidWindow) => {
                     return Errno::Einval.return_value()
                 }
+                Err(error) => return tty_errno(error).return_value(),
             };
             let bytes = unsafe {
                 core::slice::from_raw_parts(
@@ -1594,6 +1806,7 @@ pub fn dispatch(number: UserWord, args: Args) -> UserWord {
                 Err(crate::tty::Error::InvalidGroup | crate::tty::Error::InvalidWindow) => {
                     Errno::Einval.return_value()
                 }
+                Err(error) => tty_errno(error).return_value(),
             }
         }
         value if value == Number::Dup2 as UserWord => {
@@ -1627,11 +1840,11 @@ fn require_fd(fd: u32, read: bool) -> Result<(), Errno> {
     }
 }
 
-fn copy_user_path<'a>(
+fn copy_user_path(
     address: UserPointer,
     length: UserWord,
-    output: &'a mut [u8; MAX_PATH],
-) -> Result<&'a str, Errno> {
+    output: &mut [u8; MAX_PATH],
+) -> Result<&str, Errno> {
     let length = usize::try_from(length).map_err(|_| Errno::Eoverflow)?;
     if length == 0 || length > MAX_PATH {
         return Err(Errno::Einval);
@@ -1646,6 +1859,40 @@ fn copy_user_path<'a>(
         return Err(Errno::Einval);
     }
     Ok(path)
+}
+
+fn validate_struct_header(header: StructHeader, expected_size: usize) -> Result<(), Errno> {
+    if header.abi_version != ABI_VERSION
+        || usize::from(header.size) != expected_size
+        || header.reserved != 0
+    {
+        Err(Errno::Einval)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_reserved(fields: &[u32]) -> Result<(), Errno> {
+    if fields.iter().any(|field| *field != 0) {
+        Err(Errno::Einval)
+    } else {
+        Ok(())
+    }
+}
+
+fn copy_user_versioned_struct<T: Copy>(address: UserPointer) -> Result<T, Errno> {
+    let expected_size = core::mem::size_of::<T>();
+    let mut header_bytes = [0u8; core::mem::size_of::<StructHeader>()];
+    if crate::usercopy::copy_from_user(address, &mut header_bytes).is_err() {
+        return Err(Errno::Efault);
+    }
+    let header = unsafe { core::ptr::read_unaligned(header_bytes.as_ptr().cast::<StructHeader>()) };
+    validate_struct_header(header, expected_size)?;
+    let mut spec_bytes = [0u8; MAX_VERSIONED_STRUCT_SIZE];
+    if crate::usercopy::copy_from_user(address, &mut spec_bytes[..expected_size]).is_err() {
+        return Err(Errno::Efault);
+    }
+    Ok(unsafe { core::ptr::read_unaligned(spec_bytes.as_ptr().cast::<T>()) })
 }
 
 fn validate_spawn2_flags(flags: UserWord) -> Result<(), Errno> {
@@ -1725,13 +1972,12 @@ fn copy_user_string_vector<'a>(
 
 fn finalize_spawn(
     transaction: crate::process::SpawnTransaction,
-    stdin_fd: UserWord,
-    stdout_fd: UserWord,
-    stderr_fd: UserWord,
+    source_fds: [UserWord; 3],
     process_group: UserWord,
     flags: UserWord,
-) -> Result<(), ()> {
-    let source_fds = [stdin_fd, stdout_fd, stderr_fd];
+    inherit_open_fds: bool,
+) -> Result<(), crate::process::Error> {
+    let child = transaction.child;
     let source_fds = match (
         u32::try_from(source_fds[0]),
         u32::try_from(source_fds[1]),
@@ -1740,34 +1986,34 @@ fn finalize_spawn(
         (Ok(stdin), Ok(stdout), Ok(stderr)) => [stdin, stdout, stderr],
         _ => {
             discard_spawn(transaction);
-            return Err(());
+            return Err(crate::process::Error::InvalidFd);
         }
     };
-    if crate::process::inherit_spawn_standard_fds(transaction, source_fds).is_err() {
-        discard_spawn(transaction);
-        return Err(());
-    }
     let requested_group = if flags & SPAWN_NEW_PROCESS_GROUP != 0 {
-        transaction.child
+        Some(child)
+    } else if process_group == 0 {
+        None
     } else {
-        crate::process::ProcessId::from_raw(process_group as u32)
+        match u32::try_from(process_group) {
+            Ok(process_group) => Some(crate::process::ProcessId::from_raw(process_group)),
+            Err(_) => {
+                discard_spawn(transaction);
+                return Err(crate::process::Error::InvalidId);
+            }
+        }
     };
-    if (flags & SPAWN_NEW_PROCESS_GROUP != 0 || process_group != 0)
-        && crate::process::set_process_group_for_spawn(transaction, requested_group).is_err()
-    {
-        discard_spawn(transaction);
-        return Err(());
+    let result =
+        crate::process::finalize_spawn(transaction, source_fds, inherit_open_fds, requested_group);
+    if result.is_err() {
+        let _ = crate::user_runtime::discard(child);
     }
-    if crate::process::publish_spawn(transaction).is_err() {
-        discard_spawn(transaction);
-        return Err(());
-    }
-    Ok(())
+    result
 }
 
 fn discard_spawn(transaction: crate::process::SpawnTransaction) {
-    let _ = crate::process::discard_child(transaction.parent, transaction.child);
-    let _ = crate::user_runtime::discard(transaction.child);
+    let child = transaction.child;
+    let _ = crate::user_runtime::discard(child);
+    let _ = crate::process::rollback_spawn(transaction);
 }
 
 fn current_fd_info(fd: u32) -> Result<(u32, bool, bool, bool), Errno> {
@@ -1777,6 +2023,22 @@ fn current_fd_info(fd: u32) -> Result<(u32, bool, bool, bool), Errno> {
             _ => Errno::Einval,
         })?;
     Ok((open_file, nonblocking, readable, writable))
+}
+
+fn tty_errno(error: crate::tty::Error) -> Errno {
+    match error {
+        crate::tty::Error::NotTty => Errno::Enotty,
+        crate::tty::Error::PermissionDenied | crate::tty::Error::NotSessionLeader => Errno::Eperm,
+        crate::tty::Error::Unsupported => Errno::Enotsup,
+        crate::tty::Error::WouldBlock | crate::tty::Error::Busy => Errno::Eagain,
+        crate::tty::Error::Broken => Errno::Epipe,
+        crate::tty::Error::Unavailable => Errno::Eio,
+        crate::tty::Error::NoSpace | crate::tty::Error::Exhausted => Errno::Enospc,
+        crate::tty::Error::InvalidHandle | crate::tty::Error::InvalidEndpoint => Errno::Ebadf,
+        crate::tty::Error::InvalidGroup
+        | crate::tty::Error::InvalidWindow
+        | crate::tty::Error::InvalidTermios => Errno::Einval,
+    }
 }
 
 fn vfs_errno(error: crate::vfs::Error) -> Errno {
@@ -1799,6 +2061,66 @@ fn vfs_errno(error: crate::vfs::Error) -> Errno {
     }
 }
 
+fn userdb_errno(error: crate::userdb::Error) -> Errno {
+    match error {
+        crate::userdb::Error::PermissionDenied => Errno::Eperm,
+        crate::userdb::Error::Missing => Errno::Enoent,
+        crate::userdb::Error::Corrupt => Errno::Ebadmsg,
+        crate::userdb::Error::Busy => Errno::Eagain,
+        crate::userdb::Error::TooLarge => Errno::E2big,
+        crate::userdb::Error::NoSpace => Errno::Enospc,
+        crate::userdb::Error::ReadOnly => Errno::Erofs,
+        crate::userdb::Error::Committed | crate::userdb::Error::Backend => Errno::Eio,
+    }
+}
+
+fn nanosleep_ticks(seconds: i64, nanoseconds: i64) -> Result<u64, Errno> {
+    nanosleep_ticks_for_interval(seconds, nanoseconds, crate::time::scheduler_ticks())
+}
+
+fn nanosleep_ticks_for_interval(
+    seconds: i64,
+    nanoseconds: i64,
+    interval: u64,
+) -> Result<u64, Errno> {
+    if seconds < 0 || !(0..NANOS_PER_SECOND as i64).contains(&nanoseconds) {
+        return Err(Errno::Einval);
+    }
+    let interval = interval as u128;
+    let whole = (seconds as u128)
+        .checked_mul(interval)
+        .ok_or(Errno::Eoverflow)?;
+    let fraction_numerator = (nanoseconds as u128)
+        .checked_mul(interval)
+        .ok_or(Errno::Eoverflow)?;
+    let fraction = fraction_numerator
+        .checked_add(NANOS_PER_SECOND as u128 - 1)
+        .ok_or(Errno::Eoverflow)?
+        / NANOS_PER_SECOND as u128;
+    let ticks = whole.checked_add(fraction).ok_or(Errno::Eoverflow)?;
+    let ticks = u64::try_from(ticks).map_err(|_| Errno::Eoverflow)?;
+    if seconds != 0 || nanoseconds != 0 {
+        Ok(ticks.max(1))
+    } else {
+        Ok(0)
+    }
+}
+
+fn copy_timespec_to_user(address: UserWord, value: &Timespec) -> Result<(), Errno> {
+    if address == 0 {
+        return Ok(());
+    }
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (value as *const Timespec).cast::<u8>(),
+            core::mem::size_of::<Timespec>(),
+        )
+    };
+    crate::usercopy::copy_to_user(address, bytes)
+        .map(|_| ())
+        .map_err(|_| Errno::Efault)
+}
+
 fn pipe_errno(error: crate::pipe::Error) -> Errno {
     match error {
         crate::pipe::Error::WouldBlock => Errno::Eagain,
@@ -1817,13 +2139,39 @@ pub fn contract_self_check() {
     assert!(!is_error(EXIT_TO_KERNEL));
     assert!(!is_error(SWITCH_TO_USER));
     assert_ne!(EXIT_TO_KERNEL, SWITCH_TO_USER);
-    assert_eq!(TABLE.len(), 38);
+    assert_eq!(TABLE.len(), 43);
     assert!(TABLE.iter().all(|entry| entry.arguments <= MAX_ARGS as u8));
     assert_eq!(TABLE[0].number as UserWord, Number::Read as UserWord);
     assert!(TABLE.iter().all(|entry| !entry.name.is_empty()));
     assert_eq!(Number::Fcntl as UserWord, 432);
-    assert_eq!(TABLE[37].number as UserWord, Number::Fcntl as UserWord);
-    assert_eq!(TABLE[37].arguments, 3);
+    assert_eq!(TABLE[39].number as UserWord, Number::Fcntl as UserWord);
+    assert_eq!(TABLE[39].arguments, 3);
+    assert_eq!(Number::UserDbLoad as UserWord, 433);
+    assert_eq!(Number::UserDbCommit as UserWord, 434);
+    assert_eq!(Number::Nanosleep as UserWord, 435);
+    assert_eq!(TABLE[42].number as UserWord, Number::Nanosleep as UserWord);
+    assert_eq!(TABLE[42].arguments, 3);
+    assert_eq!(nanosleep_ticks(0, 0), Ok(0));
+    assert!(matches!(nanosleep_ticks(-1, 0), Err(Errno::Einval)));
+    assert!(matches!(
+        nanosleep_ticks(0, NANOS_PER_SECOND as i64),
+        Err(Errno::Einval)
+    ));
+    assert!(nanosleep_ticks(0, 1).is_ok());
+    assert!(matches!(
+        nanosleep_ticks_for_interval(1, 1, u64::MAX),
+        Err(Errno::Eoverflow)
+    ));
+    assert!(matches!(
+        copy_timespec_to_user(
+            1,
+            &Timespec {
+                seconds: 0,
+                nanoseconds: 0,
+            }
+        ),
+        Err(Errno::Efault)
+    ));
     assert!(TABLE
         .iter()
         .any(|entry| entry.restart == RestartPolicy::Restartable));
@@ -1837,10 +2185,10 @@ pub fn contract_self_check() {
     );
     assert_eq!(core::mem::size_of::<PipeFds>(), 16);
     assert_eq!(core::mem::size_of::<WaitStatus>(), 16);
-    assert_eq!(core::mem::size_of::<SpawnSpec>(), 88);
-    assert_eq!(core::mem::size_of::<DelegatedSpawnSpec>(), 112);
+    assert_eq!(core::mem::size_of::<SpawnSpec>(), 104);
+    assert_eq!(core::mem::size_of::<DelegatedSpawnSpec>(), 120);
     assert_eq!(core::mem::size_of::<Credentials>(), 32);
-    assert_eq!(core::mem::size_of::<SessionSpec>(), 72);
+    assert_eq!(core::mem::size_of::<SessionSpec>(), 80);
     assert_eq!(core::mem::size_of::<Stat>(), 24);
     assert_eq!(core::mem::size_of::<TtyInfo>(), 20);
     assert_eq!(core::mem::size_of::<DirEntry>(), 56);
@@ -1869,6 +2217,54 @@ pub fn contract_self_check() {
         Err(Errno::Einval)
     ));
     assert!(validate_spawn2_process_group(SPAWN_NEW_PROCESS_GROUP, UserWord::MAX).is_ok());
+    let header = StructHeader {
+        abi_version: ABI_VERSION,
+        size: core::mem::size_of::<SpawnSpec>() as u16,
+        reserved: 0,
+    };
+    assert!(validate_struct_header(header, core::mem::size_of::<SpawnSpec>()).is_ok());
+    assert!(matches!(
+        validate_struct_header(
+            StructHeader {
+                size: (core::mem::size_of::<SpawnSpec>() - 1) as u16,
+                ..header
+            },
+            core::mem::size_of::<SpawnSpec>(),
+        ),
+        Err(Errno::Einval)
+    ));
+    assert!(matches!(
+        validate_struct_header(
+            StructHeader {
+                size: (core::mem::size_of::<SpawnSpec>() + 1) as u16,
+                ..header
+            },
+            core::mem::size_of::<SpawnSpec>(),
+        ),
+        Err(Errno::Einval)
+    ));
+    assert!(matches!(
+        validate_struct_header(
+            StructHeader {
+                abi_version: ABI_VERSION + 1,
+                ..header
+            },
+            core::mem::size_of::<SpawnSpec>(),
+        ),
+        Err(Errno::Einval)
+    ));
+    assert!(matches!(
+        validate_struct_header(
+            StructHeader {
+                reserved: 1,
+                ..header
+            },
+            core::mem::size_of::<SpawnSpec>(),
+        ),
+        Err(Errno::Einval)
+    ));
+    assert!(validate_reserved(&[0, 0, 0]).is_ok());
+    assert!(matches!(validate_reserved(&[0, 1]), Err(Errno::Einval)));
     let mut path_storage = [0u8; MAX_PATH];
     assert!(matches!(
         copy_user_path(0, 1, &mut path_storage),

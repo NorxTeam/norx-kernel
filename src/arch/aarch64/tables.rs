@@ -48,9 +48,9 @@ norx_exception_vectors:
     .space 124
     b norx_aarch64_exception_entry
     .space 124
-    b norx_aarch64_irq_entry
+    b norx_aarch64_sync_exception
     .space 124
-    b norx_aarch64_exception_entry
+    b norx_aarch64_irq_entry
     .space 124
     b norx_aarch64_exception_entry
     .space 124
@@ -116,7 +116,24 @@ norx_aarch64_irq_entry:
 norx_aarch64_sync_exception:
     stp x0, x16, [sp, #-32]!
     stp x17, x18, [sp, #16]
+    mrs x17, CurrentEL
+    ubfx x17, x17, #2, #2
+    cmp x17, #1
+    b.eq norx_aarch64_sync_el1
+    cmp x17, #2
+    b.eq norx_aarch64_sync_el2
+    cmp x17, #3
+    b.eq norx_aarch64_sync_el3
+    b norx_aarch64_exception_entry
+norx_aarch64_sync_el1:
     mrs x17, spsr_el1
+    b norx_aarch64_sync_source
+norx_aarch64_sync_el2:
+    mrs x17, spsr_el2
+    b norx_aarch64_sync_source
+norx_aarch64_sync_el3:
+    mrs x17, spsr_el3
+norx_aarch64_sync_source:
     and x17, x17, #0xf
     cbnz x17, norx_aarch64_restore_kernel_frame
     adrp x18, norx_aarch64_user_depth
@@ -169,26 +186,48 @@ norx_aarch64_exception_frame:
     b 9f
 1:
     mrs x10, esr_el1
+    mrs x11, spsr_el1
     b 4f
 2:
     mrs x10, esr_el2
+    mrs x11, spsr_el2
     b 4f
 3:
     mrs x10, esr_el3
+    mrs x11, spsr_el3
 4:
     ubfx x12, x10, #26, #6
+    and x11, x11, #0xf
     cmp x12, #0x15
-    b.eq 6f
+    b.eq norx_aarch64_svc
     cmp x12, #0x20
-    b.eq 55f
+    b.eq norx_aarch64_instruction_abort
     cmp x12, #0x21
-    b.eq 55f
+    b.eq norx_aarch64_instruction_abort
     cmp x12, #0x24
-    b.eq 5f
+    b.eq norx_aarch64_data_abort
     cmp x12, #0x25
-    b.eq 5f
+    b.eq norx_aarch64_data_abort
     b 9f
-5:
+
+norx_aarch64_svc:
+    cbnz x11, 9f
+    b 6f
+
+norx_aarch64_instruction_abort:
+    cbnz x11, 9f
+    bl norx_aarch64_user_fault
+    b norx_aarch64_user_fault_result
+
+norx_aarch64_data_abort:
+    cbz x11, norx_aarch64_user_data_abort
+    b norx_aarch64_kernel_data_abort
+
+norx_aarch64_user_data_abort:
+    bl norx_aarch64_user_fault
+    b norx_aarch64_user_fault_result
+
+norx_aarch64_kernel_data_abort:
     cmp x9, #1
     b.eq 51f
     cmp x9, #2
@@ -214,11 +253,11 @@ norx_aarch64_exception_frame:
     cbz x0, 9f
     msr elr_el3, x0
     b 7f
-55:
-    bl norx_aarch64_user_fault
+
+norx_aarch64_user_fault_result:
     mov x9, #1
     cmp x0, x9
-    b.eq 7f
+    b.eq norx_aarch64_restore_success
     mov x9, #-4098
     cmp x0, x9
     b.eq 10f
@@ -247,19 +286,12 @@ norx_aarch64_exception_frame:
     mov x9, #-4097
     cmp x0, x9
     b.eq 8f
-    ldp x1, x2, [sp, #0]
-    ldp x3, x4, [sp, #16]
-    ldp x5, x6, [sp, #32]
-    ldp x7, x8, [sp, #48]
-    ldp x9, x10, [sp, #64]
-    ldp x11, x12, [sp, #80]
-    ldp x13, x14, [sp, #96]
-    ldp x29, x30, [sp, #112]
-    ldp x15, x16, [sp, #128]
-    ldp x17, x18, [sp, #144]
-    add sp, sp, #160
-    eret
+    b norx_aarch64_restore_frame
 10:
+    mrs x9, CurrentEL
+    ubfx x9, x9, #2, #2
+    cmp x9, #1
+    b.ne 9f
     mrs x9, sp_el0
     adrp x10, SWITCH_SAVED_SP
     add x10, x10, :lo12:SWITCH_SAVED_SP
@@ -358,6 +390,10 @@ norx_aarch64_exception_frame:
     ldr x20, [x20, #184]
     eret
 8:
+    mrs x9, CurrentEL
+    ubfx x9, x9, #2, #2
+    cmp x9, #1
+    b.ne 9f
     adrp x9, norx_aarch64_user_depth
     add x9, x9, :lo12:norx_aarch64_user_depth
     ldr x10, [x9]
@@ -415,7 +451,14 @@ norx_aarch64_exception_frame:
     mov x30, x11
     mov sp, x10
     ret
+
+norx_aarch64_restore_success:
+    ldr x0, [sp, #160]
+    b norx_aarch64_restore_frame
+
 7:
+    mov x0, #14
+norx_aarch64_restore_frame:
     ldp x1, x2, [sp, #0]
     ldp x3, x4, [sp, #16]
     ldp x5, x6, [sp, #32]
@@ -426,7 +469,6 @@ norx_aarch64_exception_frame:
     ldp x29, x30, [sp, #112]
     ldp x15, x16, [sp, #128]
     ldp x17, x18, [sp, #144]
-    mov x0, #14
     add sp, sp, #160
     eret
 9:

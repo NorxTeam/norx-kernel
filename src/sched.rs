@@ -13,8 +13,6 @@ struct RuntimeCell(UnsafeCell<Scheduler>);
 unsafe impl Sync for RuntimeCell {}
 
 static RUNTIME: RuntimeCell = RuntimeCell(UnsafeCell::new(Scheduler::new()));
-static mut CURRENT: Option<usize> = None;
-static mut TIMER_TICKS: u64 = 0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
@@ -52,6 +50,9 @@ pub struct Scheduler {
     tasks: [Option<Task>; MAX_TASKS],
     len: usize,
     clock: u64,
+    current: Option<usize>,
+    timer_ticks: u64,
+    switches: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -61,6 +62,7 @@ pub struct Status {
     pub clock: u64,
     pub timer_ticks: u64,
     pub tasks: usize,
+    pub switches: u64,
 }
 
 impl Scheduler {
@@ -69,14 +71,26 @@ impl Scheduler {
             tasks: [None; MAX_TASKS],
             len: 0,
             clock: 0,
+            current: None,
+            timer_ticks: 0,
+            switches: 0,
         }
     }
 
     pub fn add(&mut self, mut task: Task) -> bool {
-        if self.len == MAX_TASKS || task.weight == 0 {
+        if self.len == MAX_TASKS
+            || task.weight == 0
+            || self.tasks[..self.len]
+                .iter()
+                .flatten()
+                .any(|existing| existing.id == task.id)
+        {
             return false;
         }
-        task.deadline = self.clock + slice_for(task);
+        let Some(deadline) = self.clock.checked_add(slice_for(task)) else {
+            return false;
+        };
+        task.deadline = deadline;
         self.tasks[self.len] = Some(task);
         self.len += 1;
         true
@@ -87,11 +101,13 @@ impl Scheduler {
         let mut best_key = u64::MAX;
 
         for slot in &self.tasks[..self.len] {
-            let task = slot.as_ref()?;
+            let Some(task) = slot.as_ref() else {
+                continue;
+            };
             if task.state != TaskState::Ready {
                 continue;
             }
-            let key = task.deadline + task.burst / 2;
+            let key = task.deadline.saturating_add(task.burst / 2);
             if key < best_key {
                 best_key = key;
                 best = Some(task.id);
@@ -109,7 +125,7 @@ impl Scheduler {
         self.len
     }
 
-    pub fn charge(&mut self, id: usize, runtime: u64, slept: bool) {
+    pub fn charge(&mut self, id: usize, runtime: u64, slept: bool) -> bool {
         for slot in &mut self.tasks[..self.len] {
             let Some(task) = slot.as_mut() else { continue };
             if task.id != id {
@@ -124,9 +140,25 @@ impl Scheduler {
                 task.burst.saturating_add(runtime)
             };
             self.clock = self.clock.saturating_add(runtime);
-            task.deadline = task.vruntime + slice_for(*task) + task.burst / 4;
-            return;
+            task.deadline = task
+                .vruntime
+                .saturating_add(slice_for(*task))
+                .saturating_add(task.burst / 4);
+            return true;
         }
+        false
+    }
+
+    fn select_initial(&mut self) {
+        self.current = self.pick();
+    }
+
+    fn select_next(&mut self) {
+        let next = self.pick();
+        if next != self.current {
+            self.switches = self.switches.saturating_add(1);
+        }
+        self.current = next;
     }
 }
 
@@ -141,21 +173,41 @@ pub fn self_check() {
     let mut sched = Scheduler::new();
     assert!(sched.add(Task::new(1, 1024, 3)));
     assert!(sched.add(Task::new(2, 1024, 0)));
+    assert!(!sched.add(Task::new(1, 1024, 0)));
+    assert!(!sched.add(Task::new(3, 0, 0)));
     let _ = TaskState::Sleeping;
     let _ = TaskState::Done;
     assert_eq!(sched.pick(), Some(1));
-    sched.charge(1, 12, false);
+    assert!(sched.charge(1, 12, false));
     assert_eq!(sched.pick(), Some(2));
-    sched.charge(2, 4, true);
+    assert!(sched.charge(2, 4, true));
     assert_eq!(sched.pick(), Some(2));
+    assert!(!sched.charge(99, 1, false));
+
+    let mut capacity = Scheduler::new();
+    for id in 1..=MAX_TASKS {
+        assert!(capacity.add(Task::new(id, 1024, 0)));
+    }
+    assert!(!capacity.add(Task::new(MAX_TASKS + 1, 1024, 0)));
 
     let mut accounting = Scheduler::new();
     assert!(accounting.add(Task::new(7, 1024, 0)));
+    assert!(accounting.add(Task::new(8, 1024, 0)));
+    let mut seen = 0u8;
     for _ in 0..8 {
         let current = accounting.pick().unwrap();
-        accounting.charge(current, 1, false);
+        seen |= if current == 7 { 1 } else { 2 };
+        assert!(accounting.charge(current, 1, false));
     }
+    assert_eq!(seen, 3);
     assert_eq!(accounting.clock(), 8);
+
+    let mut saturated = Scheduler::new();
+    assert!(saturated.add(Task::new(1, 1024, 0)));
+    assert!(saturated.charge(1, u64::MAX, false));
+    assert_eq!(saturated.clock(), u64::MAX);
+    assert_eq!(saturated.pick(), Some(1));
+    assert!(!saturated.add(Task::new(2, 1024, 0)));
 }
 
 pub fn init_runtime() {
@@ -164,26 +216,24 @@ pub fn init_runtime() {
         *runtime = Scheduler::new();
         let _ = runtime.add(Task::new(1, 1024, 3));
         let _ = runtime.add(Task::new(2, 1024, 1));
-        CURRENT = runtime.pick();
-        TIMER_TICKS = 0;
+        runtime.select_initial();
     });
 }
 
 pub fn on_timer_tick() {
     crate::arch::without_interrupts(|| unsafe {
         let runtime = &mut *RUNTIME.0.get();
-        TIMER_TICKS = TIMER_TICKS.saturating_add(1);
+        runtime.timer_ticks = runtime.timer_ticks.saturating_add(1);
         crate::process::wake_sleepers(crate::time::ticks());
-        if let Some(id) = CURRENT {
-            runtime.charge(id, 1, false);
+        if let Some(id) = runtime.current {
+            let _ = runtime.charge(id, 1, false);
         }
-        CURRENT = runtime.pick();
+        runtime.select_next();
     });
 }
 
 pub fn runtime_self_check(hardware_ticks: bool) -> bool {
-    let before = status();
-    let before_irq = crate::irq::stats();
+    let (before, before_irq) = snapshot();
     if crate::time::scheduler_hz() != 100
         || before.tasks < 2
         || before.current.is_none()
@@ -200,7 +250,7 @@ pub fn runtime_self_check(hardware_ticks: bool) -> bool {
     while spins < probe_limit {
         if hardware_ticks {
             let _ = crate::irq::run_deferred();
-            spins += 1;
+            spins = spins.saturating_add(1);
         } else {
             for _ in 0..PROBE_BATCH_SPINS {
                 core::hint::spin_loop();
@@ -214,29 +264,33 @@ pub fn runtime_self_check(hardware_ticks: bool) -> bool {
             break;
         }
     }
-    let after = status();
-    let after_irq = crate::irq::stats();
+    let (after, after_irq) = snapshot();
     let advanced = after.timer_ticks.saturating_sub(before.timer_ticks);
     let irq_delta = after_irq.timer.saturating_sub(before_irq.timer);
-    let available = before_irq.timer_pending.saturating_add(irq_delta);
-    let accounted = advanced.saturating_add(after_irq.timer_pending);
-    advanced != 0
-        && after.clock.saturating_sub(before.clock) >= advanced
+    let timer_conservation = before_irq.timer_pending.saturating_add(irq_delta)
+        == after_irq.timer_pending.saturating_add(advanced);
+    advanced >= RUNTIME_PROBE_TICKS
+        && after.clock.saturating_sub(before.clock) == advanced
+        && after.switches > before.switches
         && after.current.is_some()
         && after.next.is_some()
-        && (!hardware_ticks
-            || (after_irq.timer != 0 && accounted <= available && advanced >= RUNTIME_PROBE_TICKS))
+        && (!hardware_ticks || (irq_delta >= advanced && timer_conservation))
+}
+
+fn snapshot() -> (Status, crate::irq::Stats) {
+    crate::arch::without_interrupts(|| (status(), crate::irq::stats()))
 }
 
 pub fn status() -> Status {
     crate::arch::without_interrupts(|| unsafe {
         let runtime = &*RUNTIME.0.get();
         Status {
-            current: CURRENT,
+            current: runtime.current,
             next: runtime.pick(),
             clock: runtime.clock(),
-            timer_ticks: TIMER_TICKS,
+            timer_ticks: runtime.timer_ticks,
             tasks: runtime.len(),
+            switches: runtime.switches,
         }
     })
 }

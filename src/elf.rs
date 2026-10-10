@@ -8,6 +8,11 @@ const MAX_ARGUMENTS: usize = 16;
 const MAX_ENVIRONMENT: usize = 16;
 const MAX_STACK_WORDS: usize = 64;
 const MAX_STACK_BYTES: usize = 4096;
+const STARTUP_MAGIC: u64 = 0x4e4f525853544152;
+const STARTUP_VERSION: u64 = 1;
+const STARTUP_HEADER_WORDS: usize = 12;
+const STARTUP_HEADER_BYTES: usize = STARTUP_HEADER_WORDS * core::mem::size_of::<u64>();
+const STARTUP_AUXV_ENTRIES: usize = 3;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const PT_LOAD: u32 = 1;
@@ -156,16 +161,38 @@ impl InitialStack {
         {
             return Err(Error::InvalidStack);
         }
-        let word_count = 1usize
+        let word_count = STARTUP_HEADER_WORDS
             .checked_add(arguments.len())
             .and_then(|count| count.checked_add(1))
             .and_then(|count| count.checked_add(environment.len()))
             .and_then(|count| count.checked_add(1))
-            .and_then(|count| count.checked_add(6))
+            .and_then(|count| count.checked_add(STARTUP_AUXV_ENTRIES * 2))
             .ok_or(Error::StackOverflow)?;
         if word_count > MAX_STACK_WORDS {
             return Err(Error::StackOverflow);
         }
+
+        let argv_offset = STARTUP_HEADER_BYTES;
+        let argv_bytes = arguments
+            .len()
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(core::mem::size_of::<u64>()))
+            .ok_or(Error::StackOverflow)?;
+        let envp_offset = argv_offset
+            .checked_add(argv_bytes)
+            .ok_or(Error::StackOverflow)?;
+        let envp_bytes = environment
+            .len()
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(core::mem::size_of::<u64>()))
+            .ok_or(Error::StackOverflow)?;
+        let auxv_offset = envp_offset
+            .checked_add(envp_bytes)
+            .ok_or(Error::StackOverflow)?;
+        let auxv_bytes = STARTUP_AUXV_ENTRIES
+            .checked_mul(2)
+            .and_then(|count| count.checked_mul(core::mem::size_of::<u64>()))
+            .ok_or(Error::StackOverflow)?;
 
         let stack_bottom = stack_top - MAX_STACK_BYTES;
         let mut bytes = [0; MAX_STACK_BYTES];
@@ -204,10 +231,36 @@ impl InitialStack {
         if stack_pointer < stack_bottom {
             return Err(Error::StackOverflow);
         }
+        let block_size = stack_top
+            .checked_sub(stack_pointer)
+            .ok_or(Error::StackOverflow)?;
+        let strings_offset = string_base
+            .checked_sub(stack_pointer)
+            .ok_or(Error::StackOverflow)?;
+        if strings_offset < auxv_offset + auxv_bytes
+            || strings_offset
+                .checked_add(string_length)
+                .ok_or(Error::StackOverflow)?
+                != block_size
+        {
+            return Err(Error::StackOverflow);
+        }
+
         let mut words = [0; MAX_STACK_WORDS];
-        let mut index = 0;
-        words[index] = arguments.len() as u64;
-        index += 1;
+        words[0] = STARTUP_MAGIC;
+        words[1] = STARTUP_VERSION;
+        words[2] = STARTUP_HEADER_BYTES as u64;
+        words[3] = block_size as u64;
+        words[4] = arguments.len() as u64;
+        words[5] = environment.len() as u64;
+        words[6] = argv_offset as u64;
+        words[7] = envp_offset as u64;
+        words[8] = auxv_offset as u64;
+        words[9] = STARTUP_AUXV_ENTRIES as u64;
+        words[10] = strings_offset as u64;
+        words[11] = string_length as u64;
+
+        let mut index = STARTUP_HEADER_WORDS;
         for pointer in argument_pointers.iter().take(arguments.len()) {
             words[index] = *pointer;
             index += 1;
@@ -238,7 +291,11 @@ impl InitialStack {
     }
 
     pub fn word(&self, index: usize) -> Option<u64> {
-        (index < self.word_count).then_some(self.words[index])
+        if index < self.word_count {
+            Some(self.words[index])
+        } else {
+            None
+        }
     }
 
     pub fn string_bytes(&self) -> &[u8] {
@@ -257,13 +314,7 @@ impl InitialStack {
         #[cfg(target_arch = "x86_64")]
         let (flags, arg0, arg1, arg2) = (0x202, 0, 0, 0);
         #[cfg(target_arch = "aarch64")]
-        let (flags, arg0, arg1, arg2) = (
-            0,
-            self.words[0],
-            (self.stack_pointer + core::mem::size_of::<u64>()) as u64,
-            (self.stack_pointer + core::mem::size_of::<u64>() * (2 + self.words[0] as usize))
-                as u64,
-        );
+        let (flags, arg0, arg1, arg2) = (0, 0, 0, 0);
         InitialRegisters {
             instruction_pointer: entry,
             stack_pointer: self.stack_pointer,
@@ -362,6 +413,9 @@ pub fn parse(image: &[u8], machine: Machine, load_bias: usize) -> Result<LoadPla
     let entry = load_bias
         .checked_add(usize_from_u64(entry_raw)?)
         .ok_or(Error::InvalidRange)?;
+    let program_headers = image
+        .get(program_header_offset..program_header_end)
+        .ok_or(Error::Truncated)?;
     let mut plan = LoadPlan {
         base: load_bias,
         entry,
@@ -369,20 +423,19 @@ pub fn parse(image: &[u8], machine: Machine, load_bias: usize) -> Result<LoadPla
         total_pages: 0,
         segments: [None; MAX_LOAD_SEGMENTS],
     };
-    for index in 0..program_header_count {
-        let offset = program_header_offset + index * PROGRAM_HEADER_SIZE;
-        if read_u32(image, offset)? != PT_LOAD {
+    for header in program_headers.chunks_exact(PROGRAM_HEADER_SIZE) {
+        if read_u32(header, 0)? != PT_LOAD {
             continue;
         }
         if plan.segment_count == MAX_LOAD_SEGMENTS {
             return Err(Error::TooManySegments);
         }
-        let flags_raw = read_u32(image, offset + 4)?;
-        let file_offset = read_u64(image, offset + 8)?;
-        let virtual_raw = read_u64(image, offset + 16)?;
-        let file_size = read_u64(image, offset + 32)?;
-        let memory_size = read_u64(image, offset + 40)?;
-        let alignment = read_u64(image, offset + 48)?;
+        let flags_raw = read_u32(header, 4)?;
+        let file_offset = read_u64(header, 8)?;
+        let virtual_raw = read_u64(header, 16)?;
+        let file_size = read_u64(header, 32)?;
+        let memory_size = read_u64(header, 40)?;
+        let alignment = read_u64(header, 48)?;
         if file_size > memory_size {
             return Err(Error::FileSizeExceedsMemory);
         }
@@ -485,13 +538,15 @@ fn interpreter(image: &[u8]) -> Result<Option<&[u8]>, Error> {
     if end > image.len() {
         return Err(Error::Truncated);
     }
-    for index in 0..program_header_count {
-        let offset = program_header_offset + index * PROGRAM_HEADER_SIZE;
-        if read_u32(image, offset)? != PT_INTERP {
+    let program_headers = image
+        .get(program_header_offset..end)
+        .ok_or(Error::Truncated)?;
+    for header in program_headers.chunks_exact(PROGRAM_HEADER_SIZE) {
+        if read_u32(header, 0)? != PT_INTERP {
             continue;
         }
-        let file_offset = usize_from_u64(read_u64(image, offset + 8)?)?;
-        let file_size = usize_from_u64(read_u64(image, offset + 32)?)?;
+        let file_offset = usize_from_u64(read_u64(header, 8)?)?;
+        let file_size = usize_from_u64(read_u64(header, 32)?)?;
         if file_size == 0 || file_size > MAX_INTERPRETER {
             return Err(Error::InterpreterTooLong);
         }
@@ -535,8 +590,14 @@ fn place_string(
         return Err(Error::StackOverflow);
     }
     let offset = start - stack_bottom;
-    bytes[offset..offset + string.len()].copy_from_slice(string);
-    bytes[offset + string.len()] = 0;
+    let string_end = offset
+        .checked_add(string.len())
+        .ok_or(Error::StackOverflow)?;
+    bytes
+        .get_mut(offset..string_end)
+        .ok_or(Error::StackOverflow)?
+        .copy_from_slice(string);
+    *bytes.get_mut(string_end).ok_or(Error::StackOverflow)? = 0;
     *cursor = start;
     *byte_count = byte_count.saturating_add(length);
     Ok(start as u64)
@@ -550,18 +611,23 @@ fn usize_from_u64(value: u64) -> Result<usize, Error> {
     }
 }
 
+fn slice_at(image: &[u8], offset: usize, width: usize) -> Result<&[u8], Error> {
+    let end = offset.checked_add(width).ok_or(Error::Truncated)?;
+    image.get(offset..end).ok_or(Error::Truncated)
+}
+
 fn read_u16(image: &[u8], offset: usize) -> Result<u16, Error> {
-    let bytes = image.get(offset..offset + 2).ok_or(Error::Truncated)?;
+    let bytes = slice_at(image, offset, 2)?;
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 fn read_u32(image: &[u8], offset: usize) -> Result<u32, Error> {
-    let bytes = image.get(offset..offset + 4).ok_or(Error::Truncated)?;
+    let bytes = slice_at(image, offset, 4)?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 fn read_u64(image: &[u8], offset: usize) -> Result<u64, Error> {
-    let bytes = image.get(offset..offset + 8).ok_or(Error::Truncated)?;
+    let bytes = slice_at(image, offset, 8)?;
     Ok(u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]))
@@ -712,6 +778,47 @@ pub(crate) fn load_bias_for_image(image: &[u8], dynamic_bias: usize, seed: u64) 
     }
 }
 
+const MALFORMED_FUZZ_CASES: usize = 512;
+
+fn fuzz_next(state: &mut u64) -> u64 {
+    *state ^= *state << 7;
+    *state ^= *state >> 9;
+    *state
+}
+
+fn malformed_image_fuzz_self_check() {
+    let machine = Machine::current();
+    let seed = contract_image(machine);
+    let mut image = seed;
+    let mut state = 0x9e37_79b9_7f4a_7c15;
+    for case in 0..MALFORMED_FUZZ_CASES {
+        image.copy_from_slice(&seed);
+        if case % 8 == 0 {
+            for byte in &mut image {
+                *byte = fuzz_next(&mut state) as u8;
+            }
+        } else {
+            let flips = 1 + (fuzz_next(&mut state) as usize & 7);
+            for _ in 0..flips {
+                let index = fuzz_next(&mut state) as usize % image.len();
+                image[index] ^= fuzz_next(&mut state) as u8 | 1;
+            }
+        }
+        match case % 4 {
+            0 => write_u64(&mut image, 32, u64::MAX),
+            1 => write_u16(&mut image, 56, u16::MAX),
+            2 => write_u64(&mut image, ELF_HEADER_SIZE + 32, u64::MAX),
+            _ => write_u64(&mut image, 24, u64::MAX),
+        }
+        let _ = parse(&image, machine, 0);
+        let _ = select_interpreter(&image, None);
+    }
+
+    assert_eq!(read_u16(&[], usize::MAX), Err(Error::Truncated));
+    assert_eq!(read_u32(&[], usize::MAX), Err(Error::Truncated));
+    assert_eq!(read_u64(&[], usize::MAX), Err(Error::Truncated));
+}
+
 pub fn contract_self_check() {
     let _machines = [Machine::X86_64, Machine::Aarch64];
     let _errors = [
@@ -835,4 +942,5 @@ pub fn contract_self_check() {
         parse(&image[..PAGE_SIZE + 3], Machine::current(), 0),
         Err(Error::FileRangeOverflow)
     );
+    malformed_image_fuzz_self_check();
 }

@@ -5,6 +5,9 @@ edition = "2021"
 license = "GPL-3.0-only"
 
 [dependencies]
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["fast"] }
+
+sha2 = { version = "0.10.9", default-features = false, features = ["force-soft"] }
 
 [profile.dev]
 panic = "abort"

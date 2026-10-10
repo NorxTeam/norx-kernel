@@ -1,3 +1,4 @@
+use crate::capability::{CapabilityHandle, CapabilityTable, ResourceLimits, SessionHandle};
 use crate::drivers::framework::{
     self, Bus, BusKind, Class, Device, DeviceState, DmaBuffer, DmaDirection, Driver, DriverError,
     DriverOps, Resource,
@@ -30,6 +31,7 @@ pub enum Error {
     NotUserThread,
     Process(crate::process::Error),
     Driver(DriverError),
+    Authority(crate::capability::Error),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +49,11 @@ struct ServiceRecord {
     state: ServiceState,
     endpoint_active: bool,
     restarts: u8,
+    session: SessionHandle,
+    endpoint: Option<CapabilityHandle>,
+    supervisor_endpoint: Option<CapabilityHandle>,
+    device_capability: Option<CapabilityHandle>,
+    dma_capability: Option<CapabilityHandle>,
 }
 
 type DeviceId = framework::DeviceId;
@@ -54,6 +61,7 @@ type DeviceId = framework::DeviceId;
 pub struct Supervisor {
     records: [Option<ServiceRecord>; MAX_SERVICES],
     generations: [u16; MAX_SERVICES],
+    authority: CapabilityTable,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -73,6 +81,7 @@ impl Supervisor {
         Self {
             records: [None; MAX_SERVICES],
             generations: [0; MAX_SERVICES],
+            authority: CapabilityTable::new(),
         }
     }
 
@@ -105,6 +114,10 @@ impl Supervisor {
             .position(Option::is_none)
             .ok_or(Error::Capacity)?;
         let generation = self.generations[slot];
+        let session = self
+            .authority
+            .create_session(process, ResourceLimits::DEFAULT)
+            .map_err(Error::Authority)?;
         self.records[slot] = Some(ServiceRecord {
             device: device.id,
             driver,
@@ -113,6 +126,11 @@ impl Supervisor {
             state: ServiceState::Registered,
             endpoint_active: false,
             restarts: 0,
+            session,
+            endpoint: None,
+            supervisor_endpoint: None,
+            device_capability: None,
+            dma_capability: None,
         });
         Ok(ServiceHandle {
             slot: slot as u8,
@@ -133,8 +151,40 @@ impl Supervisor {
             return Err(Error::InvalidState);
         }
         self.validate_process(processes, record.process, record.thread)?;
+        let device_capability = self
+            .authority
+            .create_device(record.process, record.session, device.id)
+            .map_err(Error::Authority)?;
+        let (endpoint, supervisor_endpoint) =
+            match self
+                .authority
+                .create_ipc_pair(record.process, ProcessId::INIT, record.session)
+            {
+                Ok(pair) => pair,
+                Err(error) => {
+                    let _ = self.authority.close(record.process, device_capability);
+                    return Err(Error::Authority(error));
+                }
+            };
+        let dma_capability =
+            match self
+                .authority
+                .create_dma(record.process, record.session, device_capability, 4096)
+            {
+                Ok(capability) => capability,
+                Err(error) => {
+                    let _ = self.authority.close(record.process, endpoint);
+                    let _ = self.authority.close(ProcessId::INIT, supervisor_endpoint);
+                    let _ = self.authority.close(record.process, device_capability);
+                    return Err(Error::Authority(error));
+                }
+            };
         record.state = ServiceState::Running;
         record.endpoint_active = true;
+        record.endpoint = Some(endpoint);
+        record.supervisor_endpoint = Some(supervisor_endpoint);
+        record.device_capability = Some(device_capability);
+        record.dma_capability = Some(dma_capability);
         self.records[slot] = Some(record);
         Ok(())
     }
@@ -150,11 +200,19 @@ impl Supervisor {
         if record.state != ServiceState::Running {
             return Err(Error::InvalidState);
         }
-        if let Err(error) = framework::quiesce(device, driver) {
+        let framework_result = framework::quiesce(device, driver);
+        let revoke_result = self.revoke_runtime_capabilities(&mut record);
+        if let Err(error) = framework_result {
             record.state = ServiceState::Failed;
             record.endpoint_active = false;
             self.records[slot] = Some(record);
             return Err(Error::Driver(error));
+        }
+        if let Err(error) = revoke_result {
+            record.state = ServiceState::Failed;
+            record.endpoint_active = false;
+            self.records[slot] = Some(record);
+            return Err(error);
         }
         record.state = ServiceState::Quiescing;
         record.endpoint_active = false;
@@ -185,8 +243,23 @@ impl Supervisor {
         if device.state != DeviceState::Removed || !device.resources().is_empty() {
             failure.get_or_insert(Error::InvalidState);
         }
+        if let Err(error) = self.revoke_runtime_capabilities(&mut record) {
+            failure.get_or_insert(error);
+        }
+        if let Err(error) = self.authority.revoke_session(record.session) {
+            failure.get_or_insert(Error::Authority(error));
+        }
+        if let Err(error) = self
+            .authority
+            .close(record.process, record.session.capability())
+        {
+            failure.get_or_insert(Error::Authority(error));
+        }
+        if let Err(error) = self.authority.revoke_owner(record.process) {
+            failure.get_or_insert(Error::Authority(error));
+        }
         match processes.process_state(record.process) {
-            Ok(ProcessState::Running) => {
+            Ok(ProcessState::Running | ProcessState::Stopped) => {
                 if let Err(error) = processes.exit(record.process, 0) {
                     failure.get_or_insert(Error::Process(error));
                 }
@@ -228,11 +301,24 @@ impl Supervisor {
             return Err(Error::RestartLimit);
         }
         self.validate_process(processes, process, thread)?;
+        let session = self
+            .authority
+            .create_session(process, ResourceLimits::DEFAULT)
+            .map_err(Error::Authority)?;
         framework::probe(device, driver).map_err(Error::Driver)?;
-        framework::publish(device).map_err(Error::Driver)?;
+        if let Err(error) = framework::publish(device) {
+            let _ = self.authority.revoke_session(session);
+            let _ = self.authority.close(process, session.capability());
+            return Err(Error::Driver(error));
+        }
         record.driver = driver;
         record.process = process;
         record.thread = thread;
+        record.session = session;
+        record.endpoint = None;
+        record.supervisor_endpoint = None;
+        record.device_capability = None;
+        record.dma_capability = None;
         record.state = ServiceState::Registered;
         record.endpoint_active = false;
         record.restarts = record.restarts.saturating_add(1);
@@ -269,13 +355,19 @@ impl Supervisor {
     }
 
     pub fn unregister(&mut self, handle: ServiceHandle) -> Result<(), Error> {
-        let (slot, record) = self.record(handle)?;
+        let (slot, mut record) = self.record(handle)?;
         if matches!(
             record.state,
             ServiceState::Running | ServiceState::Quiescing
         ) {
             return Err(Error::InvalidState);
         }
+        let _ = self.revoke_runtime_capabilities(&mut record);
+        let _ = self.authority.revoke_session(record.session);
+        let _ = self
+            .authority
+            .close(record.process, record.session.capability());
+        let _ = self.authority.revoke_owner(record.process);
         self.records[slot] = None;
         self.generations[slot] = self.generations[slot]
             .checked_add(1)
@@ -288,7 +380,13 @@ impl Supervisor {
     }
 
     pub fn endpoint_active(&self, handle: ServiceHandle) -> Result<bool, Error> {
-        Ok(self.record(handle)?.1.endpoint_active)
+        let record = self.record(handle)?.1;
+        Ok(record.endpoint_active
+            && record.endpoint.is_some_and(|endpoint| {
+                self.authority
+                    .info(record.process, endpoint)
+                    .is_ok_and(|info| info.active)
+            }))
     }
 
     pub fn restart_count(&self, handle: ServiceHandle) -> Result<u8, Error> {
@@ -340,6 +438,28 @@ impl Supervisor {
         Ok(())
     }
 
+    fn revoke_runtime_capabilities(&mut self, record: &mut ServiceRecord) -> Result<(), Error> {
+        let mut first_error = None;
+        for (owner, capability) in [
+            (record.process, record.endpoint.take()),
+            (ProcessId::INIT, record.supervisor_endpoint.take()),
+            (record.process, record.dma_capability.take()),
+            (record.process, record.device_capability.take()),
+        ] {
+            let Some(capability) = capability else {
+                continue;
+            };
+            if let Err(error) = self.authority.revoke_kernel(capability) {
+                first_error.get_or_insert(Error::Authority(error));
+            }
+            if let Err(error) = self.authority.close(owner, capability) {
+                first_error.get_or_insert(Error::Authority(error));
+            }
+        }
+        record.endpoint_active = false;
+        first_error.map_or(Ok(()), Err)
+    }
+
     fn record(&self, handle: ServiceHandle) -> Result<(usize, ServiceRecord), Error> {
         let slot = handle.slot as usize;
         if slot >= MAX_SERVICES || self.generations[slot] != handle.generation {
@@ -357,14 +477,13 @@ fn service_probe(device: &mut Device) -> Result<(), DriverError> {
         size: 0x1000,
         owner: device.id,
     })?;
-    device.add_resource(Resource::Dma(DmaBuffer {
-        physical: crate::address::PhysAddr::new(0x2000),
-        virtual_address: crate::address::VirtAddr::new(0xffff_8000_0000_2000),
-        length: 4096,
-        alignment: 4096,
-        direction: DmaDirection::Bidirectional,
-        owner: device.id,
-    }))
+    device.add_resource(Resource::Dma(DmaBuffer::allocate(
+        device.id,
+        device.bus_kind,
+        4096,
+        4096,
+        DmaDirection::Bidirectional,
+    )?))
 }
 
 fn service_remove_ok(_device: &mut Device) -> Result<(), DriverError> {
@@ -384,13 +503,14 @@ pub fn contract_self_check() {
     };
     let (service_process, service_thread) =
         processes.spawn_child(init, service_credentials).unwrap();
-    let mut bus = Bus::new(120, "service-contract", BusKind::Platform);
+    // DMA lifecycle fixture uses the explicitly trusted virtio bus policy.
+    let mut bus = Bus::new(120, "service-contract", BusKind::Virtio);
     let mut device = Device::new(120, bus.id, bus.kind, "service-contract", Class::Network);
     let driver = Driver::with_ops(
         120,
         "service-contract",
         Class::Network,
-        BusKind::Platform,
+        BusKind::Virtio,
         DriverOps {
             probe: service_probe,
             suspend: None,
@@ -400,7 +520,7 @@ pub fn contract_self_check() {
         },
     );
     assert!(framework::discover(&mut bus, &mut device).is_ok());
-    assert!(framework::probe(&mut device, driver).is_ok());
+    framework::probe(&mut device, driver).expect("service contract probe");
     assert!(framework::publish(&mut device).is_ok());
 
     let mut supervisor = Supervisor::new();
@@ -1064,7 +1184,7 @@ pub fn vfs_image_prepare_smoke(path: &str) -> Result<(), SpawnError> {
     })
 }
 
-fn image_for_user_path<'a>(path: &'a str) -> Result<(&'static [u8], &'a str), SpawnError> {
+fn image_for_user_path(path: &str) -> Result<(&'static [u8], &str), SpawnError> {
     let image = match path {
         "/bin/rust-smoke" | "/bin/userspace-smoke" => {
             return Ok((crate::elf::representative_image(), "rust-smoke"));
@@ -1179,12 +1299,16 @@ pub fn spawn_user_path(path: &str) -> Result<u32, SpawnError> {
     })
 }
 
+// Convenience resumable wrapper is staged; syscall callers use the transaction path.
+#[allow(dead_code)]
 pub fn spawn_user_path_resumable(path: &str) -> Result<u32, SpawnError> {
     let label = user_path_label(path)?;
     let arguments = [label.as_bytes()];
     spawn_user_path_resumable_with_args(path, &arguments, &[])
 }
 
+// Convenience resumable wrapper is staged; syscall callers use the transaction path.
+#[allow(dead_code)]
 pub fn spawn_user_path_resumable_with_args(
     path: &str,
     arguments: &[&[u8]],
@@ -1193,14 +1317,21 @@ pub fn spawn_user_path_resumable_with_args(
     spawn_user_path_resumable_with_args_and_flags(path, arguments, environment, 0)
 }
 
+// Convenience resumable wrapper is staged; syscall callers use the transaction path.
+#[allow(dead_code)]
 pub fn spawn_user_path_resumable_with_args_and_flags(
     path: &str,
     arguments: &[&[u8]],
     environment: &[&[u8]],
     flags: u64,
 ) -> Result<u32, SpawnError> {
-    spawn_user_path_resumable_with_args_and_flags_transaction(path, arguments, environment, flags)
-        .map(|transaction| transaction.child.get())
+    let transaction = spawn_user_path_resumable_with_args_and_flags_transaction(
+        path,
+        arguments,
+        environment,
+        flags,
+    )?;
+    finalize_default_spawn(transaction)
 }
 
 pub fn spawn_user_path_resumable_with_args_and_flags_transaction(
@@ -1212,6 +1343,8 @@ pub fn spawn_user_path_resumable_with_args_and_flags_transaction(
     spawn_user_path_resumable_with_args_and_credentials(path, arguments, environment, flags, None)
 }
 
+// Delegated convenience wrapper is staged; syscall callers use the transaction path.
+#[allow(dead_code)]
 pub fn spawn_delegated_user_path_resumable_with_args(
     path: &str,
     arguments: &[&[u8]],
@@ -1219,14 +1352,14 @@ pub fn spawn_delegated_user_path_resumable_with_args(
     flags: u64,
     credentials: Credentials,
 ) -> Result<u32, SpawnError> {
-    spawn_delegated_user_path_resumable_with_args_transaction(
+    let transaction = spawn_delegated_user_path_resumable_with_args_transaction(
         path,
         arguments,
         environment,
         flags,
         credentials,
-    )
-    .map(|transaction| transaction.child.get())
+    )?;
+    finalize_default_spawn(transaction)
 }
 
 pub fn spawn_delegated_user_path_resumable_with_args_transaction(
@@ -1243,6 +1376,25 @@ pub fn spawn_delegated_user_path_resumable_with_args_transaction(
         flags,
         Some(credentials),
     )
+}
+
+fn rollback_spawn(transaction: crate::process::SpawnTransaction) {
+    let child = transaction.child;
+    let _ = crate::user_runtime::discard(child);
+    let _ = crate::process::rollback_spawn(transaction);
+}
+
+// Finalizer for staged convenience wrappers; transaction-aware syscall flow owns commit.
+#[allow(dead_code)]
+fn finalize_default_spawn(
+    transaction: crate::process::SpawnTransaction,
+) -> Result<u32, SpawnError> {
+    let child = transaction.child;
+    if crate::process::finalize_spawn(transaction, [0, 1, 2], false, None).is_err() {
+        let _ = crate::user_runtime::discard(child);
+        return Err(SpawnError::Runtime);
+    }
+    Ok(child.get())
 }
 
 fn spawn_user_path_resumable_with_args_and_credentials(
@@ -1280,33 +1432,35 @@ fn spawn_user_path_resumable_with_args_and_credentials(
             image,
             &plan,
             crate::address_space::AslrHook::new(53),
-            &arguments,
-            &environment,
+            arguments,
+            environment,
         ) {
             Ok(runtime) => runtime,
             Err(_) => {
-                let _ = crate::process::discard_child(transaction.parent, child);
+                rollback_spawn(transaction);
                 return Err(SpawnError::Runtime);
             }
         };
         let Some(root) = runtime.root_frame() else {
             let mut runtime = runtime;
             let _ = runtime.discard();
-            let _ = crate::process::discard_child(transaction.parent, child);
+            rollback_spawn(transaction);
             return Err(SpawnError::Runtime);
         };
         let mut runtime = runtime;
         if runtime.activate_for_resumable().is_err() {
             let _ = runtime.discard();
-            let _ = crate::process::discard_child(transaction.parent, child);
+            rollback_spawn(transaction);
             return Err(SpawnError::Runtime);
         }
-        if crate::process::attach_address_space(child, root).is_err()
-            || crate::user_runtime::install(child, runtime).is_err()
-        {
-            let _ = crate::user_runtime::discard(child);
+        if crate::process::attach_address_space(child, root).is_err() {
+            let _ = runtime.discard();
+            rollback_spawn(transaction);
+            return Err(SpawnError::Runtime);
+        }
+        if crate::user_runtime::install(child, runtime).is_err() {
             let _ = crate::process::clear_address_space(child);
-            let _ = crate::process::discard_child(transaction.parent, child);
+            rollback_spawn(transaction);
             return Err(SpawnError::Runtime);
         }
         let registers = match crate::user_runtime::start(child) {
@@ -1314,14 +1468,14 @@ fn spawn_user_path_resumable_with_args_and_credentials(
             Err(_) => {
                 let _ = crate::user_runtime::discard(child);
                 let _ = crate::process::clear_address_space(child);
-                let _ = crate::process::discard_child(transaction.parent, child);
+                rollback_spawn(transaction);
                 return Err(SpawnError::Runtime);
             }
         };
         if crate::process::install_user_context(transaction.thread.get(), registers).is_err() {
             let _ = crate::user_runtime::discard(child);
             let _ = crate::process::clear_address_space(child);
-            let _ = crate::process::discard_child(transaction.parent, child);
+            rollback_spawn(transaction);
             return Err(SpawnError::Runtime);
         }
         Ok(transaction)

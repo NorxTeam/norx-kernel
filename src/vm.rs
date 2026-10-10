@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "Staged architecture and fault hooks are not all enabled in bootstrap"
+)]
+
 pub const LAZY_BASE: usize = 0xffff_9000_0000_0000;
 const LAZY_PAGES: usize = 16;
 const PAGE_SIZE: usize = 4096;
@@ -19,6 +24,21 @@ pub struct FaultInfo {
     pub write: bool,
     pub instruction: bool,
     pub user: bool,
+}
+
+impl FaultInfo {
+    pub const fn page_address(self) -> Option<usize> {
+        let page = self.address & !(PAGE_SIZE - 1);
+        if page >= PAGE_SIZE && page < crate::address_space::USER_LIMIT {
+            Some(page)
+        } else {
+            None
+        }
+    }
+
+    pub const fn is_translation(self) -> bool {
+        matches!(self.kind, FaultKind::Translation)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,9 +221,7 @@ pub fn classify_fault(fault: FaultInfo, resolved: bool) -> FaultResult {
     if resolved {
         FaultResult::Resolved
     } else if fault.user {
-        if fault.kind == FaultKind::Translation && is_lazy_address(fault.address) {
-            FaultResult::UserFault(FaultReason::OutOfMemory)
-        } else if fault.kind == FaultKind::Protection {
+        if matches!(fault.kind, FaultKind::Protection | FaultKind::AccessFlag) {
             FaultResult::UserFault(FaultReason::Protection)
         } else {
             FaultResult::UserFault(FaultReason::InvalidAddress)

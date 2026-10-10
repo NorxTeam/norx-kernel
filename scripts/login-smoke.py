@@ -20,8 +20,7 @@ def main() -> int:
     env["NORX_SMOKE_COMMAND"] = "/bin/login-smoke"
     env["NORX_SMOKE_EXPECT"] = (
         "LOGIN:BAD_CREDENTIALS\n"
-        "LOGIN:LOCKED\n"
-        "LOGIN:EXPIRED\n"
+        "LOGIN:ACCOUNT_DENIED\n"
         "LOGIN:AUTH_SUCCESS\n"
         "LOGIN:ENV_OK\n"
         "LOGIN:CWD_OK\n"

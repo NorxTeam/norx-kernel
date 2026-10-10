@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "Staged ABI and hardware hooks are not all enabled in the bootstrap profile"
+)]
+
 use core::arch::global_asm;
 
 const MAX_USER_CONTEXTS: usize = 64;
@@ -15,6 +20,8 @@ impl UserContext {
 static mut USER_CONTEXTS: [UserContext; MAX_USER_CONTEXTS] =
     [UserContext::EMPTY; MAX_USER_CONTEXTS];
 static mut CONTEXT_VALID: [bool; MAX_USER_CONTEXTS] = [false; MAX_USER_CONTEXTS];
+// The low bits select storage; the full generational ID owns the slot.
+static mut CONTEXT_THREAD_IDS: [u32; MAX_USER_CONTEXTS] = [0; MAX_USER_CONTEXTS];
 static mut SWITCH_FROM: u64 = 0;
 static mut SWITCH_TO: u64 = 0;
 #[no_mangle]
@@ -206,12 +213,13 @@ pub fn init() -> bool {
         norx_aarch64_kernel_return_x28_stack = [0; 4];
         norx_aarch64_kernel_return_x29_stack = [0; 4];
         CONTEXT_VALID = [false; MAX_USER_CONTEXTS];
+        CONTEXT_THREAD_IDS = [0; MAX_USER_CONTEXTS];
     }
     true
 }
 
 pub fn install_user_context(thread: u32, registers: crate::elf::InitialRegisters) -> bool {
-    let Some(index) = context_index(thread) else {
+    let Some(index) = context_slot(thread) else {
         return false;
     };
     unsafe {
@@ -223,6 +231,7 @@ pub fn install_user_context(thread: u32, registers: crate::elf::InitialRegisters
         context.registers[4] = registers.arg1;
         context.registers[5] = registers.arg2;
         USER_CONTEXTS[index] = context;
+        CONTEXT_THREAD_IDS[index] = thread;
         CONTEXT_VALID[index] = true;
     }
     true
@@ -239,7 +248,24 @@ pub fn has_user_context(thread: u32) -> bool {
     context_index(thread).is_some_and(|index| unsafe { CONTEXT_VALID[index] })
 }
 
+pub fn revoke_user_context(thread: u32) {
+    let Some(index) = context_index(thread) else {
+        return;
+    };
+    unsafe {
+        USER_CONTEXTS[index] = UserContext::EMPTY;
+        CONTEXT_THREAD_IDS[index] = 0;
+        CONTEXT_VALID[index] = false;
+    }
+}
+
 fn context_index(thread: u32) -> Option<usize> {
+    let slot = (thread & 0xffff) as usize;
+    let index = (slot != 0 && slot <= MAX_USER_CONTEXTS).then_some(slot - 1)?;
+    unsafe { (CONTEXT_VALID[index] && CONTEXT_THREAD_IDS[index] == thread).then_some(index) }
+}
+
+fn context_slot(thread: u32) -> Option<usize> {
     let slot = (thread & 0xffff) as usize;
     (slot != 0 && slot <= MAX_USER_CONTEXTS).then_some(slot - 1)
 }
@@ -265,6 +291,22 @@ pub fn enter_user(registers: crate::elf::InitialRegisters) -> bool {
     true
 }
 
+pub fn context_contract_self_check() {
+    // Real generation/reap checks live in process::contract_self_check.
+    assert!(!has_user_context(0));
+    assert!(!install_user_context(
+        0,
+        crate::elf::InitialRegisters {
+            instruction_pointer: 1,
+            stack_pointer: 2,
+            flags: 0,
+            arg0: 0,
+            arg1: 0,
+            arg2: 0,
+        }
+    ));
+}
+
 #[no_mangle]
 extern "C" fn norx_aarch64_usercopy_fault(rip: u64) -> u64 {
     let exception = crate::arch::tables::exception_state();
@@ -274,11 +316,7 @@ extern "C" fn norx_aarch64_usercopy_fault(rip: u64) -> u64 {
         exception.saved_program_status & 0xf == 0,
     );
     let _ = crate::vm::classify_fault(fault, false);
-    let recovery_address = if crate::usercopy::handles_fault(rip) {
-        crate::usercopy::recovery_address()
-    } else {
-        0
-    };
+    let recovery_address = crate::usercopy::fault_recovery(rip).unwrap_or(0);
     crate::arch::tables::record_usercopy_fault(exception, recovery_address);
     recovery_address
 }

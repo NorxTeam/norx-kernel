@@ -16,6 +16,9 @@ The marker covers these existing contracts:
   versioned `ramfs /hello.txt readback passed` marker on both architectures.
 - The process contract creates a child and kernel thread, switches threads,
   checks credentials/FDs/capabilities, then exits and waits for the child.
+- The native runtime contract serializes its fixed slot store with the shared
+  SMP lock and refuses to resolve a recycled process ID before it can start,
+  fault, take, or discard the runtime owned by the prior generation.
 - `AddressSpace` maps executable/read-write pages and the guarded stack,
   rejects W^X and invalid/fault addresses, grows the stack, and tears down all
   mappings.
@@ -24,7 +27,8 @@ The marker covers these existing contracts:
 - Dynamic linking validates VFS-only library discovery, a relocation and TLS,
   then runs the one-library/missing-dependency smoke. The Wasm interpreter runs
   the portable sample and deterministic memory/cancellation traps.
-- Syscall/usercopy checks cover negative errno, invalid user ranges and the
+- Syscall/usercopy checks cover negative errno, invalid user ranges, mapped and
+  unmapped active user pages, per-CPU fault-frame recovery, and the
   architecture-specific entry boundary; process and address-space checks cover
   permission and teardown behavior.
 
@@ -37,6 +41,11 @@ rust-smoke: external userspace ELF exited cleanly
 c-runtime: external userspace ELF exited cleanly
 cxx-runtime: external userspace ELF exited cleanly
 ```
+
+The C++ fixture also emits `userspace: c-atexit` followed by
+`userspace: cxx-destructor`; those markers prove that normal `exit` drains the
+bounded callback registry. `_Exit`/`abort` remain immediate and do not run
+handlers.
 
 The aarch64 timer gate also emits `NORX_AARCH64_GIC_TIMER_IRQ_OK v=1` only
 after the DTB-discovered GIC has acknowledged at least eight generic-timer
@@ -69,14 +78,21 @@ probe:
 - boot hand-off rejects truncated or malformed Multiboot2 tags on x86_64,
   malformed FDT headers and cell counts on aarch64, and invalid framebuffer
   ranges on both architectures;
+- the physical-frame allocator rejects aligned but never-allocated or
+  firmware/kernel/device frames, rejects duplicate returns, and serializes
+  ownership updates across CPUs;
 - MMIO, PIO, and DMA helpers reject zero-sized, overflowing, unaligned, and
   out-of-range accesses without dereferencing them;
 - the driver framework rejects invalid resource ranges and DMA ownership or
   direction, while block, virtio-net, virtio-gpu, and xHCI checks reject bad
   queue or descriptor shapes, unsupported features, and unavailable operations;
+- the block contract keeps a timed-out request quarantined, rejects stale
+  completion generations, releases only after delayed completion or confirmed
+  cancellation, and keeps caller buffers out of lower-driver DMA ownership;
 - FAT32, ext4, btrfs, ELF, dynamic-loader, Wasm, syscall, and usercopy
   contracts exercise malformed metadata, broken images, invalid pointers,
-  permission failures, and deterministic traps;
+  permission failures, deterministic traps, and the bounded ELF/dynamic
+  mutational fuzz no-panic checks;
 - the interrupt contract drives the bounded storm path and verifies that
   delivery accounting remains consistent under concurrent-style re-entry.
 - the driver IRQ contract verifies generation-bearing ownership, owner-checked
@@ -91,6 +107,12 @@ is emitted only after all groups have returned successfully:
 ```text
 interrupt, MMIO, PIO, and DMA boundary checks passed
 boot hand-off and parser boundary checks passed
+```
+
+The block request contract also emits:
+
+```text
+NORX_BLOCK_REQUEST_CONTRACT_OK v=1 bounce=1 quarantine=1 generation=1 delayed=1 cancellation=1
 ```
 
 ## Bounded storage persistence smoke
@@ -116,6 +138,12 @@ CI boots twice against the same image and asserts that the second `previous`
 value equals the first sequence. This is evidence for the fixed-file FAT32
 vertical only; it is not a claim of a complete persistent VFS, ext4/btrfs
 writer, allocator, journal-recovery path, or general POSIX filesystem ABI.
+
+The writable FAT32 VFS smoke also opens a temporary file, verifies that rename
+returns `Busy` while its handle is live and that the handle still reads the old
+contents, then closes it, renames it, recreates the old pathname, and verifies
+that the two reopened paths read different contents. This is the current
+immutable-handle contract for persistent VFS adapters.
 
 ## Serial and framebuffer artifacts
 

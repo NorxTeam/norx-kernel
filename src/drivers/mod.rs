@@ -158,6 +158,9 @@ pub fn init(framebuffer: Option<crate::boot::RawFramebuffer>) -> bool {
         display::MODE_CONTRACT_VERSION
     ));
     block::contract_self_check();
+    crate::bootlog::ok(
+        "NORX_BLOCK_REQUEST_CONTRACT_OK v=1 bounce=1 quarantine=1 generation=1 delayed=1 cancellation=1",
+    );
     let mut ok = true;
     let serial_state = if serial::available() {
         framework::DeviceState::Ready

@@ -1,4 +1,4 @@
-use crate::drivers::framework::{DmaBuffer, DmaDirection};
+use crate::drivers::framework::{BusKind, DmaBuffer, DmaDirection};
 use crate::drivers::pci;
 use crate::io::PioRegion;
 
@@ -8,6 +8,7 @@ const NABM_SIZE: u16 = 0x0100;
 const PCM_RATE: u16 = 48_000;
 const PCM_BYTES: usize = 4096;
 const RING_ENTRIES: usize = 4;
+const DMA_DEVICE_ID: crate::drivers::framework::DeviceId = 8;
 
 const NAM_RESET: usize = 0x00;
 const NAM_MASTER_VOLUME: usize = 0x02;
@@ -89,50 +90,46 @@ pub enum InitResult {
     Failed(AudioError),
 }
 
-#[derive(Clone, Copy)]
 struct DmaPage {
+    dma: Option<DmaBuffer>,
     physical: u64,
     virtual_address: usize,
 }
 
 impl DmaPage {
     fn new() -> Result<Self, AudioError> {
-        let physical = crate::memory::alloc_frame().ok_or(AudioError::DmaUnavailable)?;
-        let virtual_address =
-            crate::arch::physical_to_virtual(crate::address::PhysAddr::new(physical))
-                .ok_or(AudioError::DmaUnavailable)?
-                .value();
+        let dma = DmaBuffer::allocate(
+            DMA_DEVICE_ID,
+            BusKind::Pci,
+            4096,
+            4096,
+            DmaDirection::Bidirectional,
+        )
+        .map_err(|_| AudioError::DmaUnavailable)?;
+        let physical = dma.physical().value();
+        let virtual_address = dma.virtual_address().value();
         let page = Self {
+            dma: Some(dma),
             physical,
             virtual_address,
         };
         page.clear();
-        page.buffer()
-            .validate()
-            .map_err(|_| AudioError::DmaUnavailable)?;
         Ok(page)
     }
 
-    fn buffer(self) -> DmaBuffer {
-        DmaBuffer {
-            physical: crate::address::PhysAddr::new(self.physical),
-            virtual_address: crate::address::VirtAddr::new(self.virtual_address),
-            length: 4096,
-            alignment: 4096,
-            direction: DmaDirection::Bidirectional,
-            owner: 0,
-        }
+    fn sync_for_device(&self) -> Result<(), AudioError> {
+        self.dma
+            .as_ref()
+            .ok_or(AudioError::DmaUnavailable)?
+            .sync_for_device()
+            .map_err(|_| AudioError::DmaUnavailable)
     }
 
-    fn sync_for_device(self) -> Result<(), AudioError> {
-        unsafe { self.buffer().sync_for_device() }.map_err(|_| AudioError::DmaUnavailable)
-    }
-
-    fn clear(self) {
+    fn clear(&self) {
         unsafe { core::ptr::write_bytes(self.virtual_address as *mut u8, 0, 4096) };
     }
 
-    fn write_u16(self, offset: usize, value: u16) {
+    fn write_u16(&self, offset: usize, value: u16) {
         assert!(offset + 2 <= 4096 && offset.is_multiple_of(2));
         unsafe {
             (self.virtual_address as *mut u16)
@@ -141,7 +138,7 @@ impl DmaPage {
         }
     }
 
-    fn write_u32(self, offset: usize, value: u32) {
+    fn write_u32(&self, offset: usize, value: u32) {
         assert!(offset + 4 <= 4096 && offset.is_multiple_of(4));
         unsafe {
             (self.virtual_address as *mut u32)
@@ -213,7 +210,7 @@ pub fn submit_pcm(samples: &[i16]) -> Result<(), AudioError> {
         let Some(runtime) = (&mut *core::ptr::addr_of_mut!(RUNTIME)).as_mut() else {
             return Err(AudioError::SilentFallback);
         };
-        let page = runtime.data[0];
+        let page = &runtime.data[0];
         page.clear();
         for (index, sample) in samples.iter().copied().enumerate() {
             page.write_u16(index * 2, sample as u16);
@@ -274,10 +271,11 @@ impl Runtime {
         let extended_audio_id = nam
             .read_u16(NAM_EXTENDED_AUDIO_ID)
             .ok_or(AudioError::RegisterAccess)?;
-        let mut data = [DmaPage {
+        let mut data = core::array::from_fn(|_| DmaPage {
+            dma: None,
             physical: 0,
             virtual_address: 0,
-        }; RING_ENTRIES];
+        });
         for page in &mut data {
             *page = DmaPage::new()?;
         }

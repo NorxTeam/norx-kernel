@@ -34,8 +34,10 @@ wait reference.
 
 The scheduler selects `TaskId`, while the task owns a `ThreadId`; a thread
 owns the saved register context and a user thread points at one process
-address space. The process-table contract charges running threads, makes
-block/wakeup and preemption explicit, and validates a switch only from
+address space. Architecture context slots store and validate the complete
+generational `ThreadId`, and thread destruction revokes the matching slot
+before it can be reused. The process-table contract charges running threads,
+makes block/wakeup and preemption explicit, and validates a switch only from
 `Running` to `Ready` and `Ready` to `Running`. x86_64 and AArch64 now save the
 syscall-boundary register frame and install the selected process address space
 before returning to user mode. Timer preemption, blocking wait queues, and

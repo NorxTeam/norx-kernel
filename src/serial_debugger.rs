@@ -955,16 +955,13 @@ fn vfs(debugger: &mut SerialDebugger, args: &[&str]) {
     ));
     crate::vfs::list_mounts(|info| {
         debugger.write_fmt(format_args!(
-            "mount id={} ns={:?} parent={:?} source={:?} propagation={:?} ro={} noexec={} nosuid={} nodev={}\n",
+            "mount id={} ns={:?} parent={:?} source={:?} propagation={:?} ro={}\n",
             info.id.raw(),
             info.namespace,
             info.parent,
             info.source,
             info.propagation,
             info.flags.read_only,
-            info.flags.no_exec,
-            info.flags.no_suid,
-            info.flags.no_dev,
         ));
     });
 }

@@ -16,6 +16,12 @@ current guard page, up to eight pages. `AslrHook` provides a deterministic,
 seeded base-selection hook for a later entropy source; it never accepts a range
 outside the user limit.
 
-The contract is exercised during boot on x86_64 and aarch64. Actual CR3/TTBR0
-installation and user-mode context switching are intentionally not performed
-yet; those belong to the thread/context-switch work that follows this model.
+The contract is exercised during boot on x86_64 and aarch64. Runtime entry
+activates the process root, switches CR3/TTBR0, and restores the kernel root on
+return. This remains a separate-address-space boundary; it is not evidence
+that mutually untrusted native processes can share one root. See
+[`single-address-space-evaluation.md`](single-address-space-evaluation.md) for
+the gated co-location decision.
+Optional ARM64 MTE and x86 LAM/MPK hardening is a separate, disabled design
+surface; see [hardware-hardening.md](hardware-hardening.md). It cannot replace
+this page-table and usercopy boundary.

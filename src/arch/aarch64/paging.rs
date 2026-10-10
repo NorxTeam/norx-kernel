@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "Staged ABI and hardware hooks are not all enabled in the bootstrap profile"
+)]
+
 use core::arch::asm;
 
 const PAGE_SIZE: u64 = 4096;
@@ -151,38 +156,45 @@ pub fn user_space_map(
         (mapping.virtual_address >> 12) & 0x1ff,
     ];
     let mut table = root.value();
-    for index in indices[..3].iter().copied() {
+    let mut created = [None; 3];
+    let mut parents = [core::ptr::null_mut(); 3];
+    for (depth, index) in indices[..3].iter().copied().enumerate() {
         let Some(table_ptr) = table_ptr(table) else {
+            unsafe { rollback_user_tables(&created, &parents, tables) };
             return false;
         };
-        let descriptor = unsafe { table_ptr.add(index).read_volatile() };
+        let entry = unsafe { table_ptr.add(index) };
+        parents[depth] = entry;
+        let descriptor = unsafe { entry.read_volatile() };
         if descriptor & VALID != 0 {
             if descriptor & TABLE_OR_PAGE != TABLE_OR_PAGE {
+                unsafe { rollback_user_tables(&created, &parents, tables) };
                 return false;
             }
             let next = descriptor & ADDRESS_MASK;
             if !owned_table(tables, next) {
+                unsafe { rollback_user_tables(&created, &parents, tables) };
                 return false;
             }
             table = next;
         } else {
             let Some(next) = allocate_table(tables) else {
+                unsafe { rollback_user_tables(&created, &parents, tables) };
                 return false;
             };
-            unsafe {
-                table_ptr
-                    .add(index)
-                    .write_volatile(next | VALID | TABLE_OR_PAGE)
-            };
+            unsafe { entry.write_volatile(next | VALID | TABLE_OR_PAGE) };
+            created[depth] = Some(next);
             table = next;
         }
     }
 
     let Some(leaf_table_ptr) = table_ptr(table) else {
+        unsafe { rollback_user_tables(&created, &parents, tables) };
         return false;
     };
     let slot = unsafe { leaf_table_ptr.add(indices[3]) };
     if unsafe { slot.read_volatile() } & VALID != 0 {
+        unsafe { rollback_user_tables(&created, &parents, tables) };
         return false;
     }
     let mut descriptor = mapping.physical_frame.value() & ADDRESS_MASK;
@@ -215,13 +227,10 @@ pub fn user_space_unmap(
         (virtual_address >> 12) & 0x1ff,
     ];
     let mut table = root.value();
-    let mut child_tables = [0u64; 3];
-    let mut parent_entries = [core::ptr::null_mut(); 3];
-    for (depth, index) in indices[..3].iter().copied().enumerate() {
+    for index in indices[..3].iter().copied() {
         let Some(table_ptr) = table_ptr(table) else {
             return false;
         };
-        parent_entries[depth] = unsafe { table_ptr.add(index) };
         let descriptor = unsafe { table_ptr.add(index).read_volatile() };
         if descriptor & (VALID | TABLE_OR_PAGE) != (VALID | TABLE_OR_PAGE) {
             return false;
@@ -230,7 +239,6 @@ pub fn user_space_unmap(
         if !owned_table(owned_tables, table) {
             return false;
         }
-        child_tables[depth] = table;
     }
     let Some(leaf_table_ptr) = table_ptr(table) else {
         return false;
@@ -241,30 +249,60 @@ pub fn user_space_unmap(
     }
     unsafe { slot.write_volatile(0) };
     flush_tlb();
-    for depth in (0..3).rev() {
-        let Some(child_table_ptr) = table_ptr(child_tables[depth]) else {
-            break;
-        };
-        let empty = unsafe {
-            (0..TABLE_ENTRIES).all(|index| child_table_ptr.add(index).read_volatile() & VALID == 0)
-        };
-        if !empty {
-            break;
-        }
-        let entry = parent_entries[depth];
-        let Some(slot_index) = owned_tables.iter().position(|slot| {
-            slot.as_ref()
-                .is_some_and(|frame| frame.value() == child_tables[depth])
-        }) else {
-            return false;
-        };
-        let frame = owned_tables[slot_index].expect("owned page table");
-        if !crate::memory::free_frame(frame.value()) {
-            return false;
-        }
-        unsafe { entry.write_volatile(0) };
-        owned_tables[slot_index] = None;
+    true
+}
+
+pub fn user_space_protect(
+    root: crate::address::PhysAddr,
+    virtual_address: usize,
+    flags: crate::address_space::PageFlags,
+) -> bool {
+    if !flags.is_valid()
+        || !virtual_address.is_multiple_of(PAGE_SIZE as usize)
+        || !(crate::address_space::PAGE_SIZE..crate::address_space::USER_LIMIT)
+            .contains(&virtual_address)
+    {
+        return false;
     }
+    let indices = [
+        (virtual_address >> 39) & 0x1ff,
+        (virtual_address >> 30) & 0x1ff,
+        (virtual_address >> 21) & 0x1ff,
+        (virtual_address >> 12) & 0x1ff,
+    ];
+    let mut table = root.value();
+    for index in indices[..3].iter().copied() {
+        let Some(table_ptr) = table_ptr(table) else {
+            return false;
+        };
+        let descriptor = unsafe { table_ptr.add(index).read_volatile() };
+        if descriptor & (VALID | TABLE_OR_PAGE) != (VALID | TABLE_OR_PAGE) {
+            return false;
+        }
+        table = descriptor & ADDRESS_MASK;
+        if table == 0 {
+            return false;
+        }
+    }
+    let Some(leaf_table_ptr) = table_ptr(table) else {
+        return false;
+    };
+    let slot = unsafe { leaf_table_ptr.add(indices[3]) };
+    let old = unsafe { slot.read_volatile() };
+    if old & VALID == 0 {
+        return false;
+    }
+    let mut descriptor = old & !(AP_USER_RW | AP_USER_RO | UXN);
+    descriptor |= if flags.writable {
+        AP_USER_RW
+    } else {
+        AP_USER_RO
+    };
+    if !flags.executable {
+        descriptor |= UXN;
+    }
+    unsafe { slot.write_volatile(descriptor) };
+    flush_tlb();
     true
 }
 
@@ -396,6 +434,27 @@ fn allocate_table(tables: &mut [Option<crate::address::PhysAddr>]) -> Option<u64
 
 fn owned_table(tables: &[Option<crate::address::PhysAddr>], frame: u64) -> bool {
     tables.iter().flatten().any(|entry| entry.value() == frame)
+}
+
+unsafe fn rollback_user_tables(
+    created: &[Option<u64>; 3],
+    parents: &[*mut u64; 3],
+    tables: &mut [Option<crate::address::PhysAddr>],
+) {
+    for depth in (0..3).rev() {
+        let Some(frame) = created[depth] else {
+            continue;
+        };
+        parents[depth].write_volatile(0);
+        if crate::memory::free_frame(frame) {
+            if let Some(slot) = tables
+                .iter()
+                .position(|entry| entry.is_some_and(|entry| entry.value() == frame))
+            {
+                tables[slot] = None;
+            }
+        }
+    }
 }
 
 fn table_ptr(frame: u64) -> Option<*mut u64> {

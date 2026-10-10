@@ -57,6 +57,7 @@ pub struct Mount {
     reader: ReadSector,
     writer: Option<WriteSector>,
     base_lba: u64,
+    available_sectors: u64,
     reserved_sectors: u16,
     fat_count: u8,
     fat_size: u32,
@@ -72,6 +73,8 @@ pub struct FileInfo {
     pub directory: bool,
     pub cluster: u32,
     pub size: u64,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -301,6 +304,9 @@ impl Mount {
         base_lba: u64,
         available_sectors: u64,
     ) -> Result<Self, Error> {
+        if available_sectors == 0 || base_lba.checked_add(available_sectors).is_none() {
+            return Err(Error::InvalidBpb);
+        }
         let mut bpb = [0u8; BYTES_PER_SECTOR];
         if !reader(base_lba, &mut bpb) {
             return Err(Error::Io);
@@ -353,8 +359,7 @@ impl Mount {
         let cluster_count = ((total_sectors - first_data_sector) / sectors_per_cluster as u64)
             .try_into()
             .map_err(|_| Error::InvalidBpb)?;
-        if cluster_count < 65_525
-            || cluster_count > MAX_DATA_CLUSTER - 1
+        if !(65_525..=MAX_DATA_CLUSTER - 1).contains(&cluster_count)
             || (cluster_count as u64 + 2) * 4 > fat_size as u64 * BYTES_PER_SECTOR as u64
             || root_cluster > cluster_count + 1
         {
@@ -364,6 +369,7 @@ impl Mount {
             reader,
             writer,
             base_lba,
+            available_sectors,
             reserved_sectors,
             fat_count,
             fat_size,
@@ -413,6 +419,8 @@ impl Mount {
                 directory: true,
                 cluster: self.root_cluster,
                 size: 0,
+                uid: 0,
+                gid: 0,
             });
         }
         let mut directory_cluster = self.root_cluster;
@@ -423,6 +431,8 @@ impl Mount {
                     directory: entry.directory,
                     cluster: entry.cluster,
                     size: entry.size as u64,
+                    uid: 0,
+                    gid: 0,
                 });
             }
             if !entry.directory {
@@ -500,7 +510,7 @@ impl Mount {
         }
         let cluster_bytes = self.sectors_per_cluster as usize * BYTES_PER_SECTOR;
         let required_clusters = input.len() / cluster_bytes
-            + if input.len() % cluster_bytes == 0 {
+            + if input.len().is_multiple_of(cluster_bytes) {
                 0
             } else {
                 1
@@ -508,8 +518,18 @@ impl Mount {
         if required_clusters > self.cluster_count as usize {
             return Err(Error::NoSpace);
         }
+        if required_clusters > MAX_MUTATION_CHAIN_CLUSTERS {
+            return Err(Error::FileTooLarge);
+        }
         let old_start = location.entry.cluster;
-        let (old_count, old_last) = self.chain_length_and_last(old_start)?;
+        let mut old_links = [ChainLink {
+            cluster: 0,
+            next: None,
+        }; MAX_MUTATION_CHAIN_CLUSTERS];
+        let old_count = self.collect_chain_links(old_start, &mut old_links)?;
+        let old_last = old_count
+            .checked_sub(1)
+            .map(|index| old_links[index].cluster);
         if old_start == 0 && location.entry.size != 0 {
             return Err(Error::BadClusterChain);
         }
@@ -524,18 +544,26 @@ impl Mount {
 
         if required_clusters < old_count {
             if required_clusters == 0 {
-                // Publish an empty file before releasing its old chain. If a later
-                // FAT write fails, the result is a valid file with leaked clusters.
                 self.update_directory_entry(location, 0, 0)?;
-                self.free_chain(old_start)?;
+                if let Err(error) = self.free_chain_links(&old_links, old_count) {
+                    let _ = self.update_directory_entry(location, old_start, location.entry.size);
+                    return Err(error);
+                }
                 return Ok(0);
             }
             self.write_chain(old_start, input)?;
             self.update_directory_entry(location, old_start, input.len() as u32)?;
-            let (keep_last, tail_start) = self.chain_split(old_start, required_clusters)?;
-            self.write_fat_entry(keep_last, EOC_MIN)?;
-            if let Some(tail) = tail_start {
-                self.free_chain(tail)?;
+            let keep_link = old_links[required_clusters - 1];
+            if let Err(error) = self.write_fat_entry(keep_link.cluster, EOC_MIN) {
+                let _ = self.update_directory_entry(location, old_start, location.entry.size);
+                return Err(error);
+            }
+            if let Some(tail) = keep_link.next {
+                if let Err(error) = self.free_chain(tail) {
+                    self.restore_chain_links(&old_links, old_count);
+                    let _ = self.update_directory_entry(location, old_start, location.entry.size);
+                    return Err(error);
+                }
             }
             return Ok(input.len());
         }
@@ -662,7 +690,13 @@ impl Mount {
         if self.writer.is_none() {
             return Err(Error::ReadOnly);
         }
+        if path.is_empty() || path == "/" {
+            return Err(Error::InvalidPath);
+        }
         let (components, count) = components(path)?;
+        if count == 0 {
+            return Err(Error::InvalidPath);
+        }
         let parent_cluster = self.directory_for_components(&components, count - 1)?;
         let location = self.find_entry_location(parent_cluster, components[count - 1])?;
         if !location.entry.directory {
@@ -796,18 +830,7 @@ impl Mount {
         data[location.offset + 20..location.offset + 22].copy_from_slice(&high);
         data[location.offset + 26..location.offset + 28].copy_from_slice(&low);
         data[location.offset + 28..location.offset + 32].copy_from_slice(&size.to_le_bytes());
-        if !self.write_sector(location.sector, &data) {
-            return Err(Error::Io);
-        }
-        let mut verify = [0u8; BYTES_PER_SECTOR];
-        if !self.read_sector(location.sector, &mut verify)
-            || le_u16(&verify, location.offset + 20) != (cluster >> 16) as u16
-            || le_u16(&verify, location.offset + 26) != cluster as u16
-            || le_u32(&verify, location.offset + 28) != size
-        {
-            return Err(Error::Io);
-        }
-        Ok(())
+        self.write_directory_sector(location.sector, &data)
     }
 
     fn directory_for_components(
@@ -1023,10 +1046,10 @@ impl Mount {
             data: [0; BYTES_PER_SECTOR],
         }; MAX_DIRECTORY_SECTOR_BACKUPS];
         let mut backup_count = 0;
-        for index in 0..count {
+        for (index, entry) in entries.iter().enumerate().take(count) {
             let slot = run.slots[index];
             let end = slot.offset.checked_add(32).ok_or(Error::Io)?;
-            if end > BYTES_PER_SECTOR || slot.offset % 32 != 0 {
+            if end > BYTES_PER_SECTOR || !slot.offset.is_multiple_of(32) {
                 return Err(Error::BadDirectory);
             }
             let backup_index = if let Some(index) = backups[..backup_count]
@@ -1046,7 +1069,7 @@ impl Mount {
                 backup_count += 1;
                 backup_count - 1
             };
-            backups[backup_index].data[slot.offset..end].copy_from_slice(&entries[index]);
+            backups[backup_index].data[slot.offset..end].copy_from_slice(entry);
         }
 
         for index in 0..backup_count {
@@ -1101,7 +1124,7 @@ impl Mount {
 
     fn read_directory_entry(self, slot: DirectorySlot) -> Result<[u8; 32], Error> {
         let end = slot.offset.checked_add(32).ok_or(Error::Io)?;
-        if end > BYTES_PER_SECTOR || slot.offset % 32 != 0 {
+        if end > BYTES_PER_SECTOR || !slot.offset.is_multiple_of(32) {
             return Err(Error::BadDirectory);
         }
         let mut data = [0u8; BYTES_PER_SECTOR];
@@ -1162,12 +1185,12 @@ impl Mount {
             return Ok(0);
         }
         let mut cluster = start;
-        for count in 0..MAX_MUTATION_CHAIN_CLUSTERS {
+        for (count, link) in output.iter_mut().enumerate() {
             if !self.valid_cluster(cluster) {
                 return Err(Error::BadClusterChain);
             }
             let next = self.next_cluster(cluster)?;
-            output[count] = ChainLink { cluster, next };
+            *link = ChainLink { cluster, next };
             if next.is_none() {
                 return Ok(count + 1);
             }
@@ -1332,9 +1355,7 @@ impl Mount {
             if !self.valid_cluster(cluster) {
                 return Err(Error::BadClusterChain);
             }
-        } else if cluster != 0 && !self.valid_cluster(cluster) {
-            return Err(Error::BadClusterChain);
-        } else if size != 0 && cluster == 0 {
+        } else if (cluster != 0 && !self.valid_cluster(cluster)) || (size != 0 && cluster == 0) {
             return Err(Error::BadClusterChain);
         }
         Ok(EntryMetadata {
@@ -1383,68 +1404,27 @@ impl Mount {
         (2..=self.cluster_count + 1).contains(&cluster)
     }
 
-    fn chain_length_and_last(self, start: u32) -> Result<(usize, Option<u32>), Error> {
-        if start == 0 {
-            return Ok((0, None));
-        }
-        let mut cluster = start;
-        for count in 0..self.cluster_count as usize {
-            if !self.valid_cluster(cluster) {
-                return Err(Error::BadClusterChain);
-            }
-            let Some(next) = self.next_cluster(cluster)? else {
-                return Ok((count + 1, Some(cluster)));
-            };
-            cluster = next;
-        }
-        Err(Error::BadClusterChain)
-    }
-
-    fn chain_split(self, start: u32, keep: usize) -> Result<(u32, Option<u32>), Error> {
-        if keep == 0 || !self.valid_cluster(start) || keep > self.cluster_count as usize {
-            return Err(Error::BadClusterChain);
-        }
-        let mut cluster = start;
-        for index in 1..=keep {
-            if !self.valid_cluster(cluster) {
-                return Err(Error::BadClusterChain);
-            }
-            let next = self.next_cluster(cluster)?;
-            if index == keep {
-                return Ok((cluster, next));
-            }
-            cluster = next.ok_or(Error::BadClusterChain)?;
-        }
-        Err(Error::BadClusterChain)
-    }
-
     fn free_chain(self, start: u32) -> Result<(), Error> {
-        if start == 0 {
-            return Ok(());
-        }
-        let mut cluster = start;
-        for _ in 0..self.cluster_count {
-            if !self.valid_cluster(cluster) {
-                return Err(Error::BadClusterChain);
-            }
-            let next = self.next_cluster(cluster)?;
-            self.write_fat_entry(cluster, 0)?;
-            let Some(next) = next else {
-                return Ok(());
-            };
-            cluster = next;
-        }
-        Err(Error::BadClusterChain)
+        let mut links = [ChainLink {
+            cluster: 0,
+            next: None,
+        }; MAX_MUTATION_CHAIN_CLUSTERS];
+        let count = self.collect_chain_links(start, &mut links)?;
+        self.free_chain_links(&links, count)
     }
 
     fn allocate_chain(self, count: usize) -> Result<(u32, u32), Error> {
-        if count == 0 || count > self.cluster_count as usize {
+        if count == 0 || count > self.cluster_count as usize || count > MAX_MUTATION_CHAIN_CLUSTERS
+        {
             return Err(Error::NoSpace);
         }
         let mut first = 0;
         let mut previous = 0;
         let mut allocated = 0;
-        for offset in 0..self.cluster_count {
+        // ponytail: Allocation scans at most the first 1024 FAT entries; add a
+        // bounded allocation cursor before supporting larger fragmented volumes.
+        let scan_limit = self.cluster_count.min(MAX_MUTATION_CHAIN_CLUSTERS as u32);
+        for offset in 0..scan_limit {
             let cluster = offset + 2;
             if self.read_fat_entry(cluster)? != 0 {
                 continue;
@@ -1487,7 +1467,7 @@ impl Mount {
         };
         let mut cluster = start;
         let mut copied = 0;
-        for _ in 0..self.cluster_count {
+        for _ in 0..MAX_MUTATION_CHAIN_CLUSTERS {
             if cluster < 2 || cluster > self.cluster_count + 1 {
                 return Err(Error::BadClusterChain);
             }
@@ -1654,24 +1634,28 @@ impl Mount {
     }
 
     fn read_sector(self, lba: u64, output: &mut [u8; BYTES_PER_SECTOR]) -> bool {
-        self.base_lba
-            .checked_add(lba)
+        self.absolute_sector(lba)
             .is_some_and(|absolute| (self.reader)(absolute, output))
     }
 
     fn write_sector(self, lba: u64, input: &[u8; BYTES_PER_SECTOR]) -> bool {
         self.writer
             .and_then(|writer| {
-                self.base_lba
-                    .checked_add(lba)
+                self.absolute_sector(lba)
                     .map(|absolute| writer(absolute, input))
             })
             .unwrap_or(false)
     }
+
+    fn absolute_sector(self, lba: u64) -> Option<u64> {
+        (lba < self.available_sectors)
+            .then_some(())
+            .and_then(|_| self.base_lba.checked_add(lba))
+    }
 }
 
 pub fn probe_block() -> Result<Mount, Error> {
-    let partition = block::partition(0).ok_or(Error::InvalidBpb)?;
+    let partition = block::active_partition().ok_or(Error::InvalidBpb)?;
     Mount::open_at(
         ramdisk_read_sector,
         None,
@@ -1681,7 +1665,7 @@ pub fn probe_block() -> Result<Mount, Error> {
 }
 
 pub fn probe_block_rw() -> Result<Mount, Error> {
-    let partition = block::partition(0).ok_or(Error::InvalidBpb)?;
+    let partition = block::active_partition().ok_or(Error::InvalidBpb)?;
     Mount::open_at(
         ramdisk_read_sector,
         Some(ramdisk_write_sector),
@@ -1848,6 +1832,12 @@ fn fixture_check() -> bool {
     if volume.geometry().read_only {
         return false;
     }
+    if volume.rmdir("") != Err(Error::InvalidPath)
+        || volume.rmdir("/") != Err(Error::InvalidPath)
+        || volume.rmdir("////") != Err(Error::InvalidPath)
+    {
+        return false;
+    }
     let mut output = [0u8; 32];
     let Ok(length) = volume.read_file("/Long Name.txt", &mut output) else {
         return false;
@@ -1953,6 +1943,13 @@ fn fixture_check() -> bool {
     {
         return false;
     }
+    if !Mount::open_at(fixture_partition_read_sector, None, 100, 0)
+        .is_err_and(|error| error == Error::InvalidBpb)
+        || !Mount::open_at(fixture_partition_read_sector, None, u64::MAX, 1)
+            .is_err_and(|error| error == Error::InvalidBpb)
+    {
+        return false;
+    }
     let grown = [0xa5u8; BYTES_PER_SECTOR + 37];
     if volume.write_file("/Long Name.txt", &grown).is_err() {
         return false;
@@ -1974,6 +1971,31 @@ fn fixture_check() -> bool {
         return false;
     }
 
+    let Ok(grown_info) = volume.stat("/Long Name.txt") else {
+        return false;
+    };
+    let failed_shrink = [0xa5u8; 6];
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = 1;
+    }
+    if volume.write_file("/Long Name.txt", &failed_shrink) != Err(Error::Io) {
+        return false;
+    }
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = u64::MAX;
+    }
+    let Ok(after_shrink_failure) = volume.stat("/Long Name.txt") else {
+        return false;
+    };
+    if after_shrink_failure != grown_info
+        || fixture_fat_entry(1, 3) != Some(5)
+        || fixture_fat_entry(1, 5) != Some(EOC_MIN)
+        || fixture_fat_entry(1025, 3) != Some(5)
+        || fixture_fat_entry(1025, 5) != Some(EOC_MIN)
+    {
+        return false;
+    }
+
     if volume.write_file("/Long Name.txt", b"shrunk").is_err() {
         return false;
     }
@@ -1988,6 +2010,28 @@ fn fixture_check() -> bool {
         return false;
     }
 
+    let Ok(shrunk_info) = volume.stat("/Long Name.txt") else {
+        return false;
+    };
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = 1;
+    }
+    if volume.write_file("/Long Name.txt", &[]) != Err(Error::Io) {
+        return false;
+    }
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = u64::MAX;
+    }
+    let Ok(after_empty_failure) = volume.stat("/Long Name.txt") else {
+        return false;
+    };
+    if after_empty_failure != shrunk_info
+        || fixture_fat_entry(1, 3) != Some(EOC_MIN)
+        || fixture_fat_entry(1025, 3) != Some(EOC_MIN)
+    {
+        return false;
+    }
+
     if volume.write_file("/Long Name.txt", &[]).is_err() {
         return false;
     }
@@ -1999,6 +2043,53 @@ fn fixture_check() -> bool {
         return false;
     }
     if volume.write_file("/Long Name.txt", b"again").is_err() {
+        return false;
+    }
+
+    let Ok(original_info) = volume.stat("/Long Name.txt") else {
+        return false;
+    };
+    let mut failed_grow = [0xa5u8; BYTES_PER_SECTOR + 37];
+    failed_grow[..5].copy_from_slice(b"again");
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = 2052;
+    }
+    if volume.write_file("/Long Name.txt", &failed_grow) != Err(Error::Io) {
+        return false;
+    }
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = u64::MAX;
+    }
+    let Ok(after_data_failure) = volume.stat("/Long Name.txt") else {
+        return false;
+    };
+    if after_data_failure != original_info
+        || fixture_fat_entry(1, 3) != Some(EOC_MIN)
+        || fixture_fat_entry(1, 5) != Some(0)
+        || fixture_fat_entry(1025, 3) != Some(EOC_MIN)
+        || fixture_fat_entry(1025, 5) != Some(0)
+    {
+        return false;
+    }
+
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = 2049;
+    }
+    if volume.write_file("/Long Name.txt", &failed_grow) != Err(Error::Io) {
+        return false;
+    }
+    unsafe {
+        FIXTURE_FAIL_WRITE_LBA = u64::MAX;
+    }
+    let Ok(after_metadata_failure) = volume.stat("/Long Name.txt") else {
+        return false;
+    };
+    if after_metadata_failure != original_info
+        || fixture_fat_entry(1, 3) != Some(EOC_MIN)
+        || fixture_fat_entry(1, 5) != Some(0)
+        || fixture_fat_entry(1025, 3) != Some(EOC_MIN)
+        || fixture_fat_entry(1025, 5) != Some(0)
+    {
         return false;
     }
 
@@ -2133,9 +2224,10 @@ fn fixture_check() -> bool {
     unsafe {
         write_u32(&mut *core::ptr::addr_of_mut!(FIXTURE_FAT_SECONDARY), 12, 0);
     }
-    volume
-        .read_file("/Long Name.txt", &mut output)
-        .is_err_and(|error| error == Error::FatMismatch)
+    volume.write_file("/Long Name.txt", b"rejected") == Err(Error::FatMismatch)
+        && volume
+            .read_file("/Long Name.txt", &mut output)
+            .is_err_and(|error| error == Error::FatMismatch)
 }
 
 fn fixture_read_sector(lba: u64, output: &mut [u8; BYTES_PER_SECTOR]) -> bool {

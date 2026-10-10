@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "Staged ABI and hardware hooks are not all enabled in the bootstrap profile"
+)]
+
 use core::str;
 
 #[cfg(target_arch = "x86_64")]
@@ -7,6 +12,17 @@ const MAX_MEMORY_REGIONS: usize = 64;
 const MAX_RESERVED_REGIONS: usize = 32;
 const MAX_MODULES: usize = 8;
 const CMDLINE_MAX: usize = 128;
+const POINTER_REGION_MIN: usize = 1;
+const EFI_TABLE_HEADER_SIZE: usize = 24;
+const EFI_SYSTEM_TABLE_SIZE: usize = 120;
+const EFI_BOOT_SERVICES_SIZE: usize = 328;
+const EFI_CONFIG_TABLE_ENTRY_SIZE: usize = 24;
+const MAX_EFI_CONFIG_TABLES: usize = 1024;
+const EFI_FILE_PROTOCOL_SIZE: usize = 72;
+const EFI_GOP_SIZE: usize = 32;
+const EFI_GOP_MODE_SIZE: usize = 40;
+const EFI_GOP_INFO_SIZE: usize = 36;
+const MAX_FDT_NODE_NAME: usize = 256;
 #[cfg(target_arch = "x86_64")]
 const MAX_MULTIBOOT_INFO: usize = 16 * 1024 * 1024;
 #[cfg(target_arch = "x86_64")]
@@ -16,6 +32,59 @@ const MAX_FDT_SIZE: usize = 16 * 1024 * 1024;
 
 #[cfg(target_arch = "x86_64")]
 static mut EFI_MEMORY_MAP: [u8; EFI_MEMORY_MAP_SIZE] = [0; EFI_MEMORY_MAP_SIZE];
+
+#[derive(Clone, Copy)]
+struct PointerRegion {
+    address: usize,
+    length: usize,
+}
+
+impl PointerRegion {
+    fn new(address: usize, length: usize) -> Option<Self> {
+        if length < POINTER_REGION_MIN || !valid_pointer(address) {
+            return None;
+        }
+        let end = address.checked_add(length)?;
+        if !valid_pointer(end.checked_sub(1)?) {
+            return None;
+        }
+        Some(Self { address, length })
+    }
+
+    fn from_u64(address: u64, length: usize) -> Option<Self> {
+        Self::new(usize::try_from(address).ok()?, length)
+    }
+
+    fn subregion(self, offset: usize, length: usize) -> Option<Self> {
+        let end = offset.checked_add(length)?;
+        if end > self.length {
+            return None;
+        }
+        Some(Self {
+            address: self.address.checked_add(offset)?,
+            length,
+        })
+    }
+
+    fn address_at(self, offset: usize, length: usize) -> Option<usize> {
+        self.subregion(offset, length).map(|region| region.address)
+    }
+}
+
+fn valid_pointer(address: usize) -> bool {
+    if address == 0 {
+        return false;
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        let upper = address >> 48;
+        upper == 0 || upper == usize::MAX >> 48
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        true
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
@@ -298,7 +367,15 @@ pub fn contract_self_check() {
         malformed[4..8].copy_from_slice(&40u32.to_be_bytes());
         malformed[8..12].copy_from_slice(&64u32.to_be_bytes());
         assert!(unsafe { parse_fdt(malformed.as_ptr() as usize) }.is_none());
-        assert!(unsafe { read_cells(malformed.as_ptr() as usize, 8, 0) }.is_none());
+        assert!(unsafe {
+            read_cells(
+                &PointerRegion::new(malformed.as_ptr() as usize, malformed.len()).unwrap(),
+                0,
+                8,
+                0,
+            )
+        }
+        .is_none());
         assert!(unsafe { align4(usize::MAX) }.is_none());
     }
 }
@@ -518,58 +595,62 @@ fn framebuffer(
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn parse_multiboot2(address: usize) -> Option<BootInfo> {
-    let total_size = read_u32(address)? as usize;
+    let header = PointerRegion::new(address, 8)?;
+    let total_size = read_u32(&header, 0)? as usize;
     if !(16..=MAX_MULTIBOOT_INFO).contains(&total_size) {
         return None;
     }
-    let end = address.checked_add(total_size)?;
+    let region = PointerRegion::new(address, total_size)?;
     let mut info = BootInfo::empty(Architecture::X86_64);
     let mut offset = 8usize;
     let mut framebuffer_info = None;
     let mut efi_system_table = 0u64;
     let mut efi_image_handle = 0u64;
     let mut acpi_rsdp = 0u64;
+    let mut end_tag = false;
 
-    while offset.checked_add(8)? <= total_size {
-        let tag = address.checked_add(offset)?;
-        let tag_type = read_u32(tag)?;
-        let size = read_u32(tag + 4)? as usize;
-        if size < 8 || offset.checked_add(size)? > total_size {
+    while offset < total_size {
+        let tag_header = region.subregion(offset, 8)?;
+        let tag_type = read_u32(&tag_header, 0)?;
+        let size = read_u32(&tag_header, 4)? as usize;
+        if size < 8 {
             return None;
         }
+        let tag = region.subregion(offset, size)?;
         match tag_type {
-            1 => copy_c_string(tag + 8, &mut info.cmdline, &mut info.cmdline_len, size - 8),
+            1 => copy_c_string(&tag, 8, size - 8, &mut info.cmdline, &mut info.cmdline_len)?,
             3 if size >= 16 => {
-                let start = read_u32(tag + 8)? as u64;
-                let end = read_u32(tag + 12)? as u64;
+                let start = read_u32(&tag, 8)? as u64;
+                let end = read_u32(&tag, 12)? as u64;
                 add_module(&mut info, start, end);
             }
             6 if size >= 16 => {
-                let entry_size = read_u32(tag + 8)? as usize;
-                if entry_size < 24 || tag + 16 > end {
+                let entry_size = read_u32(&tag, 8)? as usize;
+                let entries_size = size - 16;
+                if entry_size < 24 || !entries_size.is_multiple_of(entry_size) {
                     return None;
                 }
-                let mut entry = tag + 16;
-                let entries_end = tag + size;
-                while entry.checked_add(24)? <= entries_end {
-                    let base = read_u64(entry)?;
-                    let length = read_u64(entry + 8)?;
-                    if read_u32(entry + 16)? == 1 {
+                let mut entry_offset = 16usize;
+                while entry_offset < size {
+                    let entry = tag.subregion(entry_offset, entry_size)?;
+                    let base = read_u64(&entry, 0)?;
+                    let length = read_u64(&entry, 8)?;
+                    if read_u32(&entry, 16)? == 1 {
                         add_memory(&mut info, base, length);
                     }
-                    entry = entry.checked_add(entry_size)?;
+                    entry_offset = entry_offset.checked_add(entry_size)?;
                 }
             }
             8 if size >= 32 => {
-                let base = read_u64(tag + 8)?;
-                let pitch = read_u32(tag + 16)? as u64;
-                let width = read_u32(tag + 20)? as u64;
-                let height = read_u32(tag + 24)? as u64;
-                let bpp = read_u8(tag + 28)?;
-                let pixel_type = read_u8(tag + 29)?;
+                let base = read_u64(&tag, 8)?;
+                let pitch = read_u32(&tag, 16)? as u64;
+                let width = read_u32(&tag, 20)? as u64;
+                let height = read_u32(&tag, 24)? as u64;
+                let bpp = read_u8(&tag, 28)?;
+                let pixel_type = read_u8(&tag, 29)?;
                 if pixel_type == 1 && size >= 38 {
-                    let red = read_u8(tag + 32)?;
-                    let blue = read_u8(tag + 36)?;
+                    let red = read_u8(&tag, 32)?;
+                    let blue = read_u8(&tag, 36)?;
                     if red == 0 && blue == 16 {
                         framebuffer_info =
                             framebuffer(base, pitch, width, height, bpp, PixelFormat::Rgb);
@@ -579,14 +660,22 @@ unsafe fn parse_multiboot2(address: usize) -> Option<BootInfo> {
                     }
                 }
             }
-            12 if size >= 16 => efi_system_table = read_u64(tag + 8)?,
-            14 if size >= 28 && acpi_rsdp == 0 => acpi_rsdp = tag as u64 + 8,
-            15 if size >= 44 => acpi_rsdp = tag as u64 + 8,
-            20 if size >= 16 => efi_image_handle = read_u64(tag + 8)?,
-            0 => break,
+            12 if size >= 16 => efi_system_table = read_u64(&tag, 8)?,
+            14 if size >= 28 && acpi_rsdp == 0 => acpi_rsdp = tag.address_at(8, 1)? as u64,
+            15 if size >= 44 => acpi_rsdp = tag.address_at(8, 1)? as u64,
+            20 if size >= 16 => efi_image_handle = read_u64(&tag, 8)?,
+            0 if size == 8 => {
+                end_tag = true;
+                offset = total_size;
+                continue;
+            }
             _ => {}
         }
-        offset = offset.checked_add((size + 7) & !7)?;
+        offset = offset.checked_add(size)?.checked_add(7)? & !7;
+    }
+
+    if !end_tag {
+        return None;
     }
 
     if info.memory_len == 0 {
@@ -603,6 +692,49 @@ unsafe fn parse_multiboot2(address: usize) -> Option<BootInfo> {
     #[cfg(not(target_os = "uefi"))]
     reserve_kernel(&mut info);
     Some(info)
+}
+
+#[cfg(any(target_arch = "x86_64", target_os = "uefi"))]
+const EFI_SYSTEM_TABLE_SIGNATURE: u64 = 0x5453_5953_2049_4249;
+#[cfg(any(target_arch = "x86_64", target_os = "uefi"))]
+const EFI_BOOT_SERVICES_SIGNATURE: u64 = 0x5652_4553_544f_4f42;
+
+#[cfg(any(target_arch = "x86_64", target_os = "uefi"))]
+unsafe fn efi_table_region(address: u64, size: usize, signature: u64) -> Option<PointerRegion> {
+    let header = PointerRegion::from_u64(address, EFI_TABLE_HEADER_SIZE)?;
+    if read_u64(&header, 0)? != signature {
+        return None;
+    }
+    let header_size = read_u32(&header, 12)? as usize;
+    if !(EFI_TABLE_HEADER_SIZE..=4096).contains(&header_size) {
+        return None;
+    }
+    PointerRegion::from_u64(address, size)
+}
+
+#[cfg(any(target_arch = "x86_64", target_os = "uefi"))]
+unsafe fn efi_boot_services_region(system_table: u64) -> Option<PointerRegion> {
+    let system_table = efi_table_region(
+        system_table,
+        EFI_SYSTEM_TABLE_SIZE,
+        EFI_SYSTEM_TABLE_SIGNATURE,
+    )?;
+    let boot_services = read_u64(&system_table, 96)?;
+    efi_table_region(
+        boot_services,
+        EFI_BOOT_SERVICES_SIZE,
+        EFI_BOOT_SERVICES_SIGNATURE,
+    )
+}
+
+#[cfg(any(target_arch = "x86_64", target_os = "uefi"))]
+fn efi_function_address(address: u64) -> Option<usize> {
+    let region = PointerRegion::from_u64(address, POINTER_REGION_MIN)?;
+    #[cfg(target_arch = "aarch64")]
+    if !region.address.is_multiple_of(4) {
+        return None;
+    }
+    Some(region.address)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -623,19 +755,16 @@ unsafe fn efi_memory_map(system_table: u64, image_handle: u64, info: &mut BootIn
         return None;
     }
 
-    let system_table = system_table as usize;
-    let boot_services = read_u64(system_table + 96)? as usize;
-    let get_memory_map = read_u64(boot_services + 56)? as usize;
-    let exit_boot_services = read_u64(boot_services + 232)? as usize;
-    if get_memory_map == 0 || exit_boot_services == 0 {
-        return None;
-    }
+    let boot_services = efi_boot_services_region(system_table)?;
+    let get_memory_map = efi_function_address(read_u64(&boot_services, 56)?)?;
+    let exit_boot_services = efi_function_address(read_u64(&boot_services, 232)?)?;
 
     let mut map_size = EFI_MEMORY_MAP_SIZE;
     let mut map_key = 0usize;
     let mut descriptor_size = 0usize;
     let mut descriptor_version = 0u32;
     let map_ptr = core::ptr::addr_of_mut!(EFI_MEMORY_MAP) as *mut u8;
+    let map_region = PointerRegion::new(map_ptr as usize, EFI_MEMORY_MAP_SIZE)?;
     let get_memory_map: EfiGetMemoryMap = core::mem::transmute(get_memory_map);
     if get_memory_map(
         &mut map_size,
@@ -646,6 +775,8 @@ unsafe fn efi_memory_map(system_table: u64, image_handle: u64, info: &mut BootIn
     ) != 0
         || descriptor_size < 40
         || map_size > EFI_MEMORY_MAP_SIZE
+        || map_size == 0
+        || !map_size.is_multiple_of(descriptor_size)
     {
         return None;
     }
@@ -657,10 +788,10 @@ unsafe fn efi_memory_map(system_table: u64, image_handle: u64, info: &mut BootIn
 
     let mut offset = 0usize;
     while offset.checked_add(descriptor_size)? <= map_size {
-        let descriptor = map_ptr.add(offset) as usize;
-        let kind = read_u32(descriptor)?;
-        let base = read_u64(descriptor + 8)?;
-        let pages = read_u64(descriptor + 24)?;
+        let descriptor = map_region.subregion(offset, descriptor_size)?;
+        let kind = read_u32(&descriptor, 0)?;
+        let base = read_u64(&descriptor, 8)?;
+        let pages = read_u64(&descriptor, 24)?;
         if matches!(kind, 1..=4 | 7) {
             add_memory(info, base, pages.checked_mul(0x1000)?);
         }
@@ -672,32 +803,31 @@ unsafe fn efi_memory_map(system_table: u64, image_handle: u64, info: &mut BootIn
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn parse_fdt(address: usize) -> Option<BootInfo> {
-    if read_be32(address)? != 0xd00d_feed {
+    let header = PointerRegion::new(address, 40)?;
+    if read_be32(&header, 0)? != 0xd00d_feed {
         return None;
     }
-    let total_size = read_be32(address + 4)? as usize;
+    let total_size = read_be32(&header, 4)? as usize;
     if !(40..=MAX_FDT_SIZE).contains(&total_size) {
         return None;
     }
-    let structure_offset = read_be32(address + 8)? as usize;
-    let strings_offset = read_be32(address + 12)? as usize;
-    let structure_size = read_be32(address + 36)? as usize;
-    let strings_size = read_be32(address + 32)? as usize;
-    let structure = address.checked_add(structure_offset)?;
-    let structure_end = structure.checked_add(structure_size)?;
-    let strings = address.checked_add(strings_offset)?;
-    let strings_end = strings.checked_add(strings_size)?;
-    let blob_end = address.checked_add(total_size)?;
-    if structure < address
-        || structure_end > blob_end
-        || strings < address
-        || strings_end > blob_end
-    {
+    let blob = PointerRegion::new(address, total_size)?;
+    let structure_offset = read_be32(&header, 8)? as usize;
+    let strings_offset = read_be32(&header, 12)? as usize;
+    let memory_reserve_offset = read_be32(&header, 16)? as usize;
+    let version = read_be32(&header, 20)?;
+    let last_compatible_version = read_be32(&header, 24)?;
+    let strings_size = read_be32(&header, 32)? as usize;
+    let structure_size = read_be32(&header, 36)? as usize;
+    if version < 17 || last_compatible_version > version {
         return None;
     }
+    let structure = blob.subregion(structure_offset, structure_size)?;
+    let strings = blob.subregion(strings_offset, strings_size)?;
+    validate_fdt_reservations(&blob, memory_reserve_offset)?;
 
     let mut info = BootInfo::empty(Architecture::Aarch64);
-    let mut cursor = structure;
+    let mut cursor = 0usize;
     let mut depth = 0usize;
     let mut nodes = [NodeKind::Other; 16];
     let mut address_cells = 2usize;
@@ -716,16 +846,20 @@ unsafe fn parse_fdt(address: usize) -> Option<BootInfo> {
     let mut gic_second_region = 0u64;
     let mut timer_irq = 0u32;
     let mut timer_flags = 0u32;
+    let end_token;
 
     loop {
-        let token = read_be32(cursor)?;
+        let token = read_be32(&structure, cursor)?;
         cursor = cursor.checked_add(4)?;
         match token {
             1 => {
-                let (name_len, kind) = node_kind(cursor);
-                cursor = align4(cursor.checked_add(name_len + 1)?)?;
+                let (name_len, kind) = node_kind(&structure, cursor)?;
+                cursor = align4(cursor.checked_add(name_len)?.checked_add(1)?)?;
+                if depth >= nodes.len() {
+                    return None;
+                }
+                nodes[depth] = kind;
                 depth += 1;
-                nodes[depth.min(nodes.len() - 1)] = kind;
             }
             2 => {
                 if depth == 0 {
@@ -734,94 +868,174 @@ unsafe fn parse_fdt(address: usize) -> Option<BootInfo> {
                 depth -= 1;
             }
             3 => {
-                let length = read_be32(cursor)? as usize;
-                let name_offset = read_be32(cursor + 4)? as usize;
+                let property = structure.subregion(cursor, 8)?;
+                let length = read_be32(&property, 0)? as usize;
+                let name_offset = read_be32(&property, 4)? as usize;
                 cursor = cursor.checked_add(8)?;
                 let data = cursor;
-                cursor = align4(cursor.checked_add(length)?)?;
-                if cursor > structure_end || strings + name_offset >= strings_end {
+                let aligned_end = align4(cursor.checked_add(length)?)?;
+                structure.subregion(data, length)?;
+                if aligned_end > structure.length {
                     return None;
                 }
-                let name = strings + name_offset;
-                let kind = nodes[depth.min(nodes.len() - 1)];
-                if depth == 1 && c_string_eq(name, b"#address-cells") {
-                    address_cells = read_be32(data)? as usize;
-                } else if depth == 1 && c_string_eq(name, b"#size-cells") {
-                    size_cells = read_be32(data)? as usize;
-                } else if kind == NodeKind::Memory && c_string_eq(name, b"reg") {
-                    parse_reg(&mut info, data, length, address_cells, size_cells)?;
-                } else if kind == NodeKind::Chosen && c_string_eq(name, b"bootargs") {
-                    copy_bytes(&mut info.cmdline, &mut info.cmdline_len, data, length);
-                } else if kind == NodeKind::Chosen && c_string_eq(name, b"linux,initrd-start") {
-                    initrd_start = read_cells(data, length, size_cells)?;
-                } else if kind == NodeKind::Chosen && c_string_eq(name, b"linux,initrd-end") {
-                    initrd_end = read_cells(data, length, size_cells)?;
-                } else if kind == NodeKind::SimpleFramebuffer && c_string_eq(name, b"reg") {
-                    framebuffer_base = read_cells(data, length, address_cells)?;
+                cursor = aligned_end;
+                string_length(&strings, name_offset)?;
+                let kind = if depth == 0 {
+                    NodeKind::Other
+                } else {
+                    nodes[depth - 1]
+                };
+                if depth == 1 && c_string_eq(&strings, name_offset, b"#address-cells") {
+                    if length < 4 {
+                        return None;
+                    }
+                    address_cells = read_be32(&structure, data)? as usize;
+                } else if depth == 1 && c_string_eq(&strings, name_offset, b"#size-cells") {
+                    if length < 4 {
+                        return None;
+                    }
+                    size_cells = read_be32(&structure, data)? as usize;
+                } else if kind == NodeKind::Memory && c_string_eq(&strings, name_offset, b"reg") {
+                    parse_reg(
+                        &mut info,
+                        &structure,
+                        data,
+                        length,
+                        address_cells,
+                        size_cells,
+                    )?;
+                } else if kind == NodeKind::Chosen
+                    && c_string_eq(&strings, name_offset, b"bootargs")
+                {
+                    copy_bytes(
+                        &mut info.cmdline,
+                        &mut info.cmdline_len,
+                        &structure,
+                        data,
+                        length,
+                    )?;
+                } else if kind == NodeKind::Chosen
+                    && c_string_eq(&strings, name_offset, b"linux,initrd-start")
+                {
+                    initrd_start = read_cells(&structure, data, length, size_cells)?;
+                } else if kind == NodeKind::Chosen
+                    && c_string_eq(&strings, name_offset, b"linux,initrd-end")
+                {
+                    initrd_end = read_cells(&structure, data, length, size_cells)?;
+                } else if kind == NodeKind::SimpleFramebuffer
+                    && c_string_eq(&strings, name_offset, b"reg")
+                {
+                    framebuffer_base = read_cells(&structure, data, length, address_cells)?;
                     let offset = address_cells.checked_mul(4)?;
                     framebuffer_size = read_cells(
+                        &structure,
                         data.checked_add(offset)?,
                         length.checked_sub(offset)?,
                         size_cells,
                     )?;
-                } else if kind == NodeKind::SimpleFramebuffer && c_string_eq(name, b"width") {
-                    framebuffer_width = read_be32(data)? as u64;
-                } else if kind == NodeKind::SimpleFramebuffer && c_string_eq(name, b"height") {
-                    framebuffer_height = read_be32(data)? as u64;
-                } else if kind == NodeKind::SimpleFramebuffer && c_string_eq(name, b"stride") {
-                    framebuffer_stride = read_be32(data)? as u64;
-                } else if kind == NodeKind::SimpleFramebuffer && c_string_eq(name, b"format") {
+                } else if kind == NodeKind::SimpleFramebuffer
+                    && c_string_eq(&strings, name_offset, b"width")
+                {
+                    if length < 4 {
+                        return None;
+                    }
+                    framebuffer_width = read_be32(&structure, data)? as u64;
+                } else if kind == NodeKind::SimpleFramebuffer
+                    && c_string_eq(&strings, name_offset, b"height")
+                {
+                    if length < 4 {
+                        return None;
+                    }
+                    framebuffer_height = read_be32(&structure, data)? as u64;
+                } else if kind == NodeKind::SimpleFramebuffer
+                    && c_string_eq(&strings, name_offset, b"stride")
+                {
+                    if length < 4 {
+                        return None;
+                    }
+                    framebuffer_stride = read_be32(&structure, data)? as u64;
+                } else if kind == NodeKind::SimpleFramebuffer
+                    && c_string_eq(&strings, name_offset, b"format")
+                {
                     framebuffer_format_len = copy_bytes(
                         &mut framebuffer_format,
                         &mut framebuffer_format_len,
+                        &structure,
                         data,
                         length,
-                    );
-                } else if kind == NodeKind::InterruptController && c_string_eq(name, b"compatible")
+                    )?;
+                } else if kind == NodeKind::InterruptController
+                    && c_string_eq(&strings, name_offset, b"compatible")
                 {
-                    if c_string_starts_with(data, b"arm,gic-v3") {
+                    if property_c_string_starts_with(&structure, data, length, b"arm,gic-v3") {
                         gic_version = 3;
-                    } else if c_string_starts_with(data, b"arm,cortex-a15-gic")
-                        || c_string_starts_with(data, b"arm,gic-400")
-                    {
+                    } else if property_c_string_starts_with(
+                        &structure,
+                        data,
+                        length,
+                        b"arm,cortex-a15-gic",
+                    ) || property_c_string_starts_with(
+                        &structure,
+                        data,
+                        length,
+                        b"arm,gic-400",
+                    ) {
                         gic_version = 2;
                     }
-                } else if kind == NodeKind::InterruptController && c_string_eq(name, b"reg") {
+                } else if kind == NodeKind::InterruptController
+                    && c_string_eq(&strings, name_offset, b"reg")
+                {
                     let entry_cells = address_cells.checked_add(size_cells)?;
                     let entry_bytes = entry_cells.checked_mul(4)?;
                     if entry_bytes == 0 || !length.is_multiple_of(entry_bytes) {
                         return None;
                     }
-                    gic_distributor = read_cells(data, address_cells * 4, address_cells)?;
-                    if length >= entry_bytes * 2 {
-                        gic_second_region =
-                            read_cells(data + entry_bytes, address_cells * 4, address_cells)?;
+                    let address_bytes = address_cells.checked_mul(4)?;
+                    gic_distributor = read_cells(&structure, data, length, address_cells)?;
+                    if length >= entry_bytes.checked_mul(2)? {
+                        gic_second_region = read_cells(
+                            &structure,
+                            data.checked_add(entry_bytes)?,
+                            length.checked_sub(entry_bytes)?,
+                            address_cells,
+                        )?;
                     }
-                } else if kind == NodeKind::Timer && c_string_eq(name, b"interrupts") {
+                    if address_bytes > length {
+                        return None;
+                    }
+                } else if kind == NodeKind::Timer
+                    && c_string_eq(&strings, name_offset, b"interrupts")
+                {
                     let spec_bytes = 12usize;
                     let virtual_offset = spec_bytes.checked_mul(2)?;
-                    if length >= virtual_offset + spec_bytes {
-                        let spec = data + virtual_offset;
-                        if read_be32(spec)? == 1 {
-                            let irq = read_be32(spec + 4)?;
+                    if length >= virtual_offset.checked_add(spec_bytes)? {
+                        let spec = data.checked_add(virtual_offset)?;
+                        if read_be32(&structure, spec)? == 1 {
+                            let irq = read_be32(&structure, spec.checked_add(4)?)?;
                             if irq < 16 {
                                 timer_irq = 16 + irq;
-                                timer_flags = read_be32(spec + 8)?;
+                                timer_flags = read_be32(&structure, spec.checked_add(8)?)?;
                             }
                         }
                     }
                 }
             }
             4 => {}
-            9 => break,
+            9 => {
+                if depth != 0 {
+                    return None;
+                }
+                end_token = true;
+                break;
+            }
             _ => return None,
         }
-        if cursor >= structure_end {
-            break;
+        if cursor >= structure.length {
+            return None;
         }
     }
 
-    if info.memory_len == 0 {
+    if !end_token || info.memory_len == 0 {
         return None;
     }
     if initrd_end > initrd_start {
@@ -931,21 +1145,32 @@ type EfiFileGetInfo = unsafe extern "efiapi" fn(u64, *const u8, *mut usize, *mut
 #[cfg(target_os = "uefi")]
 type EfiAllocatePool = unsafe extern "efiapi" fn(u32, usize, *mut u64) -> usize;
 #[cfg(target_os = "uefi")]
+type EfiFreePool = unsafe extern "efiapi" fn(u64) -> usize;
+#[cfg(target_os = "uefi")]
 type EfiLocateProtocol = unsafe extern "efiapi" fn(*const u8, *const u8, *mut u64) -> usize;
 
 #[cfg(target_os = "uefi")]
 unsafe fn efi_fdt(system_table: u64) -> Option<u64> {
-    if system_table == 0 {
+    let system_table = efi_table_region(
+        system_table,
+        EFI_SYSTEM_TABLE_SIZE,
+        EFI_SYSTEM_TABLE_SIGNATURE,
+    )?;
+    let count = usize::try_from(read_u64(&system_table, 104)?).ok()?;
+    if count == 0 || count > MAX_EFI_CONFIG_TABLES {
         return None;
     }
-    let system_table = system_table as usize;
-    let count = read_u64(system_table + 104)? as usize;
-    let tables = read_u64(system_table + 112)? as usize;
+    let table_bytes = count.checked_mul(EFI_CONFIG_TABLE_ENTRY_SIZE)?;
+    let tables = PointerRegion::from_u64(read_u64(&system_table, 112)?, table_bytes)?;
     for index in 0..count {
-        let entry = tables.checked_add(index.checked_mul(24)?)?;
-        let guid = core::slice::from_raw_parts(entry as *const u8, 16);
-        if guid == EFI_DTB_TABLE_GUID {
-            return read_u64(entry + 16);
+        let entry = tables.subregion(
+            index.checked_mul(EFI_CONFIG_TABLE_ENTRY_SIZE)?,
+            EFI_CONFIG_TABLE_ENTRY_SIZE,
+        )?;
+        if bytes_equal(&entry, 0, &EFI_DTB_TABLE_GUID)? {
+            let fdt = read_u64(&entry, 16)?;
+            PointerRegion::from_u64(fdt, 40)?;
+            return Some(fdt);
         }
     }
     None
@@ -956,19 +1181,21 @@ unsafe fn efi_image_region(image_handle: u64, system_table: u64) -> Option<(u64,
     if image_handle == 0 || system_table == 0 {
         return None;
     }
-    let loaded_image = efi_loaded_image(image_handle, system_table)?;
-    let image_base = read_u64(loaded_image as usize + 64)?;
-    let image_size = read_u64(loaded_image as usize + 72)?;
+    let loaded_image = PointerRegion::from_u64(efi_loaded_image(image_handle, system_table)?, 80)?;
+    let image_base = read_u64(&loaded_image, 64)?;
+    let image_size = read_u64(&loaded_image, 72)?;
+    let image_size_usize = usize::try_from(image_size).ok()?;
+    PointerRegion::from_u64(image_base, image_size_usize)?;
     Some((image_base, image_size))
 }
 
 #[cfg(target_os = "uefi")]
 unsafe fn efi_loaded_image(image_handle: u64, system_table: u64) -> Option<u64> {
-    let boot_services = read_u64(system_table as usize + 96)? as usize;
-    let handle_protocol = read_u64(boot_services + 152)? as usize;
-    if handle_protocol == 0 {
+    if image_handle == 0 {
         return None;
     }
+    let boot_services = efi_boot_services_region(system_table)?;
+    let handle_protocol = efi_function_address(read_u64(&boot_services, 152)?)?;
     let handle_protocol: EfiHandleProtocol = core::mem::transmute(handle_protocol);
     let mut loaded_image = 0u64;
     if handle_protocol(
@@ -979,15 +1206,19 @@ unsafe fn efi_loaded_image(image_handle: u64, system_table: u64) -> Option<u64> 
     {
         return None;
     }
+    PointerRegion::from_u64(loaded_image, 80)?;
     Some(loaded_image)
 }
 
 #[cfg(target_os = "uefi")]
 unsafe fn efi_file_fdt(image_handle: u64, system_table: u64) -> Option<u64> {
-    let loaded_image = efi_loaded_image(image_handle, system_table)?;
-    let device_handle = read_u64(loaded_image as usize + 24)?;
-    let boot_services = read_u64(system_table as usize + 96)? as usize;
-    let handle_protocol = read_u64(boot_services + 152)? as usize;
+    let loaded_image = PointerRegion::from_u64(efi_loaded_image(image_handle, system_table)?, 80)?;
+    let device_handle = read_u64(&loaded_image, 24)?;
+    if device_handle == 0 {
+        return None;
+    }
+    let boot_services = efi_boot_services_region(system_table)?;
+    let handle_protocol = efi_function_address(read_u64(&boot_services, 152)?)?;
     let handle_protocol: EfiHandleProtocol = core::mem::transmute(handle_protocol);
     let mut file_system = 0u64;
     if handle_protocol(
@@ -999,21 +1230,38 @@ unsafe fn efi_file_fdt(image_handle: u64, system_table: u64) -> Option<u64> {
         return None;
     }
 
-    let open_volume: EfiOpenVolume = core::mem::transmute(read_u64(file_system as usize + 8)?);
+    let file_system_region = PointerRegion::from_u64(file_system, 16)?;
+    let open_volume = efi_function_address(read_u64(&file_system_region, 8)?)?;
+    let open_volume: EfiOpenVolume = core::mem::transmute(open_volume);
     let mut root = 0u64;
     if open_volume(file_system, &mut root) != 0 {
         return None;
     }
-    let open: EfiFileOpen = core::mem::transmute(read_u64(root as usize + 8)?);
+    let root_region = PointerRegion::from_u64(root, EFI_FILE_PROTOCOL_SIZE)?;
+    let root_close = efi_function_address(read_u64(&root_region, 16)?)?;
+    let root_close: EfiFileClose = core::mem::transmute(root_close);
+    let open = efi_function_address(read_u64(&root_region, 8)?)?;
+    let open: EfiFileOpen = core::mem::transmute(open);
     let mut file = 0u64;
     if open(root, &mut file, EFI_DTB_PATH.as_ptr(), 1, 0) != 0 {
+        root_close(root);
         return None;
     }
-    let close: EfiFileClose = core::mem::transmute(read_u64(file as usize + 16)?);
+    let file_region = PointerRegion::from_u64(file, EFI_FILE_PROTOCOL_SIZE)?;
+    let close = efi_function_address(read_u64(&file_region, 16)?)?;
+    let close: EfiFileClose = core::mem::transmute(close);
 
-    let get_info: EfiFileGetInfo = core::mem::transmute(read_u64(file as usize + 64)?);
+    let get_info = efi_function_address(read_u64(&file_region, 64)?)?;
+    let get_info: EfiFileGetInfo = core::mem::transmute(get_info);
+    let read = efi_function_address(read_u64(&file_region, 32)?)?;
+    let read: EfiFileRead = core::mem::transmute(read);
+    let allocate_pool = efi_function_address(read_u64(&boot_services, 64)?)?;
+    let allocate_pool: EfiAllocatePool = core::mem::transmute(allocate_pool);
+    let free_pool = efi_function_address(read_u64(&boot_services, 72)?)?;
+    let free_pool: EfiFreePool = core::mem::transmute(free_pool);
     let mut info_size = 128usize;
     let mut info = [0u8; 128];
+    let info_region = PointerRegion::new(info.as_ptr() as usize, info.len())?;
     if get_info(
         file,
         EFI_FILE_INFO_GUID.as_ptr(),
@@ -1022,34 +1270,54 @@ unsafe fn efi_file_fdt(image_handle: u64, system_table: u64) -> Option<u64> {
     ) != 0
     {
         close(file);
+        root_close(root);
         return None;
     }
-    let file_size = read_u64(info.as_ptr() as usize + 8)? as usize;
+    if info_size < 16 || info_size > info.len() {
+        close(file);
+        root_close(root);
+        return None;
+    }
+    let file_size = usize::try_from(read_u64(&info_region, 8)?).ok()?;
     if !(40..=MAX_FDT_SIZE).contains(&file_size) {
         close(file);
+        root_close(root);
         return None;
     }
 
-    let allocate_pool: EfiAllocatePool = core::mem::transmute(read_u64(boot_services + 64)?);
     let mut buffer = 0u64;
     if allocate_pool(2, file_size, &mut buffer) != 0 {
         close(file);
+        root_close(root);
         return None;
     }
-    let read: EfiFileRead = core::mem::transmute(read_u64(file as usize + 32)?);
+    let buffer_region = match PointerRegion::from_u64(buffer, file_size) {
+        Some(region) => region,
+        None => {
+            close(file);
+            root_close(root);
+            return None;
+        }
+    };
     let mut read_size = file_size;
-    if read(file, &mut read_size, buffer as *mut u8) != 0 || read_size != file_size {
+    if read(file, &mut read_size, buffer_region.address as *mut u8) != 0 || read_size != file_size {
+        free_pool(buffer);
         close(file);
+        root_close(root);
         return None;
     }
-    close(file);
+    if close(file) != 0 || root_close(root) != 0 {
+        free_pool(buffer);
+        return None;
+    }
     Some(buffer)
 }
 
 #[cfg(target_os = "uefi")]
 unsafe fn efi_framebuffer(system_table: u64) -> Option<RawFramebuffer> {
-    let boot_services = read_u64(system_table as usize + 96)? as usize;
-    let locate_protocol: EfiLocateProtocol = core::mem::transmute(read_u64(boot_services + 320)?);
+    let boot_services = efi_boot_services_region(system_table)?;
+    let locate_protocol = efi_function_address(read_u64(&boot_services, 320)?)?;
+    let locate_protocol: EfiLocateProtocol = core::mem::transmute(locate_protocol);
     let mut graphics = 0u64;
     if locate_protocol(
         EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID.as_ptr(),
@@ -1060,18 +1328,23 @@ unsafe fn efi_framebuffer(system_table: u64) -> Option<RawFramebuffer> {
         return None;
     }
     // EFI_GRAPHICS_OUTPUT_PROTOCOL: QueryMode, SetMode, Blt, then Mode.
-    let mode = read_u64(graphics as usize + 24)? as usize;
-    let info = read_u64(mode + 8)? as usize;
-    let width = read_u32(info + 4)? as u64;
-    let height = read_u32(info + 8)? as u64;
-    let format = match read_u32(info + 12)? {
+    let graphics = PointerRegion::from_u64(graphics, EFI_GOP_SIZE)?;
+    let mode = PointerRegion::from_u64(read_u64(&graphics, 24)?, EFI_GOP_MODE_SIZE)?;
+    let info_size = usize::try_from(read_u64(&mode, 16)?).ok()?;
+    if !(EFI_GOP_INFO_SIZE..=4096).contains(&info_size) {
+        return None;
+    }
+    let info = PointerRegion::from_u64(read_u64(&mode, 8)?, info_size)?;
+    let width = read_u32(&info, 4)? as u64;
+    let height = read_u32(&info, 8)? as u64;
+    let format = match read_u32(&info, 12)? {
         0 => PixelFormat::Rgb,
         1 => PixelFormat::Bgr,
         _ => return None,
     };
-    let pixels_per_scan_line = read_u32(info + 32)? as u64;
-    let base = read_u64(mode + 24)?;
-    let size = read_u64(mode + 32)?;
+    let pixels_per_scan_line = read_u32(&info, 32)? as u64;
+    let base = read_u64(&mode, 24)?;
+    let size = read_u64(&mode, 32)?;
     let framebuffer = framebuffer(
         base,
         pixels_per_scan_line.checked_mul(4)?,
@@ -1095,32 +1368,47 @@ enum NodeKind {
 }
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn node_kind(address: usize) -> (usize, NodeKind) {
-    let mut len = 0usize;
-    while len < 256 && read_u8(address + len).unwrap_or(0) != 0 {
-        len += 1;
+unsafe fn validate_fdt_reservations(blob: &PointerRegion, offset: usize) -> Option<()> {
+    for index in 0..1024usize {
+        let entry_offset = offset.checked_add(index.checked_mul(16)?)?;
+        let entry = blob.subregion(entry_offset, 16)?;
+        let address = read_be64(&entry, 0)?;
+        let length = read_be64(&entry, 8)?;
+        if address == 0 && length == 0 {
+            return Some(());
+        }
     }
-    let kind = if c_string_eq(address, b"chosen") {
+    None
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn node_kind(structure: &PointerRegion, offset: usize) -> Option<(usize, NodeKind)> {
+    let len = string_length(structure, offset)?;
+    if len > MAX_FDT_NODE_NAME {
+        return None;
+    }
+    let kind = if c_string_eq(structure, offset, b"chosen") {
         NodeKind::Chosen
-    } else if read_u8(address).unwrap_or(0) == b'm' && c_string_starts_with(address, b"memory") {
+    } else if c_string_starts_with(structure, offset, b"memory") {
         NodeKind::Memory
-    } else if c_string_starts_with(address, b"simple-framebuffer") {
+    } else if c_string_starts_with(structure, offset, b"simple-framebuffer") {
         NodeKind::SimpleFramebuffer
-    } else if c_string_starts_with(address, b"intc")
-        || c_string_starts_with(address, b"interrupt-controller")
+    } else if c_string_starts_with(structure, offset, b"intc")
+        || c_string_starts_with(structure, offset, b"interrupt-controller")
     {
         NodeKind::InterruptController
-    } else if c_string_eq(address, b"timer") {
+    } else if c_string_eq(structure, offset, b"timer") {
         NodeKind::Timer
     } else {
         NodeKind::Other
     };
-    (len, kind)
+    Some((len, kind))
 }
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn parse_reg(
     info: &mut BootInfo,
+    structure: &PointerRegion,
     data: usize,
     length: usize,
     address_cells: usize,
@@ -1131,53 +1419,93 @@ unsafe fn parse_reg(
     if entry_cells == 0 || entry_bytes == 0 || !length.is_multiple_of(entry_bytes) {
         return None;
     }
+    structure.subregion(data, length)?;
     let mut offset = 0usize;
     while offset < length {
-        let base = read_cells(data + offset, address_cells * 4, address_cells)?;
-        let length = read_cells(
-            data + offset + address_cells * 4,
-            size_cells * 4,
+        let entry_offset = data.checked_add(offset)?;
+        let address_bytes = address_cells.checked_mul(4)?;
+        let base = read_cells(
+            structure,
+            entry_offset,
+            length.checked_sub(offset)?,
+            address_cells,
+        )?;
+        let region_length = read_cells(
+            structure,
+            entry_offset.checked_add(address_bytes)?,
+            length.checked_sub(offset)?.checked_sub(address_bytes)?,
             size_cells,
         )?;
-        add_memory(info, base, length);
-        offset += entry_bytes;
+        if region_length != 0 && base.checked_add(region_length).is_none() {
+            return None;
+        }
+        add_memory(info, base, region_length);
+        offset = offset.checked_add(entry_bytes)?;
     }
     Some(())
 }
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn read_cells(address: usize, length: usize, cells: usize) -> Option<u64> {
+unsafe fn read_cells(
+    structure: &PointerRegion,
+    address: usize,
+    length: usize,
+    cells: usize,
+) -> Option<u64> {
     if cells == 0 || cells > 2 || length < cells.checked_mul(4)? {
         return None;
     }
     let mut value = 0u64;
     for i in 0..cells {
+        let offset = address.checked_add(i.checked_mul(4)?)?;
         value = value
             .checked_shl(32)?
-            .checked_add(read_be32(address + i * 4)? as u64)?;
+            .checked_add(read_be32(structure, offset)? as u64)?;
     }
     Some(value)
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn copy_c_string(address: usize, out: &mut [u8], len: &mut usize, limit: usize) {
-    let mut index = 0;
-    while index < out.len() && index < limit {
-        let byte = read_u8(address + index).unwrap_or(0);
+unsafe fn copy_c_string(
+    region: &PointerRegion,
+    offset: usize,
+    limit: usize,
+    out: &mut [u8],
+    len: &mut usize,
+) -> Option<()> {
+    let string = region.subregion(offset, limit)?;
+    let mut copied = 0;
+    let mut terminated = false;
+    for index in 0..limit {
+        let byte = read_u8(&string, index)?;
         if byte == 0 {
+            terminated = true;
             break;
         }
-        out[index] = byte;
-        index += 1;
+        if copied < out.len() {
+            out[copied] = byte;
+            copied += 1;
+        }
     }
-    *len = index;
+    if !terminated {
+        return None;
+    }
+    *len = copied;
+    Some(())
 }
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn copy_bytes(out: &mut [u8], len: &mut usize, address: usize, size: usize) -> usize {
+unsafe fn copy_bytes(
+    out: &mut [u8],
+    len: &mut usize,
+    structure: &PointerRegion,
+    address: usize,
+    size: usize,
+) -> Option<usize> {
+    let property = structure.subregion(address, size)?;
     let copied = size.min(out.len());
     for (index, byte) in out.iter_mut().enumerate().take(copied) {
-        *byte = read_u8(address + index).unwrap_or(0);
+        *byte = read_u8(&property, index)?;
     }
     let copied = out[..copied]
         .iter()
@@ -1185,20 +1513,50 @@ unsafe fn copy_bytes(out: &mut [u8], len: &mut usize, address: usize, size: usiz
         .map(|index| index + 1)
         .unwrap_or(0);
     *len = copied;
-    copied
+    Some(copied)
 }
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn c_string_eq(address: usize, expected: &[u8]) -> bool {
-    c_string_starts_with(address, expected) && read_u8(address + expected.len()).unwrap_or(1) == 0
+unsafe fn string_length(region: &PointerRegion, offset: usize) -> Option<usize> {
+    if offset >= region.length {
+        return None;
+    }
+    for index in offset..region.length {
+        if read_u8(region, index)? == 0 {
+            return Some(index - offset);
+        }
+    }
+    None
 }
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn c_string_starts_with(address: usize, expected: &[u8]) -> bool {
+unsafe fn c_string_eq(region: &PointerRegion, offset: usize, expected: &[u8]) -> bool {
+    string_length(region, offset) == Some(expected.len())
+        && c_string_starts_with(region, offset, expected)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn c_string_starts_with(region: &PointerRegion, offset: usize, expected: &[u8]) -> bool {
+    let Some(bytes) = region.subregion(offset, expected.len()) else {
+        return false;
+    };
     expected
         .iter()
         .enumerate()
-        .all(|(index, byte)| read_u8(address + index).unwrap_or(0) == *byte)
+        .all(|(index, byte)| read_u8(&bytes, index).is_some_and(|value| value == *byte))
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn property_c_string_starts_with(
+    structure: &PointerRegion,
+    offset: usize,
+    length: usize,
+    expected: &[u8],
+) -> bool {
+    let Some(property) = structure.subregion(offset, length) else {
+        return false;
+    };
+    c_string_starts_with(&property, 0, expected)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1206,21 +1564,42 @@ unsafe fn align4(value: usize) -> Option<usize> {
     value.checked_add(3).map(|value| value & !3)
 }
 
-unsafe fn read_u8(address: usize) -> Option<u8> {
+unsafe fn read_u8(region: &PointerRegion, offset: usize) -> Option<u8> {
+    let address = region.address_at(offset, 1)?;
     Some((address as *const u8).read_unaligned())
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-unsafe fn read_u32(address: usize) -> Option<u32> {
+unsafe fn read_u32(region: &PointerRegion, offset: usize) -> Option<u32> {
+    let address = region.address_at(offset, 4)?;
     Some((address as *const u32).read_unaligned())
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-unsafe fn read_u64(address: usize) -> Option<u64> {
+unsafe fn read_u64(region: &PointerRegion, offset: usize) -> Option<u64> {
+    let address = region.address_at(offset, 8)?;
     Some((address as *const u64).read_unaligned())
 }
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn read_be32(address: usize) -> Option<u32> {
-    Some(u32::from_be((address as *const u32).read_unaligned()))
+unsafe fn read_be32(region: &PointerRegion, offset: usize) -> Option<u32> {
+    Some(u32::from_be(read_u32(region, offset)?))
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn read_be64(region: &PointerRegion, offset: usize) -> Option<u64> {
+    let high = read_be32(region, offset)? as u64;
+    let low = read_be32(region, offset.checked_add(4)?)? as u64;
+    Some((high << 32) | low)
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+unsafe fn bytes_equal(region: &PointerRegion, offset: usize, expected: &[u8]) -> Option<bool> {
+    let bytes = region.subregion(offset, expected.len())?;
+    for (index, expected) in expected.iter().enumerate() {
+        if read_u8(&bytes, index)? != *expected {
+            return Some(false);
+        }
+    }
+    Some(true)
 }

@@ -8,7 +8,10 @@ mod arch;
 mod boot;
 mod bootlog;
 mod btrfs;
+mod capability;
 mod crash;
+mod crypto;
+mod devicefs;
 mod drivers;
 mod dynamic;
 mod elf;
@@ -27,22 +30,28 @@ mod log;
 mod memory;
 #[cfg(target_arch = "x86_64")]
 mod net;
+mod package;
 mod paging;
 mod pipe;
 mod process;
+mod recovery;
 mod sched;
 mod serial_debugger;
 mod service;
+mod signal;
+mod sync;
 mod syscall;
 mod time;
 mod timer;
 mod tty;
 mod user_runtime;
 mod usercopy;
+mod userdb;
 mod vfs;
 #[cfg(target_arch = "x86_64")]
 mod vga;
 mod vm;
+mod wait;
 mod wasm;
 
 use core::panic::PanicInfo;
@@ -50,21 +59,29 @@ use core::panic::PanicInfo;
 fn persistent_vfs_mount_smoke(
     source: vfs::MountSource,
 ) -> Result<(vfs::MountId, usize, bool), vfs::Error> {
+    let mut created_mountpoint = false;
     match vfs::stat("/storage") {
         Ok(stat) if stat.kind == vfs::NodeType::Directory => {}
         Ok(_) => return Err(vfs::Error::InvalidMountTarget),
-        Err(vfs::Error::NotFound) => vfs::mkdir("/storage")?,
+        Err(vfs::Error::NotFound) => {
+            vfs::mkdir("/storage")?;
+            created_mountpoint = true;
+        }
         Err(error) => return Err(error),
     }
-    let writable = matches!(source, vfs::MountSource::Fat32 | vfs::MountSource::Ext4)
-        && drivers::block::persistent()
-        && !drivers::block::read_only();
-    let flags = if writable {
-        vfs::MountFlags::defaults()
-    } else {
-        vfs::MountFlags::read_only()
+    // S0-084 is a read-only boot mount. Writable persistent lifecycle checks
+    // are a separate contract and must not change this mount's safety policy.
+    let writable = false;
+    let flags = vfs::MountFlags::read_only();
+    let mount = match vfs::mount(source, "/storage", flags) {
+        Ok(mount) => mount,
+        Err(error) => {
+            if created_mountpoint {
+                let _ = vfs::remove_dir("/storage");
+            }
+            return Err(error);
+        }
     };
-    let mount = vfs::mount(source, "/storage", flags)?;
     let result = (|| {
         let root = vfs::stat("/storage")?;
         if root.kind != vfs::NodeType::Directory {
@@ -80,17 +97,36 @@ fn persistent_vfs_mount_smoke(
         };
         let mut entries = [empty; 16];
         let count = vfs::read_dir("/storage", &mut entries)?;
-        let dentry = vfs::lookup("/storage")?;
-        if dentry.dentry().mount != mount {
-            let _ = vfs::release_dentry(dentry);
-            return Err(vfs::Error::MountNotFound);
+        if count > entries.len() {
+            return Err(vfs::Error::BackendError);
         }
-        vfs::release_dentry(dentry)?;
+        let dentry = vfs::lookup("/storage")?;
+        let dentry_result = if dentry.dentry().mount == mount {
+            Ok(())
+        } else {
+            Err(vfs::Error::MountNotFound)
+        };
+        let release_result = vfs::release_dentry(dentry);
+        match (dentry_result, release_result) {
+            (Err(error), _) => return Err(error),
+            (Ok(()), Err(error)) => return Err(error),
+            (Ok(()), Ok(())) => {}
+        }
+        if vfs::remove_dir("/storage") != Err(vfs::Error::Busy)
+            || vfs::remove_dir("/storage/") != Err(vfs::Error::Busy)
+        {
+            return Err(vfs::Error::Busy);
+        }
         vfs::sync_path("/storage")?;
 
+        let mut regular_file = None;
+        let mut path_bytes = [0; 256];
         for entry in entries.iter().take(count) {
             if entry.kind != vfs::NodeType::Regular || entry.size > 4096 {
                 continue;
+            }
+            if entry.name_length > entry.name.len() {
+                return Err(vfs::Error::BackendError);
             }
             let prefix = b"/storage/";
             let length = prefix
@@ -100,30 +136,17 @@ fn persistent_vfs_mount_smoke(
             if length > 256 {
                 return Err(vfs::Error::InvalidPath);
             }
-            let mut path_bytes = [0; 256];
             path_bytes[..prefix.len()].copy_from_slice(prefix);
             path_bytes[prefix.len()..length].copy_from_slice(&entry.name[..entry.name_length]);
             let path =
                 core::str::from_utf8(&path_bytes[..length]).map_err(|_| vfs::Error::InvalidPath)?;
-            let handle = vfs::open(path, vfs::OpenOptions::read())?;
-            let before = vfs::stat_handle(handle)?;
-            let mut data = [0; 4096];
-            let read = vfs::read_handle(handle, &mut data)?;
-            if before.size != 0 && read == 0 {
-                let _ = vfs::close(handle);
-                return Err(vfs::Error::BackendError);
-            }
-            vfs::seek_from(handle, 0, 0)?;
-            vfs::sync_handle(handle)?;
-            vfs::close(handle)?;
-            let reopened = vfs::open(path, vfs::OpenOptions::read())?;
-            if vfs::stat_handle(reopened)?.size != before.size {
-                let _ = vfs::close(reopened);
-                return Err(vfs::Error::BackendError);
-            }
-            vfs::close(reopened)?;
+            regular_file = Some(path);
             break;
         }
+        let Some(path) = regular_file else {
+            return Err(vfs::Error::BackendUnsupported);
+        };
+        persistent_file_smoke(path)?;
         if writable && source == vfs::MountSource::Fat32 {
             const PATH: &str = "/storage/NORX.VFS";
             const PAYLOAD: &[u8] = b"NORX VFS persistent write v1\n";
@@ -161,6 +184,9 @@ fn persistent_vfs_mount_smoke(
             vfs::sync_path(PATH)?;
             bootlog::ok("persistent VFS writable FAT32 create/write/fsync/readback passed");
 
+            persistent_handle_rename_reopen_smoke()?;
+            bootlog::ok("persistent VFS immutable-handle rename/reopen race check passed");
+
             const EXTERNAL_IMAGE: &str = "/storage/NORXELF.ELF";
             match vfs::stat(EXTERNAL_IMAGE) {
                 Ok(info) if info.kind == vfs::NodeType::Regular => {
@@ -184,11 +210,156 @@ fn persistent_vfs_mount_smoke(
         }
         Ok(count)
     })();
-    let unmount = vfs::unmount_mount(mount);
-    match (result, unmount) {
-        (Ok(count), Ok(())) => Ok((mount, count, writable)),
+    match result {
+        Ok(count) => Ok((mount, count, writable)),
+        Err(error) => {
+            let rollback = vfs::unmount_mount(mount);
+            let remove_mountpoint = if rollback.is_ok() && created_mountpoint {
+                vfs::remove_dir("/storage")
+            } else {
+                Ok(())
+            };
+            match rollback {
+                Err(rollback_error) => Err(rollback_error),
+                Ok(()) => match remove_mountpoint {
+                    Err(remove_error) => Err(remove_error),
+                    Ok(()) => Err(error),
+                },
+            }
+        }
+    }
+}
+
+fn persistent_file_smoke(path: &str) -> Result<(), vfs::Error> {
+    let handle = vfs::open(path, vfs::OpenOptions::read())?;
+    let result = (|| {
+        let before = vfs::stat_handle(handle)?;
+        if before.kind != vfs::NodeType::Regular || before.size > 4096 {
+            return Err(vfs::Error::BackendError);
+        }
+        let mut data = [0; 4096];
+        let read = vfs::read_handle(handle, &mut data)?;
+        if read != before.size {
+            return Err(vfs::Error::BackendError);
+        }
+        if vfs::seek_from(handle, 0, 0)? != 0 {
+            return Err(vfs::Error::OffsetOutOfRange);
+        }
+        vfs::sync_handle(handle)?;
+        Ok(before.size)
+    })();
+    let close = vfs::close(handle);
+    let size = match (result, close) {
+        (Err(error), _) => return Err(error),
+        (Ok(_), Err(error)) => return Err(error),
+        (Ok(size), Ok(())) => size,
+    };
+
+    let reopened = vfs::open(path, vfs::OpenOptions::read())?;
+    let result = (|| {
+        if vfs::stat_handle(reopened)?.size != size {
+            return Err(vfs::Error::BackendError);
+        }
+        let mut data = [0; 4096];
+        if vfs::read_handle(reopened, &mut data)? != size {
+            return Err(vfs::Error::BackendError);
+        }
+        Ok(())
+    })();
+    let close = vfs::close(reopened);
+    match (result, close) {
         (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn persistent_handle_rename_reopen_smoke() -> Result<(), vfs::Error> {
+    const OLD_PATH: &str = "/storage/NORX.P06";
+    const NEW_PATH: &str = "/storage/NORX.P06N";
+    const OLD_DATA: &[u8] = b"persistent old inode\n";
+    const NEW_DATA: &[u8] = b"persistent new inode\n";
+
+    for path in [OLD_PATH, NEW_PATH] {
+        match vfs::unlink(path) {
+            Ok(()) | Err(vfs::Error::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    let mut live_handle = None;
+    let result = (|| {
+        let handle = vfs::open(
+            OLD_PATH,
+            vfs::OpenOptions {
+                read: true,
+                write: true,
+                create: true,
+                truncate: true,
+                append: false,
+                exclusive: false,
+                mode: 0o644,
+            },
+        )?;
+        live_handle = Some(handle);
+        vfs::write_handle(handle, OLD_DATA)?;
+        if vfs::unlink(OLD_PATH) != Err(vfs::Error::Busy) {
+            return Err(vfs::Error::Busy);
+        }
+        if vfs::rename(OLD_PATH, NEW_PATH) != Err(vfs::Error::Busy) {
+            return Err(vfs::Error::Busy);
+        }
+        vfs::seek_from(handle, 0, 0)?;
+        let mut old_readback = [0; 64];
+        let read = vfs::read_handle(handle, &mut old_readback)?;
+        if read != OLD_DATA.len() || old_readback[..read] != *OLD_DATA {
+            return Err(vfs::Error::BackendError);
+        }
+        vfs::close(handle)?;
+        live_handle = None;
+
+        vfs::rename(OLD_PATH, NEW_PATH)?;
+        let replacement = vfs::open(OLD_PATH, vfs::OpenOptions::read_write_create())?;
+        live_handle = Some(replacement);
+        vfs::write_handle(replacement, NEW_DATA)?;
+        vfs::sync_handle(replacement)?;
+        vfs::close(replacement)?;
+        live_handle = None;
+
+        let renamed = vfs::open(NEW_PATH, vfs::OpenOptions::read())?;
+        live_handle = Some(renamed);
+        let mut renamed_readback = [0; 64];
+        let renamed_read = vfs::read_handle(renamed, &mut renamed_readback)?;
+        if renamed_read != OLD_DATA.len() || renamed_readback[..renamed_read] != *OLD_DATA {
+            return Err(vfs::Error::BackendError);
+        }
+        vfs::close(renamed)?;
+        live_handle = None;
+
+        let recreated = vfs::open(OLD_PATH, vfs::OpenOptions::read())?;
+        live_handle = Some(recreated);
+        let mut recreated_readback = [0; 64];
+        let recreated_read = vfs::read_handle(recreated, &mut recreated_readback)?;
+        if recreated_read != NEW_DATA.len() || recreated_readback[..recreated_read] != *NEW_DATA {
+            return Err(vfs::Error::BackendError);
+        }
+        vfs::close(recreated)?;
+        live_handle = None;
+        Ok(())
+    })();
+
+    if let Some(handle) = live_handle {
+        let _ = vfs::close(handle);
+    }
+    let cleanup = [OLD_PATH, NEW_PATH]
+        .into_iter()
+        .try_for_each(|path| match vfs::unlink(path) {
+            Ok(()) | Err(vfs::Error::NotFound) => Ok(()),
+            Err(error) => Err(error),
+        });
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => cleanup,
     }
 }
 
@@ -266,10 +437,6 @@ pub extern "C" fn kernel_start() -> ! {
             fb.pitch()
         ));
     }
-    bootlog::start(3, "initializing kernel clock");
-    time::init();
-    time::contract_self_check();
-    bootlog::ok("kernel clock initialized");
     bootlog::start(0, "probing built-in drivers");
     if drivers::init(boot.framebuffer) {
         bootlog::ok("driver framework initialized");
@@ -286,6 +453,10 @@ pub extern "C" fn kernel_start() -> ! {
     } else {
         bootlog::warn("persistent warm-reboot log unavailable; panic context remains serial-only");
     }
+    package::contract_self_check();
+    bootlog::ok(
+        "NORX_PACKAGE_TRUST_OK v=1 root=ed25519 metadata=1 artifact=sha256 store=immutable generations=atomic rollback=checked",
+    );
     bootlog::start(1, "checking virtual filesystem");
     fat32::contract_self_check();
     bootlog::ok("FAT32 parser, long-name, and safe-write checks passed");
@@ -326,6 +497,11 @@ pub extern "C" fn kernel_start() -> ! {
             summary.skipped_ranges
         ));
     }
+    if memory::contract_self_check() {
+        bootlog::ok("physical allocator ownership and return checks passed");
+    } else {
+        bootlog::fail("physical allocator ownership check unavailable: no free frame");
+    }
     bootlog::start(1, "allocating first free frame");
     if let Some(frame) = memory::alloc_frame() {
         bootlog::ok_fmt(format_args!("first free frame 0x{:x}", frame));
@@ -338,8 +514,6 @@ pub extern "C" fn kernel_start() -> ! {
     } else {
         bootlog::fail("architecture interrupt tables incomplete");
     }
-    bootlog::start(0, "checking interrupt controller");
-    arch::init_interrupt_controller();
     syscall::contract_self_check();
     bootlog::ok_fmt(format_args!(
         "syscall ABI v{} table entries={} args={} error=negative",
@@ -360,18 +534,34 @@ pub extern "C" fn kernel_start() -> ! {
         bootlog::fail("kernel paging initialization failed");
         arch::halt();
     }
+    bootlog::start(0, "checking interrupt controller");
+    arch::init_interrupt_controller();
+    bootlog::start(3, "initializing kernel clock");
+    time::init();
+    time::contract_self_check();
+    bootlog::ok("kernel clock initialized");
     process::contract_self_check();
+    capability::contract_self_check();
+    bootlog::ok_fmt(format_args!(
+        "NORX_SERVICE_AUTHORITY_OK v={} handles={} objects={} revocation=1 ipc=1 device=1 dma=1 quotas=1",
+        capability::CAPABILITY_ABI_VERSION,
+        capability::MAX_HANDLES,
+        capability::MAX_OBJECTS,
+    ));
     bootlog::ok(
         "process PID/TID, parent-child, credentials, FD, signal, event, and wait model checks passed",
     );
     bootlog::ok(
         "capability authorization checks passed; UID alone cannot bypass privileged operations",
     );
+    recovery::contract_self_check();
+    bootlog::ok("kernel-owned maintenance mode and one-shot recovery proof checks passed");
     ipc::contract_self_check();
     pipe::contract_self_check();
     tty::contract_self_check();
+    wait::contract_self_check();
     bootlog::ok(
-        "IPC channel, shared-memory ring, event queue, wait-queue, ownership, and blocking checks passed",
+        "IPC channel, shared-memory ring, event queue, wait queue/futex, ownership, timeout, cancellation, and blocking checks passed",
     );
     service::contract_self_check();
     bootlog::ok(
@@ -442,6 +632,8 @@ pub extern "C" fn kernel_start() -> ! {
     bootlog::ok(
         "address-space user isolation, page-table ownership, guard stack, ASLR, W^X, and teardown checks passed",
     );
+    usercopy::mapped_copy_contract_self_check();
+    bootlog::ok("mapped and unmapped usercopy recovery checks passed on active user tables");
     bootlog::quickinit_overlay_stage("checking lazy page faults", 94);
     vm::init();
     if vm::contract_self_check() {
@@ -642,7 +834,7 @@ pub extern "C" fn kernel_start() -> ! {
         match persistent_vfs_mount_smoke(source) {
             Ok((mount, entries, writable)) => {
                 bootlog::ok_fmt(format_args!(
-                    "persistent VFS mount source={:?} mount={} root_entries={} read_only={}",
+                    "NORX_PERSISTENT_VFS_SMOKE_OK v=1 source={:?} mount={} root_entries={} read_only={}",
                     source,
                     mount.raw(),
                     entries,
@@ -651,7 +843,7 @@ pub extern "C" fn kernel_start() -> ! {
                 break;
             }
             Err(error) => bootlog::warn_fmt(format_args!(
-                "persistent VFS mount source={:?} unavailable: {:?}",
+                "NORX_PERSISTENT_VFS_SMOKE_FAIL v=1 source={:?} error={:?}",
                 source, error
             )),
         }

@@ -1,4 +1,7 @@
-use crate::boot::{PixelFormat, RawFramebuffer};
+use crate::{
+    boot::{PixelFormat, RawFramebuffer},
+    sync::SmpLock,
+};
 
 const MAX_MODES: usize = 8;
 const MAX_DAMAGE: usize = 32;
@@ -14,15 +17,22 @@ pub enum ModePolicy {
 pub struct ModeContract {
     pub version: u8,
     pub firmware_policy: ModePolicy,
+    /// A host frontend resize only changes presentation scaling.
     pub host_window_resize_changes_guest_mode: bool,
-    pub scanout_resize_changes_guest_mode: bool,
+    /// A device-reported scanout geometry is presentation state, not a mode
+    /// request from the guest.
+    pub scanout_geometry_changes_guest_mode: bool,
+    /// An explicit controller mode request may publish a new guest mode only
+    /// after its controller-owned transaction commits.
+    pub controller_mode_policy: ModePolicy,
 }
 
 pub const MODE_CONTRACT: ModeContract = ModeContract {
     version: MODE_CONTRACT_VERSION,
     firmware_policy: ModePolicy::FirmwareFixed,
     host_window_resize_changes_guest_mode: false,
-    scanout_resize_changes_guest_mode: false,
+    scanout_geometry_changes_guest_mode: false,
+    controller_mode_policy: ModePolicy::ControllerTransactional,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,18 +122,31 @@ struct State {
     flushes: u64,
 }
 
-static mut STATE: Option<State> = None;
+static STATE: SmpLock<Option<State>> = SmpLock::new(None);
 
 pub fn contract_self_check() {
     assert_eq!(MODE_CONTRACT.version, MODE_CONTRACT_VERSION);
     assert_eq!(MODE_CONTRACT.firmware_policy, ModePolicy::FirmwareFixed);
+    assert_eq!(
+        MODE_CONTRACT.controller_mode_policy,
+        ModePolicy::ControllerTransactional
+    );
     const {
         assert!(!MODE_CONTRACT.host_window_resize_changes_guest_mode);
-        assert!(!MODE_CONTRACT.scanout_resize_changes_guest_mode);
+        assert!(!MODE_CONTRACT.scanout_geometry_changes_guest_mode);
     }
-    let _ = ModePolicy::ControllerTransactional;
     let _ = HotplugEvent::Connected;
     let _ = HotplugEvent::Disconnected;
+    let framebuffer = RawFramebuffer {
+        base: 0x1000 as *mut u8,
+        size: 2560 * 480,
+        width: 640,
+        height: 480,
+        stride: 2560,
+        bytes_per_pixel: 4,
+        format: PixelFormat::Rgb,
+    };
+    assert!(validate_framebuffer(framebuffer));
     assert!(valid_geometry(640, 480, 2560, 4, 2560 * 480));
     assert!(!valid_geometry(640, 480, 100, 4, 2560 * 480));
     assert!(!valid_geometry(640, 480, 2560, 4, 1024));
@@ -153,13 +176,13 @@ pub fn contract_self_check() {
 
 pub fn init(raw: Option<RawFramebuffer>) -> InitResult {
     let Some(raw) = raw else {
-        unsafe { core::ptr::addr_of_mut!(STATE).write(None) };
+        STATE.with(|state| *state = None);
         crate::bootlog::start(3, "discovering display framebuffer");
         crate::bootlog::warn("display framebuffer unavailable; serial remains active");
         return InitResult::Unsupported;
     };
     let Some(mode) = mode_from_raw(raw) else {
-        unsafe { core::ptr::addr_of_mut!(STATE).write(None) };
+        STATE.with(|state| *state = None);
         crate::bootlog::start(3, "discovering display framebuffer");
         crate::bootlog::warn("display framebuffer descriptor rejected; display deferred");
         return InitResult::Failed(Error::InvalidMode);
@@ -180,7 +203,7 @@ pub fn init(raw: Option<RawFramebuffer>) -> InitResult {
         flushes: 0,
     };
     let status = state.status();
-    unsafe { core::ptr::addr_of_mut!(STATE).write(Some(state)) };
+    STATE.with(|slot| *slot = Some(state));
     crate::bootlog::start(3, "discovering display framebuffer");
     crate::bootlog::ok_fmt(format_args!(
         "display ready mode={} {}x{} pitch={} bpp={} modes=1 edid=false damage={}",
@@ -190,12 +213,12 @@ pub fn init(raw: Option<RawFramebuffer>) -> InitResult {
 }
 
 pub fn status() -> Option<Status> {
-    unsafe { (&*core::ptr::addr_of!(STATE)).as_ref().map(State::status) }
+    STATE.with(|state| state.as_ref().map(State::status))
 }
 
 pub fn modes(output: &mut [Mode]) -> Result<usize, Error> {
-    unsafe {
-        let Some(state) = (&*core::ptr::addr_of!(STATE)).as_ref() else {
+    STATE.with(|state| {
+        let Some(state) = state.as_ref() else {
             return Err(Error::NoDisplay);
         };
         if output.len() < state.mode_count {
@@ -203,12 +226,12 @@ pub fn modes(output: &mut [Mode]) -> Result<usize, Error> {
         }
         output[..state.mode_count].copy_from_slice(&state.modes[..state.mode_count]);
         Ok(state.mode_count)
-    }
+    })
 }
 
 pub fn set_mode(id: u16) -> Result<Mode, Error> {
-    unsafe {
-        let Some(state) = (&mut *core::ptr::addr_of_mut!(STATE)).as_mut() else {
+    STATE.with(|state| {
+        let Some(state) = state.as_ref() else {
             return Err(Error::NoDisplay);
         };
         let Some(mode) = state.modes[..state.mode_count]
@@ -222,22 +245,20 @@ pub fn set_mode(id: u16) -> Result<Mode, Error> {
             return Err(Error::Unsupported);
         }
         Ok(mode)
-    }
+    })
 }
 
 pub fn edid(output: &mut [u8]) -> Result<usize, Error> {
-    unsafe {
-        if (&*core::ptr::addr_of!(STATE)).is_none() {
-            return Err(Error::NoDisplay);
-        }
+    if STATE.with(|state| state.is_none()) {
+        return Err(Error::NoDisplay);
     }
     let _ = output;
     Err(Error::Unsupported)
 }
 
 pub fn queue_damage(region: DamageRegion) -> Result<(), Error> {
-    unsafe {
-        let Some(state) = (&mut *core::ptr::addr_of_mut!(STATE)).as_mut() else {
+    STATE.with(|state| {
+        let Some(state) = state.as_mut() else {
             return Err(Error::NoDisplay);
         };
         let Some(mode) = state.active_mode() else {
@@ -252,24 +273,24 @@ pub fn queue_damage(region: DamageRegion) -> Result<(), Error> {
         state.damage[state.damage_len] = region;
         state.damage_len += 1;
         Ok(())
-    }
+    })
 }
 
 pub fn flush() -> Result<usize, Error> {
-    unsafe {
-        let Some(state) = (&mut *core::ptr::addr_of_mut!(STATE)).as_mut() else {
+    STATE.with(|state| {
+        let Some(state) = state.as_mut() else {
             return Err(Error::NoDisplay);
         };
         let flushed = state.damage_len;
         state.damage_len = 0;
         state.flushes = state.flushes.saturating_add(1);
         Ok(flushed)
-    }
+    })
 }
 
 pub fn set_cursor(cursor: Cursor) -> Result<(), Error> {
-    unsafe {
-        let Some(state) = (&mut *core::ptr::addr_of_mut!(STATE)).as_mut() else {
+    STATE.with(|state| {
+        let Some(state) = state.as_mut() else {
             return Err(Error::NoDisplay);
         };
         let Some(mode) = state.active_mode() else {
@@ -291,7 +312,7 @@ pub fn set_cursor(cursor: Cursor) -> Result<(), Error> {
         }
         state.cursor = cursor;
         Ok(())
-    }
+    })
 }
 
 pub fn poll_hotplug() -> Option<HotplugEvent> {
@@ -325,14 +346,7 @@ impl State {
 }
 
 fn mode_from_raw(raw: RawFramebuffer) -> Option<Mode> {
-    valid_geometry(
-        raw.width,
-        raw.height,
-        raw.stride,
-        raw.bytes_per_pixel,
-        raw.size,
-    )
-    .then_some(Mode {
+    validate_framebuffer(raw).then_some(Mode {
         id: 0,
         width: raw.width,
         height: raw.height,
@@ -341,6 +355,19 @@ fn mode_from_raw(raw: RawFramebuffer) -> Option<Mode> {
         format: raw.format,
         policy: MODE_CONTRACT.firmware_policy,
     })
+}
+
+pub fn validate_framebuffer(raw: RawFramebuffer) -> bool {
+    (raw.base as usize)
+        .checked_add(raw.size)
+        .is_some_and(|_| !raw.base.is_null())
+        && valid_geometry(
+            raw.width,
+            raw.height,
+            raw.stride,
+            raw.bytes_per_pixel,
+            raw.size,
+        )
 }
 
 fn valid_geometry(

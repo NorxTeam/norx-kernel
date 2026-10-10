@@ -1,7 +1,6 @@
 use crate::address_space::{AddressSpace, AslrHook, PageFlags, PAGE_SIZE};
 use crate::elf::{InitialRegisters, LoadPlan};
 use crate::process::ProcessId;
-use core::cell::UnsafeCell;
 
 const MAX_WRITE: usize = 256;
 
@@ -35,12 +34,13 @@ pub struct NativeRuntime {
 
 const MAX_RUNTIME_SLOTS: usize = 32;
 
-struct RuntimeStore(UnsafeCell<[Option<NativeRuntime>; MAX_RUNTIME_SLOTS]>);
+struct RuntimeSlot {
+    owner: ProcessId,
+    runtime: NativeRuntime,
+}
 
-unsafe impl Sync for RuntimeStore {}
-
-static RUNTIME_STORE: RuntimeStore =
-    RuntimeStore(UnsafeCell::new([const { None }; MAX_RUNTIME_SLOTS]));
+static RUNTIME_STORE: crate::sync::SmpLock<[Option<RuntimeSlot>; MAX_RUNTIME_SLOTS]> =
+    crate::sync::SmpLock::new([const { None }; MAX_RUNTIME_SLOTS]);
 
 impl NativeRuntime {
     pub fn prepare(
@@ -297,42 +297,83 @@ fn runtime_index(process: ProcessId) -> Option<usize> {
     (slot != 0 && slot <= MAX_RUNTIME_SLOTS).then_some(slot - 1)
 }
 
+fn runtime_key_matches(owner: ProcessId, process: ProcessId) -> bool {
+    owner == process
+}
+
+fn runtime_slot(
+    slots: &mut [Option<RuntimeSlot>; MAX_RUNTIME_SLOTS],
+    process: ProcessId,
+) -> Option<&mut RuntimeSlot> {
+    let index = runtime_index(process)?;
+    let slot = slots[index].as_mut()?;
+    runtime_key_matches(slot.owner, process).then_some(slot)
+}
+
+fn take_runtime(
+    slots: &mut [Option<RuntimeSlot>; MAX_RUNTIME_SLOTS],
+    process: ProcessId,
+) -> Option<NativeRuntime> {
+    let index = runtime_index(process)?;
+    let owner_matches = slots[index]
+        .as_ref()
+        .is_some_and(|slot| runtime_key_matches(slot.owner, process));
+    if !owner_matches {
+        return None;
+    }
+    slots[index].take().map(|slot| slot.runtime)
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "Return ownership for cleanup without a kernel heap"
+)]
 pub fn install(process: ProcessId, runtime: NativeRuntime) -> Result<(), Error> {
-    let index = runtime_index(process).ok_or(Error::InvalidState)?;
-    crate::arch::without_interrupts(|| unsafe {
-        let slots = &mut *RUNTIME_STORE.0.get();
+    let Some(index) = runtime_index(process) else {
+        let mut runtime = runtime;
+        let _ = runtime.discard();
+        return Err(Error::InvalidState);
+    };
+    if runtime.address_space.owner() != Some(process) {
+        let mut runtime = runtime;
+        let _ = runtime.discard();
+        return Err(Error::InvalidState);
+    }
+    match RUNTIME_STORE.with(|slots| {
         if slots[index].is_some() {
-            return Err(Error::InvalidState);
+            return Err(runtime);
         }
-        slots[index] = Some(runtime);
+        slots[index] = Some(RuntimeSlot {
+            owner: process,
+            runtime,
+        });
         Ok(())
-    })
+    }) {
+        Ok(()) => Ok(()),
+        Err(mut runtime) => {
+            let _ = runtime.discard();
+            Err(Error::InvalidState)
+        }
+    }
 }
 
 pub fn start(process: ProcessId) -> Result<InitialRegisters, Error> {
-    let index = runtime_index(process).ok_or(Error::InvalidState)?;
-    crate::arch::without_interrupts(|| unsafe {
-        (&mut *RUNTIME_STORE.0.get())[index]
-            .as_mut()
-            .ok_or(Error::InvalidState)?
-            .start()
-    })
+    RUNTIME_STORE
+        .with(|slots| runtime_slot(slots, process).map(|slot| slot.runtime.start()))
+        .ok_or(Error::InvalidState)?
 }
 
 #[allow(dead_code)]
 pub fn enter_resumable(process: ProcessId, log: bool) -> Result<(), Error> {
-    let index = runtime_index(process).ok_or(Error::InvalidState)?;
-    crate::arch::without_interrupts(|| unsafe {
-        (&mut *RUNTIME_STORE.0.get())[index]
-            .as_mut()
-            .ok_or(Error::InvalidState)?
-            .enter_user_resumable(log)
-    })
+    RUNTIME_STORE
+        .with(|slots| {
+            runtime_slot(slots, process).map(|slot| slot.runtime.enter_user_resumable(log))
+        })
+        .ok_or(Error::InvalidState)?
 }
 
 pub fn take(process: ProcessId) -> Option<NativeRuntime> {
-    let index = runtime_index(process)?;
-    crate::arch::without_interrupts(|| unsafe { (&mut *RUNTIME_STORE.0.get())[index].take() })
+    RUNTIME_STORE.with(|slots| take_runtime(slots, process))
 }
 
 pub fn discard(process: ProcessId) -> Result<(), Error> {
@@ -346,11 +387,8 @@ pub fn handle_fault(
     process: ProcessId,
     fault: crate::vm::FaultInfo,
 ) -> Option<crate::vm::FaultResult> {
-    let index = runtime_index(process)?;
-    crate::arch::without_interrupts(|| unsafe {
-        (&mut *RUNTIME_STORE.0.get())[index]
-            .as_mut()
-            .map(|runtime| runtime.address_space.handle_fault(fault))
+    RUNTIME_STORE.with(|slots| {
+        runtime_slot(slots, process).map(|slot| slot.runtime.address_space.handle_fault(fault))
     })
 }
 
@@ -361,6 +399,15 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
 }
 
 pub fn contract_self_check() {
+    let live = ProcessId::from_raw(1);
+    let recycled = ProcessId::from_raw((1 << 16) | 1);
+    assert_eq!(runtime_index(live), Some(0));
+    assert_eq!(runtime_index(recycled), Some(0));
+    assert!(runtime_key_matches(live, live));
+    assert!(!runtime_key_matches(live, recycled));
+    assert!(runtime_index(ProcessId::from_raw(0)).is_none());
+    assert!(runtime_index(ProcessId::from_raw(33)).is_none());
+
     let _errors = [
         Error::Elf(crate::elf::Error::Truncated),
         Error::AddressSpace(crate::address_space::Error::NoFrames),
@@ -372,6 +419,33 @@ pub fn contract_self_check() {
     ];
     let image = crate::elf::contract_image(crate::elf::Machine::current());
     let plan = crate::elf::parse(&image, crate::elf::Machine::current(), 0).unwrap();
+    let isolated_store: crate::sync::SmpLock<[Option<RuntimeSlot>; MAX_RUNTIME_SLOTS]> =
+        crate::sync::SmpLock::new([const { None }; MAX_RUNTIME_SLOTS]);
+    let isolated_runtime =
+        NativeRuntime::prepare(live, &plan, AslrHook::new(17), &[b"stale-slot"], &[]).unwrap();
+    let (live_match, recycled_match, stale_take, mut isolated_runtime) =
+        isolated_store.with(|slots| {
+            slots[0] = Some(RuntimeSlot {
+                owner: live,
+                runtime: isolated_runtime,
+            });
+            let live_match = runtime_slot(slots, live).is_some();
+            let recycled_match = runtime_slot(slots, recycled).is_none();
+            let stale_take = take_runtime(slots, recycled).is_none();
+            let runtime = take_runtime(slots, live).unwrap();
+            (live_match, recycled_match, stale_take, runtime)
+        });
+    assert!(live_match);
+    assert!(recycled_match);
+    assert!(stale_take);
+    isolated_runtime.discard().unwrap();
+    let mismatched_runtime =
+        NativeRuntime::prepare(live, &plan, AslrHook::new(18), &[b"wrong-owner"], &[]).unwrap();
+    assert_eq!(
+        install(recycled, mismatched_runtime),
+        Err(Error::InvalidState)
+    );
+
     let arguments = [b"init".as_slice()];
     let environment: [&[u8]; 0] = [];
     let mut runtime = NativeRuntime::prepare(

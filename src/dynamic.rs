@@ -37,6 +37,8 @@ const MAX_GNU_HASH_BUCKETS: usize = 256;
 const MAX_GNU_HASH_BLOOM: usize = 256;
 const RELA_SIZE: usize = 24;
 const SYMBOL_SIZE: usize = 24;
+const MAX_LIBRARY_IMAGE: usize = 4096;
+const SHA256_DIGEST_SIZE: usize = 32;
 
 const R_X86_64_64: u32 = 1;
 const R_X86_64_GLOB_DAT: u32 = 6;
@@ -46,7 +48,7 @@ const R_AARCH64_ABS64: u32 = 257;
 const R_AARCH64_GLOB_DAT: u32 = 1025;
 const R_AARCH64_JUMP_SLOT: u32 = 1026;
 const R_AARCH64_RELATIVE: u32 = 1027;
-const SMOKE_IMAGE_SIZE: usize = 4096 + 4;
+const SMOKE_IMAGE_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -71,9 +73,86 @@ pub enum Error {
     TooManyNeeded,
     InvalidLibraryName,
     MissingDependency,
+    UntrustedLibrary,
+    LibraryChanged,
+    LibraryRelease,
 }
 
 pub const LIBRARY_SEARCH_ROOTS: [&[u8]; 1] = [b"/lib"];
+// Reserved wire version for the staged persistent library manifest.
+#[allow(dead_code)]
+pub const LIBRARY_MANIFEST_VERSION: u32 = 1;
+
+#[cfg(target_arch = "x86_64")]
+const LIBDEP_SHA256: [u8; SHA256_DIGEST_SIZE] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+#[cfg(target_arch = "aarch64")]
+const LIBDEP_SHA256: [u8; SHA256_DIGEST_SIZE] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LibraryManifestEntry {
+    pub name: &'static [u8],
+    pub sha256: [u8; SHA256_DIGEST_SIZE],
+    pub owner_uid: u32,
+    pub owner_gid: u32,
+    pub mode: u16,
+}
+
+pub const TRUSTED_LIBRARY_MANIFEST: [LibraryManifestEntry; 1] = [LibraryManifestEntry {
+    name: b"libdep.so",
+    sha256: LIBDEP_SHA256,
+    owner_uid: 0,
+    owner_gid: 0,
+    mode: 0o444,
+}];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LibraryIdentity {
+    pub mount: crate::vfs::MountId,
+    pub inode: u32,
+    pub size: usize,
+    pub mode: u16,
+    pub owner_uid: u32,
+    pub owner_gid: u32,
+}
+
+pub struct LibraryResolution<'a> {
+    pub image: &'a [u8],
+    pub plan: &'a DynamicPlan,
+    pub identity: LibraryIdentity,
+    handle: crate::vfs::FileHandle,
+    dentry: crate::vfs::DentryHandle,
+}
+
+impl LibraryResolution<'_> {
+    pub fn revalidate(&self) -> Result<(), Error> {
+        let mount =
+            crate::vfs::mount_info(self.identity.mount).map_err(|_| Error::LibraryChanged)?;
+        if mount.source != crate::vfs::MountSource::Ramfs
+            || mount.flags != crate::vfs::MountFlags::read_only()
+        {
+            return Err(Error::LibraryChanged);
+        }
+        let stat = crate::vfs::stat_handle(self.handle).map_err(|_| Error::LibraryChanged)?;
+        if library_identity(self.identity.mount, stat) != self.identity {
+            return Err(Error::LibraryChanged);
+        }
+        Ok(())
+    }
+
+    pub fn release(self) -> Result<(), Error> {
+        let close = crate::vfs::close(self.handle);
+        let dentry = crate::vfs::release_dentry(self.dentry);
+        match (close, dentry) {
+            (Ok(()), Ok(())) => Ok(()),
+            _ => Err(Error::LibraryRelease),
+        }
+    }
+}
 
 pub fn validate_library_name(name: &[u8]) -> Result<(), Error> {
     if name.is_empty()
@@ -170,9 +249,7 @@ impl DynamicPlan {
                 .file_offset
                 .checked_add(index.checked_mul(SYMBOL_SIZE).ok_or(Error::InvalidTable)?)
                 .ok_or(Error::InvalidTable)?;
-            let entry = image
-                .get(offset..offset + SYMBOL_SIZE)
-                .ok_or(Error::Truncated)?;
+            let entry = slice_at(image, offset, SYMBOL_SIZE)?;
             let name_offset = read_u32(entry, 0)?;
             if string_at(image, &strings, name_offset as usize)? != name {
                 continue;
@@ -191,7 +268,11 @@ impl DynamicPlan {
     }
 
     pub fn relocation(&self, index: usize) -> Option<Relocation> {
-        (index < self.relocation_count).then_some(self.relocations[index])
+        if index < self.relocation_count {
+            Some(self.relocations[index])
+        } else {
+            None
+        }
     }
 
     pub fn relative_value(&self, index: usize) -> Result<usize, Error> {
@@ -319,15 +400,17 @@ pub fn parse(image: &[u8], plan: &LoadPlan, machine: Machine) -> Result<DynamicP
 
     let mut dynamic_header = None;
     let mut tls = None;
-    for index in 0..program_header_count {
-        let offset = program_header_offset + index * PROGRAM_HEADER_SIZE;
+    let program_headers = image
+        .get(program_header_offset..program_header_end)
+        .ok_or(Error::Truncated)?;
+    for header_bytes in program_headers.chunks_exact(PROGRAM_HEADER_SIZE) {
         let header = ProgramHeader {
-            kind: read_u32(image, offset)?,
-            file_offset: read_u64(image, offset + 8)?,
-            virtual_address: read_u64(image, offset + 16)?,
-            file_size: read_u64(image, offset + 32)?,
-            memory_size: read_u64(image, offset + 40)?,
-            alignment: read_u64(image, offset + 48)?,
+            kind: read_u32(header_bytes, 0)?,
+            file_offset: read_u64(header_bytes, 8)?,
+            virtual_address: read_u64(header_bytes, 16)?,
+            file_size: read_u64(header_bytes, 32)?,
+            memory_size: read_u64(header_bytes, 40)?,
+            alignment: read_u64(header_bytes, 48)?,
         };
         match header.kind {
             PT_DYNAMIC => {
@@ -384,12 +467,12 @@ pub fn parse(image: &[u8], plan: &LoadPlan, machine: Machine) -> Result<DynamicP
         size: dynamic_size,
         entry_size: 16,
     };
+    let dynamic_bytes = slice_at(image, dynamic_file_offset, dynamic_size)?;
     let mut tags = Tags::new();
     let mut terminated = false;
-    for index in 0..(dynamic_size / 16) {
-        let offset = dynamic_file_offset + index * 16;
-        let tag = read_u64(image, offset)?;
-        let value = read_u64(image, offset + 8)?;
+    for entry in dynamic_bytes.chunks_exact(16) {
+        let tag = read_u64(entry, 0)?;
+        let value = read_u64(entry, 8)?;
         if tag == DT_NULL {
             terminated = true;
             break;
@@ -581,7 +664,10 @@ fn table(
     entry_size: usize,
 ) -> Result<Table, Error> {
     let size = usize::try_from(size).map_err(|_| Error::TableTooLarge)?;
-    if size > MAX_STRING_TABLE || (entry_size != 1 && !size.is_multiple_of(entry_size)) {
+    if entry_size == 0
+        || size > MAX_STRING_TABLE
+        || (entry_size != 1 && !size.is_multiple_of(entry_size))
+    {
         return Err(Error::TableTooLarge);
     }
     let virtual_address = plan
@@ -591,9 +677,8 @@ fn table(
     let file_offset = plan
         .file_offset(virtual_address, size)
         .ok_or(Error::InvalidTable)?;
-    image
-        .get(file_offset..file_offset.checked_add(size).ok_or(Error::InvalidTable)?)
-        .ok_or(Error::Truncated)?;
+    let end = file_offset.checked_add(size).ok_or(Error::InvalidTable)?;
+    image.get(file_offset..end).ok_or(Error::Truncated)?;
     Ok(Table {
         virtual_address,
         file_offset,
@@ -613,9 +698,8 @@ fn file_slice_at<'a>(
         .checked_add(usize::try_from(virtual_address).map_err(|_| Error::InvalidTable)?)
         .ok_or(Error::InvalidTable)?;
     let offset = plan.file_offset(address, size).ok_or(Error::InvalidTable)?;
-    image
-        .get(offset..offset.checked_add(size).ok_or(Error::InvalidTable)?)
-        .ok_or(Error::Truncated)
+    let end = offset.checked_add(size).ok_or(Error::InvalidTable)?;
+    image.get(offset..end).ok_or(Error::Truncated)
 }
 
 fn sysv_symbol_count(image: &[u8], plan: &LoadPlan, address: u64) -> Result<usize, Error> {
@@ -654,19 +738,20 @@ fn gnu_symbol_count(image: &[u8], plan: &LoadPlan, address: u64) -> Result<usize
             .checked_add(bucket_count.checked_mul(4).ok_or(Error::TableTooLarge)?)
             .ok_or(Error::TableTooLarge)?,
     )?;
-    let chains_address = address
+    let bucket_count_bytes = bucket_count.checked_mul(4).ok_or(Error::TableTooLarge)?;
+    let buckets_address = address
         .checked_add(u64::try_from(buckets_offset).map_err(|_| Error::TableTooLarge)?)
-        .and_then(|value| value.checked_add(u64::try_from(bucket_count.checked_mul(4)?).ok()?))
+        .ok_or(Error::TableTooLarge)?;
+    let chains_address = buckets_address
+        .checked_add(u64::try_from(bucket_count_bytes).map_err(|_| Error::TableTooLarge)?)
         .ok_or(Error::TableTooLarge)?;
     let mut symbol_count = 0;
     for bucket in 0..bucket_count {
-        let bucket_offset = buckets_offset + bucket * 4;
-        let bucket_bytes = file_slice_at(
-            image,
-            plan,
-            address + u64::try_from(bucket_offset).map_err(|_| Error::TableTooLarge)?,
-            4,
-        )?;
+        let bucket_offset = bucket.checked_mul(4).ok_or(Error::TableTooLarge)?;
+        let bucket_address = buckets_address
+            .checked_add(u64::try_from(bucket_offset).map_err(|_| Error::TableTooLarge)?)
+            .ok_or(Error::TableTooLarge)?;
+        let bucket_bytes = file_slice_at(image, plan, bucket_address, 4)?;
         let mut index =
             usize::try_from(read_u32(bucket_bytes, 0)?).map_err(|_| Error::TableTooLarge)?;
         if index < symbol_offset {
@@ -718,11 +803,10 @@ fn append_relocations(
         return Err(Error::UnsupportedRelocationFormat);
     }
     let table = file_slice_at(context.image, context.plan, address, size)?;
-    for index in 0..(size / RELA_SIZE) {
+    for entry in table.chunks_exact(RELA_SIZE) {
         if *context.relocation_count == MAX_RELOCATIONS {
             return Err(Error::TableTooLarge);
         }
-        let entry = &table[index * RELA_SIZE..(index + 1) * RELA_SIZE];
         let target = context
             .plan
             .base
@@ -786,22 +870,127 @@ fn symbolic_kind(machine: Machine) -> u32 {
     }
 }
 
+fn trusted_library(name: &[u8]) -> Option<&'static LibraryManifestEntry> {
+    TRUSTED_LIBRARY_MANIFEST
+        .iter()
+        .find(|entry| entry.name == name)
+}
+
+fn library_identity(mount: crate::vfs::MountId, stat: crate::vfs::FileStat) -> LibraryIdentity {
+    LibraryIdentity {
+        mount,
+        inode: stat.inode,
+        size: stat.size,
+        mode: stat.mode,
+        owner_uid: stat.uid,
+        owner_gid: stat.gid,
+    }
+}
+
 fn resolve_library<'a>(
     name: &[u8],
     path: &'a [u8],
     image: &'a [u8],
     plan: &'a DynamicPlan,
-) -> Result<(&'a [u8], &'a DynamicPlan), Error> {
+) -> Result<LibraryResolution<'a>, Error> {
     validate_library_name(name)?;
+    let expected = trusted_library(name).ok_or(Error::MissingDependency)?;
     let found = LIBRARY_SEARCH_ROOTS.iter().any(|root| {
         path.starts_with(root)
             && path.len() == root.len() + 1 + name.len()
             && path[root.len()] == b'/'
             && path[root.len() + 1..] == *name
     });
-    found
-        .then_some((image, plan))
-        .ok_or(Error::MissingDependency)
+    if !found || image.is_empty() || image.len() > MAX_LIBRARY_IMAGE {
+        return Err(Error::UntrustedLibrary);
+    }
+    let path = core::str::from_utf8(path).map_err(|_| Error::InvalidLibraryName)?;
+    let root = crate::vfs::lookup("/lib").map_err(map_library_vfs_error)?;
+    let root_result = (|| {
+        let root_dentry = root.dentry();
+        let root_mount =
+            crate::vfs::mount_info(root_dentry.mount).map_err(|_| Error::UntrustedLibrary)?;
+        let root_stat = crate::vfs::stat("/lib").map_err(map_library_vfs_error)?;
+        if root_mount.source != crate::vfs::MountSource::Ramfs
+            || root_mount.flags != crate::vfs::MountFlags::read_only()
+            || root_stat.kind != crate::vfs::NodeType::Directory
+            || root_stat.uid != expected.owner_uid
+            || root_stat.gid != expected.owner_gid
+            || root_stat.mode & 0o222 != 0
+        {
+            return Err(Error::UntrustedLibrary);
+        }
+
+        let dentry = crate::vfs::lookup(path).map_err(map_library_vfs_error)?;
+        let handle = match crate::vfs::open(path, crate::vfs::OpenOptions::read()) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = crate::vfs::release_dentry(dentry);
+                return Err(map_library_vfs_error(error));
+            }
+        };
+        let result = (|| {
+            let stat = crate::vfs::stat_handle(handle).map_err(map_library_vfs_error)?;
+            if stat.kind != crate::vfs::NodeType::Regular
+                || stat.inode != dentry.dentry().inode as u32
+                || stat.uid != expected.owner_uid
+                || stat.gid != expected.owner_gid
+                || stat.mode != expected.mode
+                || stat.size != image.len()
+                || sha256(image) != expected.sha256
+            {
+                return Err(Error::UntrustedLibrary);
+            }
+            let mut contents = [0u8; MAX_LIBRARY_IMAGE];
+            let mut length = 0;
+            while length < stat.size {
+                let read = crate::vfs::read_handle(handle, &mut contents[length..stat.size])
+                    .map_err(map_library_vfs_error)?;
+                if read == 0 || read > stat.size - length {
+                    return Err(Error::UntrustedLibrary);
+                }
+                length += read;
+            }
+            if contents[..length] != *image || sha256(&contents[..length]) != expected.sha256 {
+                return Err(Error::UntrustedLibrary);
+            }
+            let final_stat = crate::vfs::stat_handle(handle).map_err(map_library_vfs_error)?;
+            if library_identity(dentry.dentry().mount, final_stat)
+                != library_identity(dentry.dentry().mount, stat)
+            {
+                return Err(Error::LibraryChanged);
+            }
+            Ok(LibraryResolution {
+                image,
+                plan,
+                identity: library_identity(dentry.dentry().mount, stat),
+                handle,
+                dentry,
+            })
+        })();
+        if result.is_err() {
+            let _ = crate::vfs::close(handle);
+            let _ = crate::vfs::release_dentry(dentry);
+        }
+        result
+    })();
+    let root_release = crate::vfs::release_dentry(root);
+    match (root_result, root_release) {
+        (Ok(resolution), Ok(())) => Ok(resolution),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(_)) => Err(Error::LibraryRelease),
+    }
+}
+
+fn map_library_vfs_error(error: crate::vfs::Error) -> Error {
+    match error {
+        crate::vfs::Error::NotFound => Error::MissingDependency,
+        _ => Error::UntrustedLibrary,
+    }
+}
+
+fn sha256(input: &[u8]) -> [u8; SHA256_DIGEST_SIZE] {
+    crate::crypto::sha256(input)
 }
 
 fn add_signed(base: usize, addend: i64) -> Option<usize> {
@@ -820,9 +1009,11 @@ fn string_at<'a>(image: &'a [u8], table: &Table, offset: usize) -> Result<&'a [u
         .file_offset
         .checked_add(offset)
         .ok_or(Error::InvalidString)?;
-    let bytes = image
-        .get(start..table.file_offset + table.size)
-        .ok_or(Error::Truncated)?;
+    let table_end = table
+        .file_offset
+        .checked_add(table.size)
+        .ok_or(Error::InvalidString)?;
+    let bytes = image.get(start..table_end).ok_or(Error::Truncated)?;
     let end = bytes
         .iter()
         .position(|byte| *byte == 0)
@@ -830,18 +1021,23 @@ fn string_at<'a>(image: &'a [u8], table: &Table, offset: usize) -> Result<&'a [u
     Ok(&bytes[..end])
 }
 
+fn slice_at(bytes: &[u8], offset: usize, width: usize) -> Result<&[u8], Error> {
+    let end = offset.checked_add(width).ok_or(Error::Truncated)?;
+    bytes.get(offset..end).ok_or(Error::Truncated)
+}
+
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
-    let bytes = bytes.get(offset..offset + 2).ok_or(Error::Truncated)?;
+    let bytes = slice_at(bytes, offset, 2)?;
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
-    let bytes = bytes.get(offset..offset + 4).ok_or(Error::Truncated)?;
+    let bytes = slice_at(bytes, offset, 4)?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
-    let bytes = bytes.get(offset..offset + 8).ok_or(Error::Truncated)?;
+    let bytes = slice_at(bytes, offset, 8)?;
     Ok(u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]))
@@ -863,8 +1059,69 @@ fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-fn contract_image(machine: Machine) -> [u8; 4096 + 4] {
-    let mut image = [0u8; 4096 + 4];
+const MALFORMED_FUZZ_CASES: usize = 512;
+
+fn fuzz_next(state: &mut u64) -> u64 {
+    *state ^= *state << 7;
+    *state ^= *state >> 9;
+    *state
+}
+
+fn malformed_image_fuzz_self_check() {
+    let machine = Machine::current();
+    let seed = contract_image(machine);
+    let mut image = seed;
+    let mut state = 0xd1b5_4a32_d192_ed03;
+    let mut parsed_images = 0;
+    let dynamic_header = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE;
+    for case in 0..MALFORMED_FUZZ_CASES {
+        image.copy_from_slice(&seed);
+        if case != 0 {
+            let flips = 1 + (fuzz_next(&mut state) as usize & 7);
+            for _ in 0..flips {
+                let index = 0x80 + (fuzz_next(&mut state) as usize % (0x600 - 0x80));
+                image[index] ^= fuzz_next(&mut state) as u8 | 1;
+            }
+            match case % 6 {
+                0 => write_u64(&mut image, dynamic_header + 32, u64::MAX),
+                1 => write_u64(&mut image, dynamic_header + 40, u64::MAX),
+                2 => write_u64(&mut image, dynamic_header + 16, u64::MAX),
+                3 => write_u64(&mut image, 0x200 + (case % 10) * 16 + 8, u64::MAX),
+                4 => write_u64(&mut image, 0x200 + (case % 10) * 16 + 8, 0),
+                _ => write_u64(&mut image, 0x3a0, u64::MAX),
+            }
+        }
+        let load_plan = match elf::parse(&image, machine, 0x100000) {
+            Ok(plan) => plan,
+            Err(_) => continue,
+        };
+        parsed_images += 1;
+        if let Ok(dynamic) = parse(&image, &load_plan, machine) {
+            let _ = dynamic.needed(&image, 0);
+            let _ = dynamic.soname(&image);
+            let _ = dynamic.lookup_symbol(&image, b"fuzz");
+            let _ = dynamic.relocation(usize::MAX);
+        }
+    }
+    assert!(parsed_images > 0);
+
+    assert_eq!(read_u16(&[], usize::MAX), Err(Error::Truncated));
+    assert_eq!(read_u32(&[], usize::MAX), Err(Error::Truncated));
+    assert_eq!(read_u64(&[], usize::MAX), Err(Error::Truncated));
+    let overflowing_table = Table {
+        virtual_address: 0,
+        file_offset: usize::MAX,
+        size: 1,
+        entry_size: 1,
+    };
+    assert_eq!(
+        string_at(&[0], &overflowing_table, 0),
+        Err(Error::InvalidString)
+    );
+}
+
+fn contract_image(machine: Machine) -> [u8; SMOKE_IMAGE_SIZE] {
+    let mut image = [0u8; SMOKE_IMAGE_SIZE];
     image[0..4].copy_from_slice(b"\x7fELF");
     image[4] = 2;
     image[5] = 1;
@@ -981,13 +1238,16 @@ pub fn smoke_self_check() {
     let main_dynamic = parse(main_image, &main_load, machine).unwrap();
     let library_dynamic = parse(library_image, &library_load, machine).unwrap();
     let dependency = main_dynamic.needed(main_image, 0).unwrap().unwrap();
-    let (resolved_image, resolved_plan) = resolve_library(
+    let resolution = resolve_library(
         dependency,
         b"/lib/libdep.so",
         library_image,
         &library_dynamic,
     )
     .unwrap();
+    resolution.revalidate().unwrap();
+    let resolved_image = resolution.image;
+    let resolved_plan = resolution.plan;
     assert_eq!(resolved_image, library_image);
     let undefined = main_dynamic
         .lookup_symbol(main_image, b"foo")
@@ -1010,7 +1270,7 @@ pub fn smoke_self_check() {
             .unwrap(),
         0x600604
     );
-    assert_eq!(
+    assert!(matches!(
         resolve_library(
             b"missing.so",
             b"/lib/libdep.so",
@@ -1018,7 +1278,7 @@ pub fn smoke_self_check() {
             &library_dynamic,
         ),
         Err(Error::MissingDependency)
-    );
+    ));
     let dentry = crate::vfs::lookup("/lib/libdep.so").unwrap();
     assert_ne!(dentry.dentry().mount, crate::vfs::MountId::ROOT);
     crate::vfs::release_dentry(dentry).unwrap();
@@ -1027,6 +1287,7 @@ pub fn smoke_self_check() {
         Err(crate::vfs::Error::NotFound)
     ));
 
+    resolution.release().unwrap();
     let arguments = [b"dynamic-smoke".as_slice()];
     let environment: [&[u8]; 0] = [];
     let mut runtime = NativeRuntime::prepare(
@@ -1070,4 +1331,5 @@ pub fn contract_self_check() {
         parse(&image, &load_plan, other_machine),
         Err(Error::WrongMachine)
     );
+    malformed_image_fuzz_self_check();
 }

@@ -1,12 +1,20 @@
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 const MAX_DRIVERS: usize = 32;
 const MAX_DEVICES_PER_BUS: usize = 16;
 const MAX_RESOURCES: usize = 8;
+const PAGE_SIZE: usize = 4096;
+const MAX_DMA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DMA_ALLOCATIONS: usize = 64;
+#[allow(dead_code, reason = "Refcount limit for staged DMA ownership sharing")]
+const MAX_DMA_REFS: u16 = u16::MAX;
+const DMA_LOCK_SPINS: usize = 4096;
 
 pub type BusId = u16;
 pub type DeviceId = u16;
 pub type DriverId = u16;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BusKind {
     Platform,
     Pci,
@@ -15,7 +23,44 @@ pub enum BusKind {
     Ps2,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmaIsolation {
+    #[allow(
+        dead_code,
+        reason = "IOMMU isolation is a staged backend; allocation currently fails closed"
+    )]
+    Iommu,
+    TrustedDevice,
+    Unsupported,
+}
+
+pub const DMA_CONTRACT_VERSION: u8 = 1;
+
+/// Returns the isolation policy for a bus before any DMA allocation is made.
+///
+/// There is no IOMMU implementation in this kernel yet. PCI and virtio are
+/// therefore enabled only under the explicit trusted-device boot assumption;
+/// all other buses fail closed instead of receiving an ambient DMA mapping.
+pub fn dma_isolation(bus: BusKind) -> DmaIsolation {
+    match bus {
+        BusKind::Pci | BusKind::Virtio => DmaIsolation::TrustedDevice,
+        BusKind::Platform | BusKind::Usb | BusKind::Ps2 => DmaIsolation::Unsupported,
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "Diagnostic name used by the staged DMA contract self-check"
+)]
+pub fn dma_isolation_name(isolation: DmaIsolation) -> &'static str {
+    match isolation {
+        DmaIsolation::Iommu => "iommu",
+        DmaIsolation::TrustedDevice => "trusted-device",
+        DmaIsolation::Unsupported => "unsupported",
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
     Display,
     Serial,
@@ -49,6 +94,7 @@ pub enum DeviceState {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IrqKind {
     Legacy,
+    Local,
     Msi,
     MsiX,
     Gic,
@@ -69,22 +115,191 @@ pub struct Irq {
     pub registration: Option<crate::irq::RegistrationId>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct DmaBuffer {
-    pub physical: crate::address::PhysAddr,
-    pub virtual_address: crate::address::VirtAddr,
-    pub length: usize,
-    pub alignment: usize,
-    pub direction: DmaDirection,
-    pub owner: DeviceId,
+#[derive(Clone, Copy)]
+struct DmaRecord {
+    generation: u32,
+    references: u16,
+    frames: usize,
 }
 
+static DMA_LOCK: AtomicBool = AtomicBool::new(false);
+static DMA_RELEASE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+static mut DMA_RECORDS: [Option<DmaRecord>; MAX_DMA_ALLOCATIONS] = [None; MAX_DMA_ALLOCATIONS];
+static mut DMA_GENERATIONS: [u32; MAX_DMA_ALLOCATIONS] = [0; MAX_DMA_ALLOCATIONS];
+
+struct DmaLock;
+
+impl DmaLock {
+    fn acquire() -> Result<Self, DriverError> {
+        for _ in 0..DMA_LOCK_SPINS {
+            if DMA_LOCK
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(Self);
+            }
+            core::hint::spin_loop();
+        }
+        Err(DriverError::DmaRegistryBusy)
+    }
+}
+
+impl Drop for DmaLock {
+    fn drop(&mut self) {
+        DMA_LOCK.store(false, Ordering::Release);
+    }
+}
+
+#[derive(PartialEq, Eq)]
+pub struct DmaBuffer {
+    slot: u16,
+    generation: u32,
+    physical: crate::address::PhysAddr,
+    virtual_address: crate::address::VirtAddr,
+    length: usize,
+    allocation_length: usize,
+    alignment: usize,
+    direction: DmaDirection,
+    owner: DeviceId,
+    bus: BusKind,
+    isolation: DmaIsolation,
+}
+
+#[allow(
+    dead_code,
+    reason = "Owned DMA APIs are staged on ARM until device drivers consume them"
+)]
 impl DmaBuffer {
-    pub fn validate(self) -> Result<(), DriverError> {
+    pub fn allocate(
+        owner: DeviceId,
+        bus: BusKind,
+        length: usize,
+        alignment: usize,
+        direction: DmaDirection,
+    ) -> Result<Self, DriverError> {
+        let isolation = dma_isolation(bus);
+        if isolation == DmaIsolation::Unsupported {
+            return Err(DriverError::DmaIsolationUnavailable);
+        }
+        validate_dma_request(length, alignment)?;
+        let allocation_length = length
+            .checked_add(PAGE_SIZE - 1)
+            .map(|value| value & !(PAGE_SIZE - 1))
+            .ok_or(DriverError::InvalidAddressRange)?;
+        let frames = allocation_length / PAGE_SIZE;
+        let _lock = DmaLock::acquire()?;
+        let slot = unsafe {
+            (&*core::ptr::addr_of!(DMA_RECORDS))
+                .iter()
+                .position(Option::is_none)
+                .ok_or(DriverError::DmaRegistryFull)?
+        };
+        let mut first = None;
+        for index in 0..frames {
+            let Some(frame) = crate::memory::alloc_frame() else {
+                free_allocated_frames(first, index);
+                return Err(DriverError::DmaUnavailable);
+            };
+            if let Some(base) = first {
+                let Some(expected) = base.checked_add((index * PAGE_SIZE) as u64) else {
+                    free_allocated_frames(first, index + 1);
+                    return Err(DriverError::InvalidAddressRange);
+                };
+                if frame != expected {
+                    free_allocated_frames(first, index + 1);
+                    return Err(DriverError::DmaFragmented);
+                }
+            } else {
+                first = Some(frame);
+            }
+        }
+        let Some(first) = first else {
+            return Err(DriverError::DmaUnavailable);
+        };
+        let physical = crate::address::PhysAddr::new(first);
+        if !physical.is_aligned(alignment) {
+            free_allocated_frames(Some(first), frames);
+            return Err(DriverError::InvalidAlignment);
+        }
+        let Some(virtual_address) = crate::arch::physical_to_virtual(physical) else {
+            free_allocated_frames(Some(first), frames);
+            return Err(DriverError::DmaUnavailable);
+        };
+        if !virtual_address.is_aligned(alignment)
+            || physical.checked_add(length).is_none()
+            || virtual_address.checked_add(length).is_none()
+        {
+            free_allocated_frames(Some(first), frames);
+            return Err(DriverError::InvalidAddressRange);
+        }
+        let generation = unsafe { DMA_GENERATIONS[slot] };
+        unsafe {
+            DMA_RECORDS[slot] = Some(DmaRecord {
+                generation,
+                references: 1,
+                frames,
+            });
+        }
+        Ok(Self {
+            slot: slot as u16,
+            generation,
+            physical,
+            virtual_address,
+            length,
+            allocation_length,
+            alignment,
+            direction,
+            owner,
+            bus,
+            isolation,
+        })
+    }
+
+    pub fn try_clone(&self) -> Result<Self, DriverError> {
+        let _lock = DmaLock::acquire()?;
+        let record = unsafe {
+            (&*core::ptr::addr_of!(DMA_RECORDS))
+                .get(self.slot as usize)
+                .and_then(Option::as_ref)
+                .copied()
+        }
+        .ok_or(DriverError::DmaNotLive)?;
+        if record.generation != self.generation {
+            return Err(DriverError::DmaNotLive);
+        }
+        if record.references == MAX_DMA_REFS {
+            return Err(DriverError::DmaRefcountExhausted);
+        }
+        unsafe {
+            DMA_RECORDS[self.slot as usize] = Some(DmaRecord {
+                references: record.references + 1,
+                ..record
+            });
+        }
+        Ok(Self {
+            slot: self.slot,
+            generation: self.generation,
+            physical: self.physical,
+            virtual_address: self.virtual_address,
+            length: self.length,
+            allocation_length: self.allocation_length,
+            alignment: self.alignment,
+            direction: self.direction,
+            owner: self.owner,
+            bus: self.bus,
+            isolation: self.isolation,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), DriverError> {
         if self.length == 0
+            || self.length > self.allocation_length
+            || !self.allocation_length.is_multiple_of(PAGE_SIZE)
             || !self.alignment.is_power_of_two()
+            || self.alignment > PAGE_SIZE
             || !self.physical.is_aligned(self.alignment)
             || !self.virtual_address.is_aligned(self.alignment)
+            || dma_isolation(self.bus) != self.isolation
         {
             return Err(DriverError::InvalidAlignment);
         }
@@ -93,14 +308,41 @@ impl DmaBuffer {
         {
             return Err(DriverError::InvalidAddressRange);
         }
-        Ok(())
+        let _lock = DmaLock::acquire()?;
+        let live = unsafe {
+            (&*core::ptr::addr_of!(DMA_RECORDS))
+                .get(self.slot as usize)
+                .and_then(Option::as_ref)
+                .is_some_and(|record| record.generation == self.generation)
+        };
+        live.then_some(()).ok_or(DriverError::DmaNotLive)
     }
 
-    #[allow(dead_code)]
-    ///
-    /// # Safety
-    /// The DMA buffer's virtual range must be mapped and valid for the device.
-    pub unsafe fn sync_for_device(self) -> Result<(), DriverError> {
+    pub fn physical(&self) -> crate::address::PhysAddr {
+        self.physical
+    }
+
+    pub fn virtual_address(&self) -> crate::address::VirtAddr {
+        self.virtual_address
+    }
+
+    pub fn length(&self) -> usize {
+        self.length
+    }
+
+    pub fn owner(&self) -> DeviceId {
+        self.owner
+    }
+
+    pub fn bus(&self) -> BusKind {
+        self.bus
+    }
+
+    pub fn isolation(&self) -> DmaIsolation {
+        self.isolation
+    }
+
+    pub fn sync_for_device(&self) -> Result<(), DriverError> {
         self.validate()?;
         if !matches!(
             self.direction,
@@ -115,11 +357,7 @@ impl DmaBuffer {
         }
     }
 
-    #[allow(dead_code)]
-    ///
-    /// # Safety
-    /// The DMA buffer's virtual range must be mapped and valid for the device.
-    pub unsafe fn sync_for_cpu(self) -> Result<(), DriverError> {
+    pub fn sync_for_cpu(&self) -> Result<(), DriverError> {
         self.validate()?;
         if !matches!(
             self.direction,
@@ -135,7 +373,71 @@ impl DmaBuffer {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+impl Drop for DmaBuffer {
+    fn drop(&mut self) {
+        let Ok(_lock) = DmaLock::acquire() else {
+            // ponytail: bounded lock acquisition avoids an IRQ/SMP deadlock;
+            // a rare failed release leaks the allocation instead of freeing
+            // memory without proving the generation.
+            DMA_RELEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let record = unsafe {
+            (&*core::ptr::addr_of!(DMA_RECORDS))
+                .get(self.slot as usize)
+                .and_then(Option::as_ref)
+                .copied()
+        };
+        let Some(record) = record else {
+            return;
+        };
+        if record.generation != self.generation {
+            return;
+        }
+        if record.references > 1 {
+            unsafe {
+                DMA_RECORDS[self.slot as usize] = Some(DmaRecord {
+                    references: record.references - 1,
+                    ..record
+                });
+            }
+            return;
+        }
+        unsafe {
+            DMA_RECORDS[self.slot as usize] = None;
+            DMA_GENERATIONS[self.slot as usize] = self.generation.saturating_add(1);
+        }
+        free_allocated_frames(Some(self.physical.value()), record.frames);
+    }
+}
+
+fn free_allocated_frames(first: Option<u64>, frames: usize) {
+    let Some(first) = first else {
+        return;
+    };
+    for index in 0..frames {
+        let Some(offset) = (index * PAGE_SIZE).try_into().ok() else {
+            break;
+        };
+        let Some(frame) = first.checked_add(offset) else {
+            break;
+        };
+        let _ = crate::memory::free_frame(frame);
+    }
+}
+
+fn validate_dma_request(length: usize, alignment: usize) -> Result<(), DriverError> {
+    if length == 0
+        || length > MAX_DMA_BYTES
+        || !alignment.is_power_of_two()
+        || alignment > PAGE_SIZE
+    {
+        return Err(DriverError::InvalidAlignment);
+    }
+    Ok(())
+}
+
+#[derive(PartialEq, Eq)]
 pub enum Resource {
     Mmio {
         base: u64,
@@ -152,27 +454,32 @@ pub enum Resource {
 }
 
 impl Resource {
-    fn owner(self) -> DeviceId {
+    fn owner(&self) -> DeviceId {
         match self {
-            Self::Mmio { owner, .. } | Self::Pio { owner, .. } => owner,
+            Self::Mmio { owner, .. } | Self::Pio { owner, .. } => *owner,
             Self::Irq(irq) => irq.owner,
-            Self::Dma(buffer) => buffer.owner,
+            Self::Dma(buffer) => buffer.owner(),
         }
     }
 
-    fn validate(self) -> Result<(), DriverError> {
+    fn validate(&self, device: &Device) -> Result<(), DriverError> {
         match self {
             Self::Mmio { base, size, .. } => {
-                if size == 0 || base.checked_add(size).is_none() {
+                if *size == 0 || base.checked_add(*size).is_none() {
                     return Err(DriverError::InvalidResourceRange);
                 }
             }
             Self::Pio { base, size, .. } => {
-                if size == 0 || base as u32 + size as u32 > 0x1_0000 {
+                if *size == 0 || *base as u32 + *size as u32 > 0x1_0000 {
                     return Err(DriverError::InvalidResourceRange);
                 }
             }
-            Self::Dma(buffer) => buffer.validate()?,
+            Self::Dma(buffer) => {
+                if buffer.owner() != device.id || buffer.bus() != device.bus_kind {
+                    return Err(DriverError::ResourceOwnerMismatch);
+                }
+                buffer.validate()?
+            }
             Self::Irq(irq) => {
                 if let Some(registration) = irq.registration {
                     if crate::irq::registration_owner(registration)
@@ -217,6 +524,13 @@ pub enum DriverError {
     InterruptOwnerMismatch,
     InterruptPending,
     InvalidInterruptRegistration,
+    DmaIsolationUnavailable,
+    DmaRegistryBusy,
+    DmaRegistryFull,
+    DmaRefcountExhausted,
+    DmaNotLive,
+    DmaUnavailable,
+    DmaFragmented,
 }
 
 const MAX_TRACE_EVENTS: usize = 128;
@@ -303,7 +617,6 @@ impl Bus {
     }
 }
 
-#[derive(Clone, Copy)]
 pub struct Device {
     pub id: DeviceId,
     pub bus: BusId,
@@ -332,7 +645,7 @@ impl Device {
             name,
             class,
             state: DeviceState::Discovered,
-            resources: [None; MAX_RESOURCES],
+            resources: [const { None }; MAX_RESOURCES],
             resource_len: 0,
             driver: None,
             published: false,
@@ -375,7 +688,7 @@ impl Device {
         if resource.owner() != self.id {
             return Err(DriverError::ResourceOwnerMismatch);
         }
-        resource.validate()?;
+        resource.validate(self)?;
         if self.resource_len == MAX_RESOURCES {
             return Err(DriverError::ResourceCapacity);
         }
@@ -430,7 +743,7 @@ impl Device {
                 crate::irq::unregister_owned(registration, crate::irq::IrqOwner::Device(irq.owner))
                     .map_err(|_| DriverError::InvalidInterruptRegistration)?;
             }
-            self.resources = [None; MAX_RESOURCES];
+            self.resources = [const { None }; MAX_RESOURCES];
             self.resource_len = 0;
             trace_event(TraceOp::ResourceRelease, self, self.driver, true);
             Ok(())
@@ -1059,12 +1372,30 @@ pub fn contract_self_check() {
         DeviceState::Busy,
         DeviceState::Failed,
     ];
-    let _irq_kinds = [IrqKind::Legacy, IrqKind::Msi, IrqKind::MsiX, IrqKind::Gic];
+    let _irq_kinds = [
+        IrqKind::Legacy,
+        IrqKind::Local,
+        IrqKind::Msi,
+        IrqKind::MsiX,
+        IrqKind::Gic,
+    ];
     let _dma_directions = [
         DmaDirection::ToDevice,
         DmaDirection::FromDevice,
         DmaDirection::Bidirectional,
     ];
+    assert_eq!(DMA_CONTRACT_VERSION, 1);
+    assert_eq!(dma_isolation(BusKind::Pci), DmaIsolation::TrustedDevice);
+    assert_eq!(dma_isolation(BusKind::Virtio), DmaIsolation::TrustedDevice);
+    assert_eq!(dma_isolation(BusKind::Platform), DmaIsolation::Unsupported);
+    assert_eq!(
+        validate_dma_request(0, PAGE_SIZE),
+        Err(DriverError::InvalidAlignment)
+    );
+    assert_eq!(
+        validate_dma_request(PAGE_SIZE, PAGE_SIZE + 1),
+        Err(DriverError::InvalidAlignment)
+    );
     let _driver_errors = [
         DriverError::Unsupported,
         DriverError::Deferred,
@@ -1085,6 +1416,13 @@ pub fn contract_self_check() {
         DriverError::InterruptOwnerMismatch,
         DriverError::InterruptPending,
         DriverError::InvalidInterruptRegistration,
+        DriverError::DmaIsolationUnavailable,
+        DriverError::DmaRegistryBusy,
+        DriverError::DmaRegistryFull,
+        DriverError::DmaRefcountExhausted,
+        DriverError::DmaNotLive,
+        DriverError::DmaUnavailable,
+        DriverError::DmaFragmented,
     ];
 
     let mut bus = Bus::new(1, "platform", BusKind::Platform);
@@ -1141,29 +1479,7 @@ pub fn contract_self_check() {
             ),
         }))
         .is_ok());
-    assert!(device
-        .add_resource(Resource::Dma(DmaBuffer {
-            physical: crate::address::PhysAddr::new(0x1000),
-            virtual_address: crate::address::VirtAddr::new(0xffff_8000_0000_1000),
-            length: 4096,
-            alignment: 4096,
-            direction: DmaDirection::Bidirectional,
-            owner: device.id,
-        }))
-        .is_ok());
-    let from_device_dma = DmaBuffer {
-        physical: crate::address::PhysAddr::new(0x2000),
-        virtual_address: crate::address::VirtAddr::new(0xffff_8000_0000_2000),
-        length: 4096,
-        alignment: 4096,
-        direction: DmaDirection::FromDevice,
-        owner: device.id,
-    };
-    assert!(matches!(
-        unsafe { from_device_dma.sync_for_device() },
-        Err(DriverError::InvalidDmaDirection)
-    ));
-    assert_eq!(device.resources().len(), 4);
+    assert_eq!(device.resources().len(), 3);
     let mut invalid_resources =
         Device::new(7, bus.id, bus.kind, "invalid-resources", Class::Serial);
     assert!(matches!(
@@ -1173,17 +1489,6 @@ pub fn contract_self_check() {
             owner: invalid_resources.id,
         }),
         Err(DriverError::InvalidResourceRange)
-    ));
-    assert!(matches!(
-        invalid_resources.add_resource(Resource::Dma(DmaBuffer {
-            physical: crate::address::PhysAddr::new(3),
-            virtual_address: crate::address::VirtAddr::new(0x1003),
-            length: 16,
-            alignment: 4,
-            direction: DmaDirection::ToDevice,
-            owner: invalid_resources.id,
-        })),
-        Err(DriverError::InvalidAlignment)
     ));
     let mismatched_registration = crate::irq::register_owned(
         device.id,
@@ -1287,6 +1592,68 @@ pub fn contract_self_check() {
         DeviceState::Busy,
         DriverError::Busy,
     );
+}
+
+#[allow(
+    dead_code,
+    reason = "DMA contract check awaits ARM architecture bring-up wiring"
+)]
+pub fn dma_contract_self_check() {
+    assert_eq!(
+        dma_isolation_name(DmaIsolation::TrustedDevice),
+        "trusted-device"
+    );
+    assert!(matches!(
+        DmaBuffer::allocate(
+            70,
+            BusKind::Platform,
+            PAGE_SIZE,
+            PAGE_SIZE,
+            DmaDirection::Bidirectional,
+        ),
+        Err(DriverError::DmaIsolationUnavailable)
+    ));
+
+    let buffer = DmaBuffer::allocate(
+        70,
+        BusKind::Pci,
+        PAGE_SIZE,
+        PAGE_SIZE,
+        DmaDirection::ToDevice,
+    )
+    .expect("initialized allocator must issue a DMA buffer");
+    assert_eq!(buffer.owner(), 70);
+    assert_eq!(buffer.bus(), BusKind::Pci);
+    assert_eq!(buffer.isolation(), DmaIsolation::TrustedDevice);
+    assert!(buffer.validate().is_ok());
+    assert!(matches!(
+        buffer.sync_for_cpu(),
+        Err(DriverError::InvalidDmaDirection)
+    ));
+    let clone = buffer.try_clone().expect("live DMA lease can be shared");
+    assert_eq!(clone.physical(), buffer.physical());
+    drop(clone);
+
+    let mut wrong_device = Device::new(71, 71, BusKind::Pci, "wrong-dma-owner", Class::Block);
+    assert!(matches!(
+        wrong_device.add_resource(Resource::Dma(buffer)),
+        Err(DriverError::ResourceOwnerMismatch)
+    ));
+
+    let mut device = Device::new(70, 70, BusKind::Pci, "dma-owner", Class::Block);
+    let owned = DmaBuffer::allocate(
+        device.id,
+        device.bus_kind,
+        PAGE_SIZE,
+        PAGE_SIZE,
+        DmaDirection::Bidirectional,
+    )
+    .expect("device DMA allocation");
+    assert!(device.add_resource(Resource::Dma(owned)).is_ok());
+    assert!(device.transition(DeviceState::Probing).is_ok());
+    assert!(device.transition(DeviceState::Failed).is_ok());
+    assert!(device.release_resources().is_ok());
+    assert!(device.resources().is_empty());
 }
 
 #[derive(Clone, Copy)]

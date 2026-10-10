@@ -1,126 +1,154 @@
-use core::arch::{asm, global_asm};
+#![allow(
+    dead_code,
+    reason = "Staged architecture and fault hooks are not all enabled in bootstrap"
+)]
+
+use core::{
+    arch::{asm, global_asm},
+    cell::UnsafeCell,
+};
 
 const IA32_EFER: u32 = 0xc000_0080;
 const IA32_STAR: u32 = 0xc000_0081;
 const IA32_LSTAR: u32 = 0xc000_0082;
 const IA32_FMASK: u32 = 0xc000_0084;
+const IA32_GS_BASE: u32 = 0xc000_0101;
 const EFER_SCE: u64 = 1;
-const MAX_USER_CONTEXTS: usize = 64;
+pub use crate::process::UserContext;
+
+pub const MAX_CPUS: usize = 64;
+const RETURN_STACK_DEPTH: usize = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct UserContext {
-    rip: u64,
-    rsp: u64,
-    rflags: u64,
-    rax: u64,
-    rbx: u64,
-    rbp: u64,
-    r12: u64,
-    r13: u64,
-    r14: u64,
-    r15: u64,
-    rdi: u64,
-    rsi: u64,
-    rdx: u64,
-    r8: u64,
-    r9: u64,
-    r10: u64,
+struct CpuState {
+    syscall_stack_top: u64,
+    user_return_rsp_stack: [u64; RETURN_STACK_DEPTH],
+    user_return_depth: u64,
+    kernel_return_r12_stack: [u64; RETURN_STACK_DEPTH],
+    kernel_return_r13_stack: [u64; RETURN_STACK_DEPTH],
+    kernel_return_r14_stack: [u64; RETURN_STACK_DEPTH],
+    kernel_return_r15_stack: [u64; RETURN_STACK_DEPTH],
+    kernel_return_rbx_stack: [u64; RETURN_STACK_DEPTH],
+    kernel_return_rbp_stack: [u64; RETURN_STACK_DEPTH],
+    syscall_op: u64,
+    syscall_arg2: u64,
+    syscall_arg3: u64,
+    syscall_user_rsp: u64,
+    switch_from: u64,
+    switch_to: u64,
+    page_fault_target_context: u64,
 }
 
-impl UserContext {
+impl CpuState {
     const EMPTY: Self = Self {
-        rip: 0,
-        rsp: 0,
-        rflags: 0,
-        rax: 0,
-        rbx: 0,
-        rbp: 0,
-        r12: 0,
-        r13: 0,
-        r14: 0,
-        r15: 0,
-        rdi: 0,
-        rsi: 0,
-        rdx: 0,
-        r8: 0,
-        r9: 0,
-        r10: 0,
+        syscall_stack_top: 0,
+        user_return_rsp_stack: [0; RETURN_STACK_DEPTH],
+        user_return_depth: 0,
+        kernel_return_r12_stack: [0; RETURN_STACK_DEPTH],
+        kernel_return_r13_stack: [0; RETURN_STACK_DEPTH],
+        kernel_return_r14_stack: [0; RETURN_STACK_DEPTH],
+        kernel_return_r15_stack: [0; RETURN_STACK_DEPTH],
+        kernel_return_rbx_stack: [0; RETURN_STACK_DEPTH],
+        kernel_return_rbp_stack: [0; RETURN_STACK_DEPTH],
+        syscall_op: 0,
+        syscall_arg2: 0,
+        syscall_arg3: 0,
+        syscall_user_rsp: 0,
+        switch_from: 0,
+        switch_to: 0,
+        page_fault_target_context: 0,
     };
 }
 
-static mut USER_CONTEXTS: [UserContext; MAX_USER_CONTEXTS] =
-    [UserContext::EMPTY; MAX_USER_CONTEXTS];
-static mut CONTEXT_VALID: [bool; MAX_USER_CONTEXTS] = [false; MAX_USER_CONTEXTS];
-static mut SWITCH_FROM: u64 = 0;
-static mut SWITCH_TO: u64 = 0;
+// These offsets are part of the private assembly/Rust contract above.
+pub const STATE_SYSCALL_STACK_TOP: usize = core::mem::offset_of!(CpuState, syscall_stack_top);
+pub const STATE_USER_RETURN_RSP_STACK: usize =
+    core::mem::offset_of!(CpuState, user_return_rsp_stack);
+pub const STATE_USER_RETURN_DEPTH: usize = core::mem::offset_of!(CpuState, user_return_depth);
+pub const STATE_KERNEL_RETURN_R12_STACK: usize =
+    core::mem::offset_of!(CpuState, kernel_return_r12_stack);
+pub const STATE_KERNEL_RETURN_R13_STACK: usize =
+    core::mem::offset_of!(CpuState, kernel_return_r13_stack);
+pub const STATE_KERNEL_RETURN_R14_STACK: usize =
+    core::mem::offset_of!(CpuState, kernel_return_r14_stack);
+pub const STATE_KERNEL_RETURN_R15_STACK: usize =
+    core::mem::offset_of!(CpuState, kernel_return_r15_stack);
+pub const STATE_KERNEL_RETURN_RBX_STACK: usize =
+    core::mem::offset_of!(CpuState, kernel_return_rbx_stack);
+pub const STATE_KERNEL_RETURN_RBP_STACK: usize =
+    core::mem::offset_of!(CpuState, kernel_return_rbp_stack);
+pub const STATE_SYSCALL_OP: usize = core::mem::offset_of!(CpuState, syscall_op);
+pub const STATE_SYSCALL_ARG2: usize = core::mem::offset_of!(CpuState, syscall_arg2);
+pub const STATE_SYSCALL_ARG3: usize = core::mem::offset_of!(CpuState, syscall_arg3);
+pub const STATE_SYSCALL_USER_RSP: usize = core::mem::offset_of!(CpuState, syscall_user_rsp);
+pub const STATE_SWITCH_FROM: usize = core::mem::offset_of!(CpuState, switch_from);
+pub const STATE_SWITCH_TO: usize = core::mem::offset_of!(CpuState, switch_to);
+pub const STATE_PAGE_FAULT_TARGET_CONTEXT: usize =
+    core::mem::offset_of!(CpuState, page_fault_target_context);
 
-#[no_mangle]
-pub static mut PAGE_FAULT_TARGET_CONTEXT: u64 = 0;
+#[repr(C, align(16))]
+struct KernelStack([u8; crate::arch::tables::SYSCALL_STACK_SIZE]);
 
-#[no_mangle]
-static mut SYSCALL_STACK_TOP: u64 = 0;
+struct PerCpuStorage {
+    states: [UnsafeCell<CpuState>; MAX_CPUS],
+    syscall_stacks: [UnsafeCell<KernelStack>; MAX_CPUS],
+}
 
-#[no_mangle]
-static mut USER_RETURN_RSP_STACK: [u64; 4] = [0; 4];
+impl PerCpuStorage {
+    const fn new() -> Self {
+        Self {
+            states: [const { UnsafeCell::new(CpuState::EMPTY) }; MAX_CPUS],
+            syscall_stacks: [const {
+                UnsafeCell::new(KernelStack([0; crate::arch::tables::SYSCALL_STACK_SIZE]))
+            }; MAX_CPUS],
+        }
+    }
+}
 
-#[no_mangle]
-static mut USER_RETURN_DEPTH: u64 = 0;
+unsafe impl Sync for PerCpuStorage {}
 
-#[no_mangle]
-static mut KERNEL_RETURN_R12_STACK: [u64; 4] = [0; 4];
+static PER_CPU: PerCpuStorage = PerCpuStorage::new();
 
-#[no_mangle]
-static mut KERNEL_RETURN_R13_STACK: [u64; 4] = [0; 4];
+fn cpu_index() -> Option<usize> {
+    let cpu = crate::arch::cpu_id();
+    (cpu < MAX_CPUS).then_some(cpu)
+}
 
-#[no_mangle]
-static mut KERNEL_RETURN_R14_STACK: [u64; 4] = [0; 4];
+fn state_ptr() -> Option<*mut CpuState> {
+    let index = cpu_index()?;
+    Some(PER_CPU.states[index].get())
+}
 
-#[no_mangle]
-static mut KERNEL_RETURN_R15_STACK: [u64; 4] = [0; 4];
-
-#[no_mangle]
-static mut KERNEL_RETURN_RBX_STACK: [u64; 4] = [0; 4];
-
-#[no_mangle]
-static mut KERNEL_RETURN_RBP_STACK: [u64; 4] = [0; 4];
-
-#[no_mangle]
-static mut SYSCALL_OP: u64 = 0;
-
-#[no_mangle]
-static mut SYSCALL_ARG2: u64 = 0;
-
-#[no_mangle]
-static mut SYSCALL_ARG3: u64 = 0;
-
-#[no_mangle]
-static mut SYSCALL_USER_RSP: u64 = 0;
+fn syscall_stack_top(index: usize) -> u64 {
+    (PER_CPU.syscall_stacks[index].get() as usize)
+        .saturating_add(crate::arch::tables::SYSCALL_STACK_SIZE) as u64
+}
 
 global_asm!(
     r#"
     .section .text,"ax"
     .global norx_x86_64_syscall_entry
 norx_x86_64_syscall_entry:
-    mov qword ptr [rip + SYSCALL_OP], rax
-    mov qword ptr [rip + SYSCALL_ARG2], rdx
-    mov qword ptr [rip + SYSCALL_ARG3], r10
-    mov qword ptr [rip + SYSCALL_USER_RSP], rsp
+    mov qword ptr gs:[{syscall_op}], rax
+    mov qword ptr gs:[{syscall_arg2}], rdx
+    mov qword ptr gs:[{syscall_arg3}], r10
+    mov qword ptr gs:[{syscall_user_rsp}], rsp
     mov r10, rsp
-    mov rax, qword ptr [rip + USER_RETURN_DEPTH]
+    mov rax, qword ptr gs:[{user_return_depth}]
     test rax, rax
     jz norx_x86_64_user_return_underflow
     cmp rax, 4
     jae norx_x86_64_kernel_stack_overflow
     dec rax
     shl rax, 17
-    mov rdx, qword ptr [rip + SYSCALL_STACK_TOP]
+    mov rdx, qword ptr gs:[{syscall_stack_top}]
     sub rdx, rax
     mov rsp, rdx
     and rsp, -16
     push r9
     push r8
-    push qword ptr [rip + SYSCALL_ARG2]
+    push qword ptr gs:[{syscall_arg2}]
     push rsi
     push rdi
     push r15
@@ -134,11 +162,11 @@ norx_x86_64_syscall_entry:
     sub rsp, 8
     mov qword ptr [rsp], r9
     mov r9, r8
-    mov r8, qword ptr [rip + SYSCALL_ARG3]
-    mov rcx, qword ptr [rip + SYSCALL_ARG2]
+    mov r8, qword ptr gs:[{syscall_arg3}]
+    mov rcx, qword ptr gs:[{syscall_arg2}]
     mov rdx, rsi
     mov rsi, rdi
-    mov rdi, qword ptr [rip + SYSCALL_OP]
+    mov rdi, qword ptr gs:[{syscall_op}]
     call norx_x86_64_syscall_rust
     cmp rax, -4098
     je norx_x86_64_user_switch
@@ -158,8 +186,8 @@ norx_x86_64_syscall_entry:
     pop rdx
     pop r8
     pop r9
-    mov rsp, qword ptr [rip + SYSCALL_USER_RSP]
-    mov r10, qword ptr [rip + SYSCALL_ARG3]
+    mov rsp, qword ptr gs:[{syscall_user_rsp}]
+    mov r10, qword ptr gs:[{syscall_arg3}]
     sysretq
 
 norx_x86_64_user_switch:
@@ -190,25 +218,18 @@ norx_x86_64_user_switch:
     iretq
 
 norx_x86_64_user_exit:
-    mov rax, qword ptr [rip + USER_RETURN_DEPTH]
+    mov rax, qword ptr gs:[{user_return_depth}]
     test rax, rax
     jz norx_x86_64_user_return_underflow
     dec rax
-    mov qword ptr [rip + USER_RETURN_DEPTH], rax
-    lea rdx, [rip + KERNEL_RETURN_RBX_STACK]
-    mov rbx, qword ptr [rdx + rax*8]
-    lea rdx, [rip + KERNEL_RETURN_RBP_STACK]
-    mov rbp, qword ptr [rdx + rax*8]
-    lea rdx, [rip + KERNEL_RETURN_R12_STACK]
-    mov r12, qword ptr [rdx + rax*8]
-    lea rdx, [rip + KERNEL_RETURN_R13_STACK]
-    mov r13, qword ptr [rdx + rax*8]
-    lea rdx, [rip + KERNEL_RETURN_R14_STACK]
-    mov r14, qword ptr [rdx + rax*8]
-    lea rdx, [rip + KERNEL_RETURN_R15_STACK]
-    mov r15, qword ptr [rdx + rax*8]
-    lea rdx, [rip + USER_RETURN_RSP_STACK]
-    mov rsp, qword ptr [rdx + rax*8]
+    mov qword ptr gs:[{user_return_depth}], rax
+    mov rbx, qword ptr gs:[{kernel_return_rbx_stack} + rax*8]
+    mov rbp, qword ptr gs:[{kernel_return_rbp_stack} + rax*8]
+    mov r12, qword ptr gs:[{kernel_return_r12_stack} + rax*8]
+    mov r13, qword ptr gs:[{kernel_return_r13_stack} + rax*8]
+    mov r14, qword ptr gs:[{kernel_return_r14_stack} + rax*8]
+    mov r15, qword ptr gs:[{kernel_return_r15_stack} + rax*8]
+    mov rsp, qword ptr gs:[{user_return_rsp_stack} + rax*8]
     sti
     ret
 
@@ -223,25 +244,18 @@ norx_x86_64_kernel_stack_overflow:
     .global norx_x86_64_enter_user
 norx_x86_64_enter_user:
     mov r8, rdx
-    mov rax, qword ptr [rip + USER_RETURN_DEPTH]
+    mov rax, qword ptr gs:[{user_return_depth}]
     cmp rax, 4
     jae norx_x86_64_user_return_overflow
-    lea rdx, [rip + KERNEL_RETURN_RBX_STACK]
-    mov qword ptr [rdx + rax*8], rbx
-    lea rdx, [rip + KERNEL_RETURN_RBP_STACK]
-    mov qword ptr [rdx + rax*8], rbp
-    lea rdx, [rip + KERNEL_RETURN_R12_STACK]
-    mov qword ptr [rdx + rax*8], r12
-    lea rdx, [rip + KERNEL_RETURN_R13_STACK]
-    mov qword ptr [rdx + rax*8], r13
-    lea rdx, [rip + KERNEL_RETURN_R14_STACK]
-    mov qword ptr [rdx + rax*8], r14
-    lea rdx, [rip + KERNEL_RETURN_R15_STACK]
-    mov qword ptr [rdx + rax*8], r15
-    lea rdx, [rip + USER_RETURN_RSP_STACK]
-    mov qword ptr [rdx + rax*8], rsp
+    mov qword ptr gs:[{kernel_return_rbx_stack} + rax*8], rbx
+    mov qword ptr gs:[{kernel_return_rbp_stack} + rax*8], rbp
+    mov qword ptr gs:[{kernel_return_r12_stack} + rax*8], r12
+    mov qword ptr gs:[{kernel_return_r13_stack} + rax*8], r13
+    mov qword ptr gs:[{kernel_return_r14_stack} + rax*8], r14
+    mov qword ptr gs:[{kernel_return_r15_stack} + rax*8], r15
+    mov qword ptr gs:[{user_return_rsp_stack} + rax*8], rsp
     inc rax
-    mov qword ptr [rip + USER_RETURN_DEPTH], rax
+    mov qword ptr gs:[{user_return_depth}], rax
     push 0x1b
     push rsi
     push r8
@@ -252,7 +266,20 @@ norx_x86_64_enter_user:
 norx_x86_64_user_return_overflow:
     cli
     hlt
-"#
+"#,
+    syscall_op = const STATE_SYSCALL_OP,
+    syscall_arg2 = const STATE_SYSCALL_ARG2,
+    syscall_arg3 = const STATE_SYSCALL_ARG3,
+    syscall_user_rsp = const STATE_SYSCALL_USER_RSP,
+    syscall_stack_top = const STATE_SYSCALL_STACK_TOP,
+    user_return_depth = const STATE_USER_RETURN_DEPTH,
+    user_return_rsp_stack = const STATE_USER_RETURN_RSP_STACK,
+    kernel_return_r12_stack = const STATE_KERNEL_RETURN_R12_STACK,
+    kernel_return_r13_stack = const STATE_KERNEL_RETURN_R13_STACK,
+    kernel_return_r14_stack = const STATE_KERNEL_RETURN_R14_STACK,
+    kernel_return_r15_stack = const STATE_KERNEL_RETURN_R15_STACK,
+    kernel_return_rbx_stack = const STATE_KERNEL_RETURN_RBX_STACK,
+    kernel_return_rbp_stack = const STATE_KERNEL_RETURN_RBP_STACK,
 );
 
 extern "C" {
@@ -264,9 +291,12 @@ extern "sysv64" {
 }
 
 pub fn init() -> bool {
+    let Some(index) = cpu_index() else {
+        return false;
+    };
     unsafe {
         let kernel_stack_top = crate::arch::tables::kernel_stack_top();
-        let syscall_stack_top = crate::arch::tables::syscall_stack_top();
+        let syscall_stack_top = syscall_stack_top(index);
         let kernel_stack_base =
             kernel_stack_top.saturating_sub(crate::arch::tables::KERNEL_STACK_SIZE as u64);
         let syscall_stack_base =
@@ -274,12 +304,16 @@ pub fn init() -> bool {
         if kernel_stack_base < syscall_stack_top && syscall_stack_base < kernel_stack_top {
             return false;
         }
-        SYSCALL_STACK_TOP = syscall_stack_top;
-        USER_RETURN_DEPTH = 0;
-        CONTEXT_VALID = [false; MAX_USER_CONTEXTS];
         if kernel_stack_top == 0 || syscall_stack_top == 0 {
             return false;
         }
+
+        let state = &mut *PER_CPU.states[index].get();
+        *state = CpuState {
+            syscall_stack_top,
+            ..CpuState::EMPTY
+        };
+        wrmsr(IA32_GS_BASE, state as *mut CpuState as u64);
 
         let efer = rdmsr(IA32_EFER) | EFER_SCE | (1 << 11);
         wrmsr(IA32_EFER, efer);
@@ -297,25 +331,19 @@ pub fn init() -> bool {
 }
 
 pub fn install_user_context(thread: u32, registers: crate::elf::InitialRegisters) -> bool {
-    let Some(index) = context_index(thread) else {
-        return false;
-    };
-    unsafe {
-        USER_CONTEXTS[index] = UserContext {
-            rip: registers.instruction_pointer as u64,
-            rsp: registers.stack_pointer as u64,
-            rflags: registers.flags,
-            ..UserContext::EMPTY
-        };
-        CONTEXT_VALID[index] = true;
-    }
-    true
+    let mut context = UserContext::EMPTY;
+    context.registers[0] = registers.instruction_pointer as u64;
+    context.registers[1] = registers.stack_pointer as u64;
+    context.registers[2] = registers.flags;
+    crate::process::set_user_context(thread, context).is_ok()
 }
 
 pub fn request_user_switch(from: u32, to: u32) {
-    unsafe {
-        SWITCH_FROM = from as u64;
-        SWITCH_TO = to as u64;
+    if let Some(state) = state_ptr() {
+        unsafe {
+            (*state).switch_from = from as u64;
+            (*state).switch_to = to as u64;
+        }
     }
 }
 
@@ -335,26 +363,24 @@ pub fn terminate_user_fault() -> u64 {
     if !crate::arch::switch_to_user(root) {
         return 0;
     }
-    unsafe {
-        PAGE_FAULT_TARGET_CONTEXT = context_pointer(switch.to.get()) as u64;
+    if let Some(state) = state_ptr() {
+        unsafe {
+            (*state).page_fault_target_context = context_pointer(switch.to.get()) as u64;
+        }
     }
     crate::syscall::PAGE_FAULT_SWITCH
 }
 
 pub fn has_user_context(thread: u32) -> bool {
-    context_index(thread).is_some_and(|index| unsafe { CONTEXT_VALID[index] })
+    crate::process::has_user_context(thread)
 }
 
-fn context_index(thread: u32) -> Option<usize> {
-    let slot = (thread & 0xffff) as usize;
-    (slot != 0 && slot <= MAX_USER_CONTEXTS).then_some(slot - 1)
+pub fn revoke_user_context(thread: u32) {
+    crate::process::revoke_user_context(thread);
 }
 
 fn context_pointer(thread: u32) -> *const UserContext {
-    let Some(index) = context_index(thread) else {
-        return core::ptr::null();
-    };
-    unsafe { core::ptr::addr_of!(USER_CONTEXTS[index]) }
+    crate::process::user_context_pointer(thread).unwrap_or(core::ptr::null())
 }
 
 pub fn enter_user(registers: crate::elf::InitialRegisters) -> bool {
@@ -370,14 +396,17 @@ pub fn enter_user(registers: crate::elf::InitialRegisters) -> bool {
 
 pub fn return_debug_state() -> (u64, u64, u64, u64) {
     unsafe {
-        let depth = USER_RETURN_DEPTH;
-        let saved_rsp = USER_RETURN_RSP_STACK[0];
+        let Some(state) = state_ptr() else {
+            return (0, 0, 0, 0);
+        };
+        let depth = (*state).user_return_depth;
+        let saved_rsp = (*state).user_return_rsp_stack[0];
         let saved_return = if saved_rsp == 0 {
             0
         } else {
             (saved_rsp as *const u64).read_volatile()
         };
-        (depth, SYSCALL_STACK_TOP, saved_rsp, saved_return)
+        (depth, (*state).syscall_stack_top, saved_rsp, saved_return)
     }
 }
 
@@ -391,13 +420,12 @@ extern "sysv64" fn norx_x86_64_syscall_rust(
     _a4: u64,
     _a5: u64,
 ) -> u64 {
-    let result = crate::syscall::dispatch(
+    crate::syscall::dispatch(
         _op,
         crate::syscall::Args {
             values: [_a0, _a1, _a2, _a3, _a4, _a5],
         },
-    );
-    result
+    )
 }
 
 #[no_mangle]
@@ -405,38 +433,30 @@ extern "sysv64" fn norx_x86_64_switch_user_rust(
     frame: *const u64,
     _switch_marker: u64,
 ) -> *const UserContext {
-    let (from, to) = unsafe { (SWITCH_FROM as u32, SWITCH_TO as u32) };
-    let context = context_pointer(to);
-    if context.is_null() {
+    let Some(state) = state_ptr() else {
         return core::ptr::null();
-    }
-    let Some(index) = context_index(from) else {
-        return core::ptr::null();
+    };
+    let (from, to, user_rsp, arg3) = unsafe {
+        (
+            (*state).switch_from as u32,
+            (*state).switch_to as u32,
+            (*state).syscall_user_rsp,
+            (*state).syscall_arg3,
+        )
     };
     if frame.is_null() {
         return core::ptr::null();
     }
-    unsafe {
-        let frame = core::slice::from_raw_parts(frame, 14);
-        USER_CONTEXTS[index] = UserContext {
-            rip: frame[2],
-            rsp: SYSCALL_USER_RSP,
-            rflags: frame[1],
-            rax: 0,
-            rbx: frame[3],
-            rbp: frame[4],
-            r12: frame[5],
-            r13: frame[6],
-            r14: frame[7],
-            r15: frame[8],
-            rdi: frame[9],
-            rsi: frame[10],
-            rdx: frame[11],
-            r8: frame[12],
-            r9: frame[13],
-            r10: SYSCALL_ARG3,
-        };
-        CONTEXT_VALID[index] = true;
+    let frame = unsafe { core::slice::from_raw_parts(frame, 14) };
+    let context = UserContext {
+        registers: [
+            frame[2], user_rsp, frame[1], 0, frame[3], frame[4], frame[5], frame[6], frame[7],
+            frame[8], frame[9], frame[10], frame[11], frame[12], frame[13], arg3, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ],
+    };
+    if crate::process::save_user_context(from, context).is_err() {
+        return core::ptr::null();
     }
     let root = match crate::process::commit_user_switch(from, to) {
         Ok(root) => root,
@@ -469,4 +489,20 @@ unsafe fn wrmsr(msr: u32, value: u64) {
         in("eax") value as u32,
         options(nomem, nostack, preserves_flags)
     );
+}
+
+pub fn context_contract_self_check() {
+    // Real generation/reap checks live in process::contract_self_check.
+    assert!(!has_user_context(0));
+    assert!(!install_user_context(
+        0,
+        crate::elf::InitialRegisters {
+            instruction_pointer: 1,
+            stack_pointer: 2,
+            flags: 0,
+            arg0: 0,
+            arg1: 0,
+            arg2: 0,
+        }
+    ));
 }

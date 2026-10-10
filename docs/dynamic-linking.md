@@ -20,6 +20,14 @@ checks the VFS path, and exits the staged runtime with status zero on both
 architectures. It is intentionally a kernel contract until user-mode CPU
 execution is available.
 
+The dynamic contract also runs a bounded 512-case mutational fuzz pass over a
+valid ET_DYN seed. Mutations cover program-header metadata, dynamic tags,
+string/symbol/hash/RELA addresses and sizes, and maximum integer values; each
+case first builds a validated load plan, then exercises the dynamic parser and
+plan accessors when parsing succeeds. Checked slice helpers and an overflowing
+string-table descriptor are covered by explicit assertions. This is a
+no-panic contract exercised by the boot checks on both architectures.
+
 Actual shared-object page mapping, relocation writes into user memory, TLS
 register hand-off, and executing a standalone user-mode dynamic linker remain
 follow-up work after VM/user mappings are available.

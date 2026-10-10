@@ -23,3 +23,9 @@ integration that follows this contract.
 Negative coverage includes bad magic, truncated file data, overlapping PT_LOAD
 segments, non-canonical user ranges, W+X flags, invalid entry points, and
 oversized argv/env vectors.
+
+The boot contract also runs a bounded 512-case mutational fuzz pass over a
+static ELF seed. It combines random byte mutations with maximum header offsets,
+counts, file sizes, and entry values, calls both `parse` and interpreter
+selection for every case, and probes the `usize::MAX` read-helper boundary.
+The pass has a no-panic contract and runs on both supported target builds.

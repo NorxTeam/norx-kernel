@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "Staged ABI and hardware hooks are not all enabled in the bootstrap profile"
+)]
+
 use crate::address::PhysAddr;
 use crate::process::ProcessId;
 
@@ -12,6 +17,15 @@ const MAX_MAPPINGS: usize = 128;
 const MAX_TABLE_FRAMES: usize = 192;
 const INITIAL_STACK_PAGES: usize = 2;
 const MAX_STACK_PAGES: usize = 8;
+const SIGNAL_TRAMPOLINE_WORDS: usize = 2;
+const DEFAULT_PAGE_QUOTA: usize = 16 * 1024;
+const MAX_SHARED_FRAMES: usize = MAX_MAPPINGS * 4;
+
+#[cfg(target_arch = "x86_64")]
+const SIGNAL_TRAMPOLINE: [u8; SIGNAL_TRAMPOLINE_WORDS * 4] = [0xb8, 15, 0, 0, 0, 0x0f, 0x05, 0xcc];
+#[cfg(target_arch = "aarch64")]
+const SIGNAL_TRAMPOLINE: [u8; SIGNAL_TRAMPOLINE_WORDS * 4] =
+    [0xe8, 0x01, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageFlags {
@@ -63,27 +77,43 @@ impl PageFlags {
 pub enum MappingKind {
     Anonymous,
     Stack,
+    Heap,
+    SignalTrampoline,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MappingInfo {
     pub virtual_address: usize,
     pub physical_frame: PhysAddr,
+    pub present: bool,
     pub flags: PageFlags,
     pub kind: MappingKind,
+    pub cow: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Mapping {
     virtual_address: usize,
-    physical_frame: PhysAddr,
+    physical_frame: Option<PhysAddr>,
     flags: PageFlags,
     kind: MappingKind,
+    shared: bool,
+    cow: bool,
 }
+
+#[derive(Clone, Copy)]
+struct SharedFrame {
+    frame: PhysAddr,
+    references: u16,
+}
+
+static SHARED_FRAMES: crate::sync::SmpLock<[Option<SharedFrame>; MAX_SHARED_FRAMES]> =
+    crate::sync::SmpLock::new([None; MAX_SHARED_FRAMES]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     NoFrames,
+    NoSpace,
     MappingCapacity,
     InvalidAddress,
     Unaligned,
@@ -96,6 +126,8 @@ pub enum Error {
     FrameReturn,
     HardwareUnavailable,
     HardwareMapping,
+    QuotaExceeded,
+    CopyOnWrite,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +158,30 @@ impl AslrHook {
         }
         Some(base)
     }
+
+    pub fn choose_down(
+        self,
+        top: usize,
+        floor: usize,
+        span: usize,
+        alignment: usize,
+    ) -> Option<usize> {
+        if span == 0 || !alignment.is_power_of_two() || floor > top {
+            return None;
+        }
+        let span = align_up(span, PAGE_SIZE)?;
+        let top = top & !(alignment - 1);
+        let floor = align_up(floor, alignment)?;
+        let available = top.checked_sub(floor)?;
+        if span > available {
+            return None;
+        }
+        let slots = (available - span) / alignment + 1;
+        let jitter = self.seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let offset = (jitter >> 12) as usize % slots;
+        top.checked_sub(span)?
+            .checked_sub(offset.checked_mul(alignment)?)
+    }
 }
 
 #[derive(Debug)]
@@ -139,13 +195,30 @@ pub struct AddressSpace {
     aslr: AslrHook,
     active: bool,
     table_frames: [Option<PhysAddr>; MAX_TABLE_FRAMES],
+    page_quota: usize,
+    reserved_pages: usize,
 }
 
 impl AddressSpace {
     pub fn new(owner: ProcessId, aslr: AslrHook) -> Result<Self, Error> {
+        Self::new_with_quota(owner, aslr, DEFAULT_PAGE_QUOTA)
+    }
+
+    pub fn new_with_quota(
+        owner: ProcessId,
+        aslr: AslrHook,
+        page_quota: usize,
+    ) -> Result<Self, Error> {
+        if page_quota == 0 {
+            return Err(Error::QuotaExceeded);
+        }
         let root_frame = crate::memory::alloc_frame()
             .map(PhysAddr::new)
             .ok_or(Error::NoFrames)?;
+        if !crate::arch::zero_physical_page(root_frame) {
+            let _ = crate::memory::free_frame(root_frame.value());
+            return Err(Error::HardwareUnavailable);
+        }
         Ok(Self {
             owner: Some(owner),
             root_frame: Some(root_frame),
@@ -162,6 +235,8 @@ impl AddressSpace {
             aslr,
             active: false,
             table_frames: [None; MAX_TABLE_FRAMES],
+            page_quota,
+            reserved_pages: 0,
         })
     }
 
@@ -181,9 +256,35 @@ impl AddressSpace {
         self.stack_top
     }
 
+    pub fn page_quota(&self) -> usize {
+        self.page_quota
+    }
+
+    pub fn mapped_pages(&self) -> usize {
+        self.reserved_pages
+    }
+
+    pub fn set_page_quota(&mut self, page_quota: usize) -> Result<(), Error> {
+        if page_quota == 0 || page_quota < self.reserved_pages {
+            return Err(Error::QuotaExceeded);
+        }
+        self.page_quota = page_quota;
+        Ok(())
+    }
+
+    pub fn mmap_top(&self) -> Option<usize> {
+        self.stack_top
+            .checked_sub((MAX_STACK_PAGES + 1) * PAGE_SIZE)
+    }
+
     pub fn heap_base(&self, hint: usize) -> Option<usize> {
         let base = self.aslr.choose_base(hint, PAGE_SIZE, PAGE_SIZE)?;
         (base < self.heap_limit()).then_some(base)
+    }
+
+    pub fn signal_trampoline(&self) -> Option<usize> {
+        self.stack_top
+            .checked_sub((MAX_STACK_PAGES + 2) * PAGE_SIZE)
     }
 
     pub(crate) fn heap_limit(&self) -> usize {
@@ -195,7 +296,76 @@ impl AddressSpace {
         virtual_address: usize,
         flags: PageFlags,
     ) -> Result<MappingInfo, Error> {
-        self.map_page(virtual_address, flags, MappingKind::Anonymous)
+        self.map_page(virtual_address, flags, MappingKind::Anonymous, true)
+    }
+
+    pub fn map_anonymous_lazy(
+        &mut self,
+        virtual_address: usize,
+        flags: PageFlags,
+    ) -> Result<MappingInfo, Error> {
+        self.map_page(virtual_address, flags, MappingKind::Anonymous, false)
+    }
+
+    pub fn map_range(
+        &mut self,
+        hint: usize,
+        length: usize,
+        flags: PageFlags,
+        fixed: bool,
+        kind: MappingKind,
+    ) -> Result<usize, Error> {
+        self.map_range_with_mode(hint, length, flags, fixed, kind, true)
+    }
+
+    pub fn map_range_lazy(
+        &mut self,
+        hint: usize,
+        length: usize,
+        flags: PageFlags,
+        fixed: bool,
+        kind: MappingKind,
+    ) -> Result<usize, Error> {
+        self.map_range_with_mode(hint, length, flags, fixed, kind, false)
+    }
+
+    fn map_range_with_mode(
+        &mut self,
+        hint: usize,
+        length: usize,
+        flags: PageFlags,
+        fixed: bool,
+        kind: MappingKind,
+        present: bool,
+    ) -> Result<usize, Error> {
+        let length = align_up(length, PAGE_SIZE).ok_or(Error::InvalidAddress)?;
+        if length == 0 || length / PAGE_SIZE > MAX_MAPPINGS {
+            return Err(Error::MappingCapacity);
+        }
+        let base = if fixed {
+            if hint == 0 || !hint.is_multiple_of(PAGE_SIZE) {
+                return Err(Error::Unaligned);
+            }
+            hint
+        } else {
+            self.find_free_range(hint, length).ok_or(Error::NoSpace)?
+        };
+        let end = base.checked_add(length).ok_or(Error::InvalidAddress)?;
+        if base < PAGE_SIZE || end > self.heap_limit() || !self.range_is_free(base, end) {
+            return Err(Error::InvalidAddress);
+        }
+        let mut mapped = 0;
+        while mapped < length {
+            if let Err(error) = self.map_page(base + mapped, flags, kind, present) {
+                while mapped != 0 {
+                    mapped -= PAGE_SIZE;
+                    let _ = self.remove_mapping(base + mapped);
+                }
+                return Err(error);
+            }
+            mapped += PAGE_SIZE;
+        }
+        Ok(base)
     }
 
     pub fn map_stack(&mut self) -> Result<(), Error> {
@@ -208,7 +378,8 @@ impl AddressSpace {
             .ok_or(Error::InvalidAddress)?;
         for index in 0..INITIAL_STACK_PAGES {
             let address = first + index * PAGE_SIZE;
-            if let Err(error) = self.map_page(address, PageFlags::USER_RW, MappingKind::Stack) {
+            if let Err(error) = self.map_page(address, PageFlags::USER_RW, MappingKind::Stack, true)
+            {
                 for rollback in 0..index {
                     let _ = self.remove_mapping(first + rollback * PAGE_SIZE);
                 }
@@ -217,6 +388,29 @@ impl AddressSpace {
         }
         self.stack_pages = INITIAL_STACK_PAGES;
         self.stack_guard = first.checked_sub(PAGE_SIZE);
+        let trampoline = self.signal_trampoline().ok_or(Error::InvalidAddress)?;
+        if let Err(error) = self.map_page(
+            trampoline,
+            PageFlags::USER_RX,
+            MappingKind::SignalTrampoline,
+            true,
+        ) {
+            for index in 0..INITIAL_STACK_PAGES {
+                let _ = self.remove_mapping(first + index * PAGE_SIZE);
+            }
+            self.stack_pages = 0;
+            self.stack_guard = None;
+            return Err(error);
+        }
+        if let Err(error) = self.load(trampoline, &SIGNAL_TRAMPOLINE) {
+            let _ = self.remove_mapping(trampoline);
+            for index in 0..INITIAL_STACK_PAGES {
+                let _ = self.remove_mapping(first + index * PAGE_SIZE);
+            }
+            self.stack_pages = 0;
+            self.stack_guard = None;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -234,7 +428,7 @@ impl AddressSpace {
         if self.stack_pages == MAX_STACK_PAGES {
             return Ok(false);
         }
-        self.map_page(guard, PageFlags::USER_RW, MappingKind::Stack)?;
+        self.map_page(guard, PageFlags::USER_RW, MappingKind::Stack, true)?;
         self.stack_pages += 1;
         self.stack_guard = guard.checked_sub(PAGE_SIZE);
         Ok(true)
@@ -244,12 +438,25 @@ impl AddressSpace {
         if !fault.user {
             return crate::vm::FaultResult::KernelFatal;
         }
-        if fault.kind != crate::vm::FaultKind::Translation || fault.instruction {
-            return crate::vm::FaultResult::UserFault(crate::vm::FaultReason::Protection);
+        let Some(page) = fault.page_address() else {
+            return crate::vm::FaultResult::UserFault(crate::vm::FaultReason::InvalidAddress);
+        };
+        if self.root_frame.is_none() || self.owner.is_none() {
+            return crate::vm::FaultResult::UserFault(crate::vm::FaultReason::InvalidAddress);
         }
-        let page = fault.address & !(PAGE_SIZE - 1);
+        if !fault.is_translation() {
+            return match fault.kind {
+                crate::vm::FaultKind::Protection | crate::vm::FaultKind::AccessFlag => {
+                    crate::vm::FaultResult::UserFault(crate::vm::FaultReason::Protection)
+                }
+                crate::vm::FaultKind::External | crate::vm::FaultKind::Unknown => {
+                    crate::vm::FaultResult::UserFault(crate::vm::FaultReason::InvalidAddress)
+                }
+                crate::vm::FaultKind::Translation => unreachable!(),
+            };
+        }
         if self.stack_guard == Some(page) {
-            if !fault.write {
+            if !fault.write || fault.instruction {
                 return crate::vm::FaultResult::UserFault(crate::vm::FaultReason::Protection);
             }
             return match self.grow_stack(fault.address) {
@@ -257,16 +464,30 @@ impl AddressSpace {
                 Ok(false) => {
                     crate::vm::FaultResult::UserFault(crate::vm::FaultReason::StackOverflow)
                 }
-                Err(Error::NoFrames) => {
+                Err(Error::NoFrames | Error::MappingCapacity | Error::QuotaExceeded) => {
                     crate::vm::FaultResult::UserFault(crate::vm::FaultReason::OutOfMemory)
                 }
-                Err(_) => crate::vm::FaultResult::UserFault(crate::vm::FaultReason::GuardPage),
+                Err(Error::GuardPage | Error::InvalidAddress) => {
+                    crate::vm::FaultResult::UserFault(crate::vm::FaultReason::GuardPage)
+                }
+                Err(_) => crate::vm::FaultResult::KernelFatal,
             };
         }
         if let Some(mapping) = self.mapping(page) {
-            if (fault.write && !mapping.flags.writable) || (!fault.write && !mapping.flags.readable)
+            if (fault.write && !mapping.flags.writable)
+                || (fault.instruction && !mapping.flags.executable)
+                || (!fault.write && !fault.instruction && !mapping.flags.readable)
             {
                 return crate::vm::FaultResult::UserFault(crate::vm::FaultReason::Protection);
+            }
+            if !mapping.present {
+                return match self.materialize(page) {
+                    Ok(()) => crate::vm::FaultResult::Resolved,
+                    Err(Error::NoFrames) => {
+                        crate::vm::FaultResult::UserFault(crate::vm::FaultReason::OutOfMemory)
+                    }
+                    Err(_) => crate::vm::FaultResult::KernelFatal,
+                };
             }
         }
         crate::vm::FaultResult::UserFault(crate::vm::FaultReason::InvalidAddress)
@@ -279,7 +500,9 @@ impl AddressSpace {
             .find(|mapping| mapping.virtual_address == virtual_address)
             .map(|mapping| MappingInfo {
                 virtual_address: mapping.virtual_address,
-                physical_frame: mapping.physical_frame,
+                physical_frame: mapping.physical_frame.unwrap_or(PhysAddr::new(0)),
+                present: mapping.physical_frame.is_some(),
+                cow: mapping.cow,
                 flags: mapping.flags,
                 kind: mapping.kind,
             })
@@ -287,10 +510,131 @@ impl AddressSpace {
 
     pub fn unmap_page(&mut self, virtual_address: usize) -> Result<(), Error> {
         let mapping = self.mapping(virtual_address).ok_or(Error::InvalidAddress)?;
-        if mapping.kind == MappingKind::Stack {
+        if matches!(
+            mapping.kind,
+            MappingKind::Stack | MappingKind::SignalTrampoline
+        ) {
             return Err(Error::InvalidState);
         }
         self.remove_mapping(virtual_address)
+    }
+
+    pub fn unmap_range(&mut self, address: usize, length: usize) -> Result<(), Error> {
+        let length = align_up(length, PAGE_SIZE).ok_or(Error::InvalidAddress)?;
+        if length == 0 || !address.is_multiple_of(PAGE_SIZE) {
+            return Err(Error::Unaligned);
+        }
+        let end = address.checked_add(length).ok_or(Error::InvalidAddress)?;
+        if end > USER_LIMIT {
+            return Err(Error::InvalidAddress);
+        }
+        let mut page = address;
+        while page < end {
+            let mapping = self.mapping(page).ok_or(Error::InvalidAddress)?;
+            if matches!(
+                mapping.kind,
+                MappingKind::Stack | MappingKind::SignalTrampoline
+            ) {
+                return Err(Error::InvalidState);
+            }
+            page += PAGE_SIZE;
+        }
+        page = address;
+        while page < end {
+            self.remove_mapping(page)?;
+            page += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
+    pub fn protect_range(
+        &mut self,
+        address: usize,
+        length: usize,
+        flags: PageFlags,
+    ) -> Result<(), Error> {
+        flags.validate()?;
+        let length = align_up(length, PAGE_SIZE).ok_or(Error::InvalidAddress)?;
+        if length == 0 || !address.is_multiple_of(PAGE_SIZE) {
+            return Err(Error::Unaligned);
+        }
+        let end = address.checked_add(length).ok_or(Error::InvalidAddress)?;
+        if end > USER_LIMIT {
+            return Err(Error::InvalidAddress);
+        }
+        let mut page = address;
+        while page < end {
+            let mapping = self.mapping(page).ok_or(Error::InvalidAddress)?;
+            if mapping.kind == MappingKind::SignalTrampoline {
+                return Err(Error::InvalidState);
+            }
+            page += PAGE_SIZE;
+        }
+        page = address;
+        while page < end {
+            let slot = self
+                .mappings
+                .iter()
+                .position(|entry| entry.is_some_and(|entry| entry.virtual_address == page))
+                .ok_or(Error::InvalidAddress)?;
+            self.mappings[slot]
+                .as_mut()
+                .ok_or(Error::InvalidAddress)?
+                .flags = flags;
+            if self.active
+                && self.mappings[slot].is_some_and(|entry| entry.physical_frame.is_some())
+            {
+                let root = self.root_frame.ok_or(Error::InvalidState)?;
+                if !crate::arch::user_space_protect(root, page, flags) {
+                    return Err(Error::HardwareMapping);
+                }
+            }
+            page += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
+    pub fn contains_executable(&self, address: usize) -> bool {
+        let page = address & !(PAGE_SIZE - 1);
+        self.mapping(page)
+            .is_some_and(|mapping| mapping.flags.executable)
+    }
+
+    fn find_free_range(&self, hint: usize, length: usize) -> Option<usize> {
+        let mut base = if hint == 0 {
+            #[cfg(target_arch = "x86_64")]
+            {
+                0x0000_1000_0000_0000
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                0x0000_0020_0000_0000
+            }
+        } else {
+            hint & !(PAGE_SIZE - 1)
+        };
+        base = self.aslr.choose_base(base, length, PAGE_SIZE)?;
+        let end = base.checked_add(length)?;
+        if end <= self.heap_limit() && self.range_is_free(base, end) {
+            Some(base)
+        } else {
+            let mut candidate = PAGE_SIZE;
+            while candidate.checked_add(length)? <= self.heap_limit() {
+                let end = candidate + length;
+                if self.range_is_free(candidate, end) {
+                    return Some(candidate);
+                }
+                candidate = candidate.checked_add(PAGE_SIZE)?;
+            }
+            None
+        }
+    }
+
+    fn range_is_free(&self, start: usize, end: usize) -> bool {
+        self.mappings
+            .iter()
+            .flatten()
+            .all(|mapping| mapping.virtual_address < start || mapping.virtual_address >= end)
     }
 
     pub fn destroy(&mut self) -> Result<(), Error> {
@@ -308,11 +652,16 @@ impl AddressSpace {
         }
         let mut error = None;
         for mapping in self.mappings.iter_mut().flatten() {
-            if !crate::memory::free_frame(mapping.physical_frame.value()) && error.is_none() {
+            if mapping
+                .physical_frame
+                .is_some_and(|frame| !crate::memory::free_frame(frame.value()))
+                && error.is_none()
+            {
                 error = Some(Error::FrameReturn);
             }
         }
         self.mappings = [None; MAX_MAPPINGS];
+        self.reserved_pages = 0;
         if !self.release_table_frames() && error.is_none() {
             error = Some(Error::FrameReturn);
         }
@@ -344,12 +693,20 @@ impl AddressSpace {
         if !crate::arch::user_space_prepare(root) {
             return Err(Error::HardwareUnavailable);
         }
-        for mapping in self.mappings.iter().flatten().copied() {
+        for mapping in self
+            .mappings
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|mapping| mapping.physical_frame.is_some())
+        {
             if !crate::arch::user_space_map(
                 root,
                 MappingInfo {
                     virtual_address: mapping.virtual_address,
-                    physical_frame: mapping.physical_frame,
+                    physical_frame: mapping.physical_frame.unwrap_or(PhysAddr::new(0)),
+                    present: mapping.physical_frame.is_some(),
+                    cow: mapping.cow,
                     flags: mapping.flags,
                     kind: mapping.kind,
                 },
@@ -374,6 +731,9 @@ impl AddressSpace {
         while offset < bytes.len() {
             let page = cursor & !(PAGE_SIZE - 1);
             let mapping = self.mapping(page).ok_or(Error::InvalidAddress)?;
+            if !mapping.present {
+                return Err(Error::InvalidState);
+            }
             let page_offset = cursor - page;
             let count = (PAGE_SIZE - page_offset).min(bytes.len() - offset);
             if !crate::arch::write_physical(
@@ -409,6 +769,7 @@ impl AddressSpace {
         virtual_address: usize,
         flags: PageFlags,
         kind: MappingKind,
+        present: bool,
     ) -> Result<MappingInfo, Error> {
         if self.root_frame.is_none() {
             return Err(Error::InvalidState);
@@ -431,11 +792,20 @@ impl AddressSpace {
             .iter()
             .position(Option::is_none)
             .ok_or(Error::MappingCapacity)?;
-        let physical_frame = crate::memory::alloc_frame()
-            .map(PhysAddr::new)
-            .ok_or(Error::NoFrames)?;
-        if !crate::arch::zero_physical_page(physical_frame) {
-            let _ = crate::memory::free_frame(physical_frame.value());
+        if self.reserved_pages >= self.page_quota {
+            return Err(Error::QuotaExceeded);
+        }
+        let physical_frame = if present {
+            Some(
+                crate::memory::alloc_frame()
+                    .map(PhysAddr::new)
+                    .ok_or(Error::NoFrames)?,
+            )
+        } else {
+            None
+        };
+        if physical_frame.is_some_and(|frame| !crate::arch::zero_physical_page(frame)) {
+            let _ = physical_frame.is_none_or(|frame| crate::memory::free_frame(frame.value()));
             return Err(Error::HardwareUnavailable);
         }
         let mapping = Mapping {
@@ -443,31 +813,79 @@ impl AddressSpace {
             physical_frame,
             flags,
             kind,
+            shared: false,
+            cow: false,
         };
         self.mappings[slot] = Some(mapping);
-        if self.active {
+        if self.active && present {
             let root = self.root_frame.ok_or(Error::InvalidState)?;
             if !crate::arch::user_space_map(
                 root,
                 MappingInfo {
                     virtual_address: mapping.virtual_address,
-                    physical_frame: mapping.physical_frame,
+                    physical_frame: mapping.physical_frame.unwrap_or(PhysAddr::new(0)),
+                    present: mapping.physical_frame.is_some(),
+                    cow: mapping.cow,
                     flags: mapping.flags,
                     kind: mapping.kind,
                 },
                 &mut self.table_frames,
             ) {
                 self.mappings[slot] = None;
-                let _ = crate::memory::free_frame(physical_frame.value());
+                let _ = physical_frame.is_none_or(|frame| crate::memory::free_frame(frame.value()));
                 return Err(Error::HardwareMapping);
             }
         }
+        self.reserved_pages += 1;
         Ok(MappingInfo {
             virtual_address,
-            physical_frame,
+            physical_frame: physical_frame.unwrap_or(PhysAddr::new(0)),
+            present,
+            cow: false,
             flags,
             kind,
         })
+    }
+
+    fn materialize(&mut self, address: usize) -> Result<(), Error> {
+        let slot = self
+            .mappings
+            .iter()
+            .position(|entry| entry.is_some_and(|mapping| mapping.virtual_address == address))
+            .ok_or(Error::InvalidAddress)?;
+        let mapping = self.mappings[slot].ok_or(Error::InvalidAddress)?;
+        if mapping.physical_frame.is_some() {
+            return Ok(());
+        }
+        let frame = crate::memory::alloc_frame()
+            .map(PhysAddr::new)
+            .ok_or(Error::NoFrames)?;
+        if !crate::arch::zero_physical_page(frame) {
+            let _ = crate::memory::free_frame(frame.value());
+            return Err(Error::HardwareUnavailable);
+        }
+        if self.active
+            && !crate::arch::user_space_map(
+                self.root_frame.ok_or(Error::InvalidState)?,
+                MappingInfo {
+                    virtual_address: address,
+                    physical_frame: frame,
+                    present: true,
+                    flags: mapping.flags,
+                    kind: mapping.kind,
+                    cow: false,
+                },
+                &mut self.table_frames,
+            )
+        {
+            let _ = crate::memory::free_frame(frame.value());
+            return Err(Error::HardwareMapping);
+        }
+        self.mappings[slot]
+            .as_mut()
+            .ok_or(Error::InvalidState)?
+            .physical_frame = Some(frame);
+        Ok(())
     }
 
     fn remove_mapping(&mut self, virtual_address: usize) -> Result<(), Error> {
@@ -478,17 +896,23 @@ impl AddressSpace {
                 mapping.is_some_and(|mapping| mapping.virtual_address == virtual_address)
             })
             .ok_or(Error::InvalidAddress)?;
-        if self.active {
+        if self.active
+            && self.mappings[slot].is_some_and(|mapping| mapping.physical_frame.is_some())
+        {
             let root = self.root_frame.ok_or(Error::InvalidState)?;
             if !crate::arch::user_space_unmap(root, virtual_address, &mut self.table_frames) {
                 return Err(Error::HardwareMapping);
             }
         }
         let mapping = self.mappings[slot].take().ok_or(Error::InvalidAddress)?;
-        if !crate::memory::free_frame(mapping.physical_frame.value()) {
+        if mapping
+            .physical_frame
+            .is_some_and(|frame| !crate::memory::free_frame(frame.value()))
+        {
             self.mappings[slot] = Some(mapping);
             return Err(Error::FrameReturn);
         }
+        self.reserved_pages -= 1;
         Ok(())
     }
 

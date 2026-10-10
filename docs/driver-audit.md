@@ -44,9 +44,9 @@ lifecycle, interrupt registration API, DMA API, or driver-owned error type.
 | x86 IDT/GDT/TSS | Static IDT, GDT, TSS, and 16 KiB kernel stack | exception and timer handlers, syscall stack setup | `arch::x86_64::tables` owns all storage for the current boot. It is single-CPU static state; per-CPU and teardown semantics are absent. |
 | x86 local APIC | APIC MSR and physical MMIO base from `IA32_APIC_BASE` | calibrated timer interrupt path and status command | `arch::x86_64` owns APIC/HPET calibration, vector routing, EOI, and the PIT fallback decision. The MMIO pointer has no explicit mapping/resource validation. |
 | aarch64 exception vectors/GIC | Static vector table, EL-specific system registers, and DTB-discovered GICv2/v3 | synchronous syscall/fault entry, IRQ acknowledgement, and generic timer PPI | `arch::aarch64::tables` installs VBAR and uses a dedicated kernel stack; `arch::aarch64::gic` owns distributor/CPU-interface or redistributor setup, ACK/EOI, and timer enable. |
-| Block layer | `static mut RAMDISK` fallback plus optional x86_64 modern PCI virtio-blk, fixed request queue | `vfs`, serial `block` diagnostic, FAT32 persistence smoke | `drivers::block` owns geometry, request lifetime, bounded completion, partition discovery, read-only state, backend selection, and write-through cache policy. The RAM backend is volatile; virtio-blk owns its bounded DMA queue and optional flush boundary. |
+| Block layer | `static mut RAMDISK` fallback plus optional x86_64 modern PCI virtio-blk, fixed request queue | `vfs`, serial `block` diagnostic, FAT32 persistence smoke | `drivers::block` owns geometry, request lifetime, one-sector request-owned bounce buffers, bounded completion, generation-bearing completion/cancellation release, partition discovery, read-only state, backend selection, and write-through cache policy. Timed-out slots are quarantined and cannot be reused until the matching lower-driver release. The RAM backend is volatile; virtio-blk owns its bounded DMA queue and optional flush boundary. |
 | Driver registry | Static 32-entry metadata array and length | boot initialization and `drivers` debugger command | `framework` owns storage, but callers ignore the `bool` result. Registration is only a status display and does not own hardware or bind a driver. |
-| Physical frames | Static range table and monotonic allocator | x86 paging lazy mapper | `memory` owns allocation; paging returns a frame when a lazy leaf cannot be installed. This is an adjacent memory contract, not a device DMA allocator. |
+| Physical frames | Static range table, per-range handed-out ownership intervals, bounded return cache, and SMP lock | x86 paging lazy mapper | `memory` owns allocation and rejects returns for never-allocated or reserved physical frames; paging returns a frame when a lazy leaf cannot be installed. This is an adjacent memory contract, not a device DMA allocator. |
 | Direct map/page tables | x86 static table pool and page-table entries | paging and lazy fault path | `arch::x86_64::paging` owns the pool and mappings. The current interface exposes raw pointers/physical addresses and has no mapping lifetime or concurrency contract. |
 
 The ownership conclusion is deliberately simple: every current “driver” is
@@ -498,12 +498,16 @@ driver deferred with an explicit bootlog message.
 ### Block layer follow-up
 
 The former direct RAM-disk sector helper is now a fixed-capacity block layer.
-It publishes sector geometry, accepts aligned multi-sector requests, queues
-requests behind `RequestId<'a>` ownership, and completes them through a bounded
-poll/wait path. Read and write wrappers remain for the current VFS, while the
-submit/wait API is available for the next filesystem vertical. Invalid ranges,
-unaligned sizes, read-only writes, queue saturation, and bounded timeouts have
-explicit typed errors.
+It publishes sector geometry, queues one-sector requests behind a
+generation-bearing `RequestId<'a>`, and completes them through a bounded
+poll/wait path. Each request owns a one-sector bounce buffer; the caller's
+buffer is copied only at submit or after successful completion. A timeout
+quarantines the request instead of clearing it, and only a matching delayed
+completion or lower-driver cancellation confirmation can release the slot.
+Read and write wrappers remain for the current VFS, while multi-sector calls
+are bounded loops over those sector requests. Invalid ranges, unaligned sizes,
+read-only writes, queue saturation, stale generations, and bounded timeouts
+have explicit typed errors.
 
 The RAM backend initializes a small MBR partition table and discovers bounded
 valid entries, falling back to a whole-disk partition when no valid table is
@@ -543,9 +547,12 @@ and a complete persistent POSIX namespace remain later roadmap work.
 
 The three staged readers now accept an explicit bounded partition view
 (`base_lba`, `available_sectors`) and the boot probes use the block layer's
-first discovered partition. Reader callbacks are still read-only for ext4 and
-btrfs, and the FAT32 writer remains fixed-file-only; this is a boundary check,
-not mount-tree publication.
+active partition: the first valid MBR entry marked bootable, or the first valid
+entry when no bootable entry exists. An unpartitioned disk is represented by a
+whole-disk fallback view. Every filesystem I/O remains relative to and bounded
+by that view. Reader callbacks are still read-only for ext4 and btrfs, and the
+FAT32 writer remains fixed-file-only; this is a boundary check, not mount-tree
+publication.
 
 ### Ramfs follow-up
 

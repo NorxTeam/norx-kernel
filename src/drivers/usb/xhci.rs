@@ -1,5 +1,5 @@
 use crate::drivers::framework::{
-    DmaBuffer, DmaDirection, Driver, DriverError, DriverOps, Resource,
+    BusKind, DmaBuffer, DmaDirection, Driver, DriverError, DriverOps, Resource,
 };
 use crate::drivers::pci;
 use crate::drivers::usb::hid;
@@ -322,7 +322,7 @@ pub fn service_dma() -> Option<DmaBuffer> {
         let runtime = core::ptr::addr_of_mut!(RUNTIME);
         (*runtime)
             .as_ref()
-            .map(|runtime| runtime.dcbaa.buffer(DmaDirection::Bidirectional))
+            .and_then(|runtime| runtime.dcbaa.dma.as_ref()?.try_clone().ok())
     }
 }
 
@@ -360,7 +360,7 @@ fn service_probe(device: &mut crate::drivers::framework::Device) -> Result<(), D
         owner: device.id,
     })?;
     let dma = service_dma().ok_or(DriverError::DmaFailure)?;
-    if dma.owner != device.id {
+    if dma.owner() != device.id || dma.bus() != device.bus_kind {
         return Err(DriverError::ResourceOwnerMismatch);
     }
     device.add_resource(Resource::Dma(dma))
@@ -621,66 +621,64 @@ fn wait_for_command_clear(mmio: MmioRegion, operational: usize, mask: u32) -> bo
     false
 }
 
-#[derive(Clone, Copy)]
 struct DmaPage {
+    dma: Option<DmaBuffer>,
     physical: u64,
     virtual_address: usize,
 }
 
 impl DmaPage {
     fn new() -> Result<Self, HostError> {
-        let physical = crate::memory::alloc_frame().ok_or(HostError::DmaUnavailable)?;
-        let virtual_address =
-            crate::arch::physical_to_virtual(crate::address::PhysAddr::new(physical))
-                .ok_or(HostError::DmaUnavailable)?
-                .value();
+        let dma = DmaBuffer::allocate(
+            SERVICE_DEVICE_ID,
+            BusKind::Pci,
+            PAGE_SIZE,
+            PAGE_SIZE,
+            DmaDirection::Bidirectional,
+        )
+        .map_err(|_| HostError::DmaUnavailable)?;
+        let physical = dma.physical().value();
+        let virtual_address = dma.virtual_address().value();
         let page = Self {
+            dma: Some(dma),
             physical,
             virtual_address,
         };
         page.clear();
-        page.buffer(DmaDirection::Bidirectional)
-            .validate()
-            .map_err(|_| HostError::DmaUnavailable)?;
         Ok(page)
     }
 
-    fn buffer(self, direction: DmaDirection) -> DmaBuffer {
-        DmaBuffer {
-            physical: crate::address::PhysAddr::new(self.physical),
-            virtual_address: crate::address::VirtAddr::new(self.virtual_address),
-            length: PAGE_SIZE,
-            alignment: PAGE_SIZE,
-            direction,
-            owner: SERVICE_DEVICE_ID,
-        }
-    }
-
-    fn sync_for_device(self) -> Result<(), HostError> {
-        unsafe { self.buffer(DmaDirection::Bidirectional).sync_for_device() }
+    fn sync_for_device(&self) -> Result<(), HostError> {
+        self.dma
+            .as_ref()
+            .ok_or(HostError::DmaUnavailable)?
+            .sync_for_device()
             .map_err(|_| HostError::DmaUnavailable)
     }
 
-    fn sync_for_cpu(self) -> Result<(), HostError> {
-        unsafe { self.buffer(DmaDirection::Bidirectional).sync_for_cpu() }
+    fn sync_for_cpu(&self) -> Result<(), HostError> {
+        self.dma
+            .as_ref()
+            .ok_or(HostError::DmaUnavailable)?
+            .sync_for_cpu()
             .map_err(|_| HostError::DmaUnavailable)
     }
 
-    fn clear(self) {
+    fn clear(&self) {
         unsafe { core::ptr::write_bytes(self.virtual_address as *mut u8, 0, PAGE_SIZE) };
     }
 
-    fn read_u8(self, offset: usize) -> u8 {
+    fn read_u8(&self, offset: usize) -> u8 {
         assert!(offset < PAGE_SIZE);
         unsafe { (self.virtual_address as *const u8).add(offset).read() }
     }
 
-    fn write_u8(self, offset: usize, value: u8) {
+    fn write_u8(&self, offset: usize, value: u8) {
         assert!(offset < PAGE_SIZE);
         unsafe { (self.virtual_address as *mut u8).add(offset).write(value) };
     }
 
-    fn write_u32(self, offset: usize, value: u32) {
+    fn write_u32(&self, offset: usize, value: u32) {
         assert!(offset + 4 <= PAGE_SIZE && offset.is_multiple_of(4));
         unsafe {
             (self.virtual_address as *mut u32)
@@ -689,12 +687,12 @@ impl DmaPage {
         };
     }
 
-    fn read_u32(self, offset: usize) -> u32 {
+    fn read_u32(&self, offset: usize) -> u32 {
         assert!(offset + 4 <= PAGE_SIZE && offset.is_multiple_of(4));
         unsafe { u32::from_le((self.virtual_address as *const u32).add(offset / 4).read()) }
     }
 
-    fn write_u64(self, offset: usize, value: u64) {
+    fn write_u64(&self, offset: usize, value: u64) {
         assert!(offset + 8 <= PAGE_SIZE && offset.is_multiple_of(8));
         unsafe {
             (self.virtual_address as *mut u64)
@@ -703,7 +701,7 @@ impl DmaPage {
         };
     }
 
-    fn read_trb(self, index: usize) -> Trb {
+    fn read_trb(&self, index: usize) -> Trb {
         let offset = index * 16;
         Trb {
             words: [
@@ -715,7 +713,7 @@ impl DmaPage {
         }
     }
 
-    fn write_trb(self, index: usize, trb: Trb) {
+    fn write_trb(&self, index: usize, trb: Trb) {
         let offset = index * 16;
         self.write_u32(offset, trb.words[0]);
         self.write_u32(offset + 4, trb.words[1]);
@@ -1363,7 +1361,7 @@ impl Runtime {
                     )?;
                 }
                 let configuration = parse_configuration(
-                    self.data,
+                    &self.data,
                     total_length,
                     device_class,
                     vendor_id,
@@ -1979,7 +1977,7 @@ impl Runtime {
 }
 
 fn parse_configuration(
-    page: DmaPage,
+    page: &DmaPage,
     total_length: usize,
     device_class: u8,
     vendor_id: u16,

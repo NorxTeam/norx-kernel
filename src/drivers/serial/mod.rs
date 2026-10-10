@@ -1,5 +1,5 @@
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 
 #[cfg(target_arch = "x86_64")]
 pub mod ns16550;
@@ -60,8 +60,9 @@ impl SerialConfig {
     }
 }
 
-static FAILED: AtomicBool = AtomicBool::new(false);
-static FAILURE_REASON: AtomicU8 = AtomicU8::new(0);
+const STATE_READY: u8 = 0;
+
+static STATE: AtomicU8 = AtomicU8::new(STATE_READY);
 
 pub struct Serial;
 
@@ -97,18 +98,18 @@ pub fn write_bytes(bytes: &[u8]) -> bool {
 }
 
 pub fn read() -> Option<u8> {
-    if FAILED.load(Ordering::Acquire) {
+    if STATE.load(Ordering::Acquire) != STATE_READY {
         return None;
     }
     crate::arch::early_serial_read()
 }
 
 pub fn available() -> bool {
-    !FAILED.load(Ordering::Acquire)
+    STATE.load(Ordering::Acquire) == STATE_READY
 }
 
 pub fn failure_reason() -> Option<FailureReason> {
-    failure_reason_code(FAILURE_REASON.load(Ordering::Relaxed))
+    failure_reason_code(STATE.load(Ordering::Acquire))
 }
 
 pub const fn backend_name() -> &'static str {
@@ -123,7 +124,7 @@ pub const fn backend_name() -> &'static str {
 }
 
 fn write_byte(byte: u8) -> bool {
-    if FAILED.load(Ordering::Acquire) {
+    if STATE.load(Ordering::Acquire) != STATE_READY {
         return false;
     }
     let ok = crate::arch::early_serial_write(byte);
@@ -134,8 +135,16 @@ fn write_byte(byte: u8) -> bool {
 }
 
 pub(crate) fn mark_failed(reason: FailureReason) {
-    let _ = FAILURE_REASON.compare_exchange(0, reason.code(), Ordering::AcqRel, Ordering::Relaxed);
-    FAILED.store(true, Ordering::Release);
+    mark_failure(&STATE, reason);
+}
+
+fn mark_failure(state: &AtomicU8, reason: FailureReason) {
+    let _ = state.compare_exchange(
+        STATE_READY,
+        reason.code(),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
 }
 
 fn failure_reason_code(code: u8) -> Option<FailureReason> {
@@ -147,7 +156,11 @@ fn failure_reason_code(code: u8) -> Option<FailureReason> {
 }
 
 pub fn contract_self_check() {
-    assert!(failure_reason_code(0).is_none());
+    let state = AtomicU8::new(STATE_READY);
+    mark_failure(&state, FailureReason::Init);
+    mark_failure(&state, FailureReason::TxTimeout);
+    assert_eq!(state.load(Ordering::Acquire), FailureReason::Init.code());
+    assert!(failure_reason_code(STATE_READY).is_none());
     assert!(failure_reason_code(FailureReason::Init.code()) == Some(FailureReason::Init));
     assert!(failure_reason_code(FailureReason::TxTimeout.code()) == Some(FailureReason::TxTimeout));
     assert_eq!(FailureReason::Init.name(), "init");

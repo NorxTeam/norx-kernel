@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "Staged architecture and fault hooks are not all enabled in bootstrap"
+)]
+
 use core::{
     arch::{asm, global_asm},
     ptr,
@@ -58,7 +63,7 @@ norx_page_fault_entry:
     add rsp, 8
     iretq
 2:
-    mov rdx, qword ptr [rip + PAGE_FAULT_TARGET_CONTEXT]
+    mov rdx, qword ptr gs:[{state_page_fault_target_context}]
     test rdx, rdx
     jz 1f
     mov rsp, rbx
@@ -82,25 +87,18 @@ norx_page_fault_entry:
     mov rdx, qword ptr [rdx + 96]
     iretq
 3:
-    mov rax, qword ptr [rip + USER_RETURN_DEPTH]
+    mov rax, qword ptr gs:[{state_user_return_depth}]
     test rax, rax
     jz 1f
     dec rax
-    mov qword ptr [rip + USER_RETURN_DEPTH], rax
-    lea rdx, [rip + KERNEL_RETURN_RBX_STACK]
-    mov rbx, qword ptr [rdx + rax*8]
-    lea rdx, [rip + KERNEL_RETURN_RBP_STACK]
-    mov rbp, qword ptr [rdx + rax*8]
-    lea rdx, [rip + KERNEL_RETURN_R12_STACK]
-    mov r12, qword ptr [rdx + rax*8]
-    lea rdx, [rip + KERNEL_RETURN_R13_STACK]
-    mov r13, qword ptr [rdx + rax*8]
-    lea rdx, [rip + KERNEL_RETURN_R14_STACK]
-    mov r14, qword ptr [rdx + rax*8]
-    lea rdx, [rip + KERNEL_RETURN_R15_STACK]
-    mov r15, qword ptr [rdx + rax*8]
-    lea rdx, [rip + USER_RETURN_RSP_STACK]
-    mov rsp, qword ptr [rdx + rax*8]
+    mov qword ptr gs:[{state_user_return_depth}], rax
+    mov rbx, qword ptr gs:[{state_kernel_return_rbx_stack} + rax*8]
+    mov rbp, qword ptr gs:[{state_kernel_return_rbp_stack} + rax*8]
+    mov r12, qword ptr gs:[{state_kernel_return_r12_stack} + rax*8]
+    mov r13, qword ptr gs:[{state_kernel_return_r13_stack} + rax*8]
+    mov r14, qword ptr gs:[{state_kernel_return_r14_stack} + rax*8]
+    mov r15, qword ptr gs:[{state_kernel_return_r15_stack} + rax*8]
+    mov rsp, qword ptr gs:[{state_user_return_rsp_stack} + rax*8]
     sti
     ret
 1:
@@ -121,7 +119,16 @@ norx_page_fault_entry:
     pop rcx
     pop rax
     ud2
-"#
+"#,
+    state_page_fault_target_context = const super::syscall::STATE_PAGE_FAULT_TARGET_CONTEXT,
+    state_user_return_depth = const super::syscall::STATE_USER_RETURN_DEPTH,
+    state_kernel_return_rbx_stack = const super::syscall::STATE_KERNEL_RETURN_RBX_STACK,
+    state_kernel_return_rbp_stack = const super::syscall::STATE_KERNEL_RETURN_RBP_STACK,
+    state_kernel_return_r12_stack = const super::syscall::STATE_KERNEL_RETURN_R12_STACK,
+    state_kernel_return_r13_stack = const super::syscall::STATE_KERNEL_RETURN_R13_STACK,
+    state_kernel_return_r14_stack = const super::syscall::STATE_KERNEL_RETURN_R14_STACK,
+    state_kernel_return_r15_stack = const super::syscall::STATE_KERNEL_RETURN_R15_STACK,
+    state_user_return_rsp_stack = const super::syscall::STATE_USER_RETURN_RSP_STACK,
 );
 
 extern "C" {
@@ -241,18 +248,15 @@ pub fn init() -> bool {
     load_gdt();
     load_idt();
     unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) };
-    let timer_registration = crate::irq::register_system(
-        crate::drivers::framework::IrqKind::Legacy,
-        0,
-        32,
-        timer_hard,
-        Some(timer_deferred),
-    );
-    if let Ok(id) = timer_registration {
-        crate::irq::register_timer(id);
-    }
-    let timer = timer_registration.is_ok();
-    timer && crate::drivers::ps2::register_irqs()
+    crate::drivers::ps2::register_irqs()
+}
+
+pub fn register_timer_handler(kind: crate::drivers::framework::IrqKind) -> bool {
+    let Ok(id) = crate::irq::register_system(kind, 0, 32, timer_hard, Some(timer_deferred)) else {
+        return false;
+    };
+    crate::irq::register_timer(id);
+    true
 }
 
 fn load_gdt() {
@@ -483,8 +487,8 @@ extern "x86-interrupt" fn general_protection(_stack: InterruptStackFrame, code: 
 #[no_mangle]
 extern "C" fn norx_page_fault_dispatch(rip: u64, code: u64) -> u64 {
     let address = super::fault_address();
-    if crate::usercopy::handles_fault(rip) {
-        return crate::usercopy::recovery_address();
+    if let Some(recovery) = crate::usercopy::fault_recovery(rip) {
+        return recovery;
     }
     let fault = crate::vm::FaultInfo::x86_page_fault(address, code);
     if crate::vm::handle_page_fault(fault) {

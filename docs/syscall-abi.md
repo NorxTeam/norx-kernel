@@ -58,8 +58,15 @@ are frozen so kernel, Rust, and C implementations cannot drift:
 
 `PipeFds` is two 64-bit words. `WaitStatus` is four C-layout words: a kind
 (`exited`, `signaled`, `stopped`, or `continued`), signed exit code, signal,
-and reserved word. `SpawnSpec` is eleven 64-bit words containing copied path,
-argument/environment vectors, stdio fds, process group, and flags. Open flags
+and reserved word. `SpawnSpec`, `DelegatedSpawnSpec`, and `SessionSpec` begin
+with an 8-byte header containing a `u16` ABI version, a `u16` exact declared
+struct size, and a zero reserved word. The current sizes are 104, 120, and 80
+bytes respectively. All three records require the current ABI version and
+exact current size; smaller, larger, or future-version declarations return
+`-EINVAL` before the full record is copied. Every explicit reserved word,
+including the records' tail/padding words, must be zero. `SpawnSpec` contains
+copied path, argument/environment vectors, stdio fds, process group, and flags.
+Open flags
 are `READ`, `WRITE`, `CREATE`, `TRUNCATE`, `APPEND`, and `EXCLUSIVE`;
 `EXCLUSIVE` requires `CREATE` and fails if the path already exists. `fsync` and
 `sync_path` validate their descriptor/path and return `-ENOTSUP` until a
@@ -86,7 +93,9 @@ handles; pipes and serial descriptors reject filesystem-only operations.
 
 When a read-only persistent mount is present, `open`, `read`, `lseek`, `stat`,
 `fstat`, `read_dir`, and `fsync` dispatch to the bounded filesystem reader and
-block flush boundary. An explicitly writable FAT32 mount additionally supports
+block flush boundary. Its `PersistentMount` access is explicit: FAT32, ext4,
+and btrfs reader probes receive no write callback, even on writable media.
+An explicitly writable FAT32 mount additionally supports
 bounded existing-file rewrite plus short 8.3 create/mkdir, empty-file unlink,
 and same-directory rename; LFN create/rename, rmdir, and directory-chain growth
 are also bounded. A journal-clean writable ext4 mount supports rewrites of
@@ -104,10 +113,15 @@ reports the ABI version, table size, negative-error convention, and runtime
 checks on both targets.
 
 The current `usercopy` boundary validates null/canonical/overflow/size rules.
-x86_64 uses an IDT assembly shim with an active-copy range and recovery RIP;
-aarch64 uses the corresponding SVC-vector data-abort path and ELR recovery.
-Both return an `EFAULT`-class result for an unmapped copy without entering the
-fatal exception path. Pointer-accepting calls copy into or out of bounded
+x86_64 uses an IDT assembly shim and aarch64 uses the corresponding SVC-vector
+data-abort path. Each online CPU owns a bounded active-copy frame; the fault
+handler recovers only when the interrupted address is inside that frame's
+faultable range, then resumes at its recovery RIP/ELR. A copy cannot replace a
+same-CPU active frame, and one CPU clearing its frame cannot disable recovery
+on another CPU. Interrupts remain masked for the non-blocking copy window so a
+same-CPU handler cannot switch away from its active frame. Both architectures
+return an `EFAULT`-class result for an unmapped copy without entering the fatal
+exception path. Pointer-accepting calls copy into or out of bounded
 kernel-owned arrays; path and vector lengths are checked before every copy.
 Multi-step TOCTOU pinning remains a future requirement for unbounded APIs, but
 the v2 records never expose kernel pointers or host descriptors.

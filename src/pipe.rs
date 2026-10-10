@@ -1,3 +1,5 @@
+use crate::sync::SmpLock;
+
 const CAPACITY: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +144,9 @@ impl PipeTable {
 }
 
 static mut PIPE_TABLE: PipeTable = PipeTable::new();
+// Pipe slots, endpoint counts, ring contents, and generations share one
+// ownership domain. IRQ masking alone is not an SMP lock.
+static PIPE_TABLE_LOCK: SmpLock<()> = SmpLock::new(());
 
 pub fn create() -> Result<(u32, u32), Error> {
     with_table(|table| {
@@ -229,7 +234,7 @@ pub fn write_raw(raw: u32, input: &[u8]) -> Result<usize, Error> {
 }
 
 fn with_table<R>(f: impl FnOnce(&mut PipeTable) -> Result<R, Error>) -> Result<R, Error> {
-    crate::arch::without_interrupts(|| unsafe {
+    PIPE_TABLE_LOCK.with(|_| unsafe {
         let table = &mut *core::ptr::addr_of_mut!(PIPE_TABLE);
         f(table)
     })

@@ -1,8 +1,9 @@
 use core::sync::atomic::{AtomicU16, Ordering};
 
-use crate::drivers::framework::{DmaBuffer, DmaDirection};
+use crate::drivers::framework::{BusKind, DmaBuffer, DmaDirection};
 use crate::drivers::pci;
 use crate::io::PioRegion;
+use crate::sync::SmpLock;
 
 const VIRTIO_NET_CLASS: u32 = 0x0002_0000;
 const PAGE_SIZE: usize = 4096;
@@ -13,6 +14,7 @@ const NET_HEADER: usize = 10;
 const PACKET_BUFFER: usize = 2048;
 const MIN_FRAME: usize = 14;
 const MAX_FRAME: usize = 1514;
+const DMA_DEVICE_ID: crate::drivers::framework::DeviceId = 9;
 
 const DEVICE_FEATURES: usize = 0x00;
 const GUEST_FEATURES: usize = 0x04;
@@ -75,8 +77,8 @@ pub enum InitResult {
     Failed(NetError),
 }
 
-#[derive(Clone, Copy)]
 struct DmaPage {
+    dma: Option<DmaBuffer>,
     physical: u64,
     virtual_address: usize,
 }
@@ -84,18 +86,25 @@ struct DmaPage {
 impl DmaPage {
     const fn empty() -> Self {
         Self {
+            dma: None,
             physical: 0,
             virtual_address: 0,
         }
     }
 
     fn new() -> Result<Self, NetError> {
-        let physical = crate::memory::alloc_frame().ok_or(NetError::DmaUnavailable)?;
-        let virtual_address =
-            crate::arch::physical_to_virtual(crate::address::PhysAddr::new(physical))
-                .ok_or(NetError::DmaUnavailable)?
-                .value();
+        let dma = DmaBuffer::allocate(
+            DMA_DEVICE_ID,
+            BusKind::Pci,
+            PAGE_SIZE,
+            PAGE_SIZE,
+            DmaDirection::Bidirectional,
+        )
+        .map_err(|_| NetError::DmaUnavailable)?;
+        let physical = dma.physical().value();
+        let virtual_address = dma.virtual_address().value();
         let page = Self {
+            dma: Some(dma),
             physical,
             virtual_address,
         };
@@ -104,30 +113,27 @@ impl DmaPage {
         Ok(page)
     }
 
-    fn buffer(self, length: usize) -> DmaBuffer {
-        DmaBuffer {
-            physical: crate::address::PhysAddr::new(self.physical),
-            virtual_address: crate::address::VirtAddr::new(self.virtual_address),
-            length,
-            alignment: PAGE_SIZE,
-            direction: DmaDirection::Bidirectional,
-            owner: 0,
-        }
+    fn sync_for_device(&self) -> Result<(), NetError> {
+        self.dma
+            .as_ref()
+            .ok_or(NetError::DmaUnavailable)?
+            .sync_for_device()
+            .map_err(|_| NetError::DmaUnavailable)
     }
 
-    fn sync_for_device(self) -> Result<(), NetError> {
-        unsafe { self.buffer(PAGE_SIZE).sync_for_device() }.map_err(|_| NetError::DmaUnavailable)
+    fn sync_for_cpu(&self) -> Result<(), NetError> {
+        self.dma
+            .as_ref()
+            .ok_or(NetError::DmaUnavailable)?
+            .sync_for_cpu()
+            .map_err(|_| NetError::DmaUnavailable)
     }
 
-    fn sync_for_cpu(self) -> Result<(), NetError> {
-        unsafe { self.buffer(PAGE_SIZE).sync_for_cpu() }.map_err(|_| NetError::DmaUnavailable)
-    }
-
-    fn clear(self) {
+    fn clear(&self) {
         unsafe { core::ptr::write_bytes(self.virtual_address as *mut u8, 0, PAGE_SIZE) };
     }
 
-    fn write_bytes(self, offset: usize, bytes: &[u8]) {
+    fn write_bytes(&self, offset: usize, bytes: &[u8]) {
         assert!(offset
             .checked_add(bytes.len())
             .is_some_and(|end| end <= PAGE_SIZE));
@@ -140,7 +146,7 @@ impl DmaPage {
         }
     }
 
-    fn copy_to(self, offset: usize, output: &mut [u8]) {
+    fn copy_to(&self, offset: usize, output: &mut [u8]) {
         assert!(offset
             .checked_add(output.len())
             .is_some_and(|end| end <= PAGE_SIZE));
@@ -170,7 +176,7 @@ impl QueueMemory {
         if page_count > MAX_QUEUE_PAGES {
             return Err(NetError::InvalidQueue);
         }
-        let mut pages = [DmaPage::empty(); MAX_QUEUE_PAGES];
+        let mut pages = core::array::from_fn(|_| DmaPage::empty());
         pages[0] = DmaPage::new()?;
         for index in 1..page_count {
             pages[index] = DmaPage::new()?;
@@ -201,27 +207,22 @@ impl QueueMemory {
         self.page_count * PAGE_SIZE
     }
 
-    fn buffer(&self) -> DmaBuffer {
-        DmaBuffer {
-            physical: crate::address::PhysAddr::new(self.physical()),
-            virtual_address: crate::address::VirtAddr::new(self.virtual_address()),
-            length: self.length(),
-            alignment: PAGE_SIZE,
-            direction: DmaDirection::Bidirectional,
-            owner: 0,
-        }
-    }
-
     fn clear(&self) {
         unsafe { core::ptr::write_bytes(self.virtual_address() as *mut u8, 0, self.length()) };
     }
 
     fn sync_for_device(&self) -> Result<(), NetError> {
-        unsafe { self.buffer().sync_for_device() }.map_err(|_| NetError::DmaUnavailable)
+        for page in &self.pages {
+            page.sync_for_device()?;
+        }
+        Ok(())
     }
 
     fn sync_for_cpu(&self) -> Result<(), NetError> {
-        unsafe { self.buffer().sync_for_cpu() }.map_err(|_| NetError::DmaUnavailable)
+        for page in &self.pages {
+            page.sync_for_cpu()?;
+        }
+        Ok(())
     }
 
     fn write_u16(&self, offset: usize, value: u16) {
@@ -350,7 +351,10 @@ struct Runtime {
     tx_error_logged: bool,
 }
 
-static mut RUNTIME: Option<Runtime> = None;
+// The runtime owns the device registers, queues, DMA buffers, endpoint
+// counters, and lifecycle state. IRQ masking does not serialize other CPUs;
+// all normal and deferred entry points take this lock before touching it.
+static RUNTIME: SmpLock<Option<Runtime>> = SmpLock::new(None);
 static IRQ_PORT_BASE: AtomicU16 = AtomicU16::new(0);
 
 pub fn contract_self_check() {
@@ -367,34 +371,33 @@ pub fn contract_self_check() {
 }
 
 pub fn init() -> InitResult {
-    match probe() {
-        Ok(Some(mut runtime)) => {
-            runtime.irq_registration = runtime.register_interrupt();
-            runtime.interrupts = runtime.irq_registration.is_some();
-            let irq = runtime.irq;
-            let status = runtime.status();
-            unsafe { core::ptr::addr_of_mut!(RUNTIME).write(Some(runtime)) };
-            if status.interrupts {
-                crate::arch::enable_legacy_irq(irq);
+    let (result, irq) = RUNTIME.with(|runtime_slot| {
+        if runtime_slot.is_some() {
+            return (InitResult::Failed(NetError::Busy), None);
+        }
+        match probe() {
+            Ok(Some(mut runtime)) => {
+                runtime.irq_registration = runtime.register_interrupt();
+                runtime.interrupts = runtime.irq_registration.is_some();
+                let irq = runtime.irq;
+                let status = runtime.status();
+                *runtime_slot = Some(runtime);
+                (InitResult::Ready(status), status.interrupts.then_some(irq))
             }
-            InitResult::Ready(status)
+            Ok(None) => (InitResult::Unsupported, None),
+            Err(error) => (InitResult::Failed(error), None),
         }
-        Ok(None) => {
-            unsafe { core::ptr::addr_of_mut!(RUNTIME).write(None) };
-            InitResult::Unsupported
-        }
-        Err(error) => {
-            unsafe { core::ptr::addr_of_mut!(RUNTIME).write(None) };
-            InitResult::Failed(error)
-        }
+    });
+    if let Some(irq) = irq {
+        crate::arch::enable_legacy_irq(irq);
     }
+    result
 }
 
 #[allow(dead_code)]
 pub fn shutdown() {
-    unsafe {
-        let runtime_slot = core::ptr::addr_of_mut!(RUNTIME);
-        let Some(runtime) = (*runtime_slot).as_mut() else {
+    RUNTIME.with(|runtime_slot| {
+        let Some(runtime) = runtime_slot.as_mut() else {
             return;
         };
         if let Some(registration) = runtime.irq_registration {
@@ -408,43 +411,38 @@ pub fn shutdown() {
             runtime.irq_registration = None;
         }
         IRQ_PORT_BASE.store(0, Ordering::Release);
-        (*runtime_slot).take();
-    }
+        runtime_slot.take();
+    })
 }
 
 pub fn status() -> Option<Status> {
-    unsafe {
-        (&*core::ptr::addr_of!(RUNTIME))
-            .as_ref()
-            .map(Runtime::status)
-    }
+    RUNTIME.with(|runtime| runtime.as_ref().map(Runtime::status))
 }
 
 pub fn poll() {
-    unsafe {
-        let runtime = core::ptr::addr_of_mut!(RUNTIME);
-        if let Some(runtime) = (*runtime).as_mut() {
+    RUNTIME.with(|runtime| {
+        if let Some(runtime) = runtime.as_mut() {
             runtime.poll();
         }
-    }
+    })
 }
 
 pub fn transmit_packet(packet: &[u8]) -> Result<(), NetError> {
-    unsafe {
-        let Some(runtime) = (&mut *core::ptr::addr_of_mut!(RUNTIME)).as_mut() else {
+    RUNTIME.with(|runtime| {
+        let Some(runtime) = runtime.as_mut() else {
             return Err(NetError::Device);
         };
         runtime.transmit(packet)
-    }
+    })
 }
 
 pub fn receive_packet(output: &mut [u8]) -> Result<usize, NetError> {
-    unsafe {
-        let Some(runtime) = (&mut *core::ptr::addr_of_mut!(RUNTIME)).as_mut() else {
+    RUNTIME.with(|runtime| {
+        let Some(runtime) = runtime.as_mut() else {
             return Err(NetError::Device);
         };
         runtime.receive(output)
-    }
+    })
 }
 
 fn probe() -> Result<Option<Runtime>, NetError> {
@@ -490,7 +488,7 @@ impl Runtime {
         if rx_size < RX_BUFFERS as u16 || tx_size == 0 {
             return Err(NetError::InvalidQueue);
         }
-        let mut rx_buffers = [DmaPage::empty(); RX_BUFFERS];
+        let mut rx_buffers = core::array::from_fn(|_| DmaPage::empty());
         for buffer in &mut rx_buffers {
             *buffer = DmaPage::new()?;
         }
@@ -637,7 +635,7 @@ impl Runtime {
                 self.rx_dropped = self.rx_dropped.saturating_add(1);
                 Err(NetError::BufferTooSmall)
             } else {
-                let buffer = self.rx_buffers[descriptor as usize];
+                let buffer = &self.rx_buffers[descriptor as usize];
                 buffer.sync_for_cpu()?;
                 buffer.copy_to(NET_HEADER, &mut output[..frame_len]);
                 self.rx_packets = self.rx_packets.saturating_add(1);

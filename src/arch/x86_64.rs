@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "Staged architecture and fault hooks are not all enabled in bootstrap"
+)]
+
 use core::arch::asm;
 use core::sync::atomic::{fence, Ordering};
 
@@ -114,6 +119,9 @@ pub fn port_read_u32(port: u16) -> u32 {
 }
 
 pub fn ticks() -> u64 {
+    if let Some(ticks) = apic::clock_ticks() {
+        return ticks;
+    }
     let high: u32;
     let low: u32;
     unsafe {
@@ -123,7 +131,7 @@ pub fn ticks() -> u64 {
 }
 
 pub fn timer_frequency_hz() -> Option<u64> {
-    None
+    apic::clock_frequency_hz()
 }
 
 pub fn timer_source() -> &'static str {
@@ -131,6 +139,14 @@ pub fn timer_source() -> &'static str {
         "apic"
     } else {
         "pit"
+    }
+}
+
+pub fn clock_source() -> &'static str {
+    if apic::clock_frequency_hz().is_some() {
+        "hpet"
+    } else {
+        "tsc"
     }
 }
 
@@ -142,7 +158,9 @@ pub fn init_timer_interrupts() -> bool {
     if apic::timer_calibration().is_some() {
         remap_pic();
         disable_legacy_irq(0);
-        if apic::enable_timer() {
+        if apic::enable_timer()
+            && tables::register_timer_handler(crate::drivers::framework::IrqKind::Local)
+        {
             let input_ok = crate::drivers::ps2::enable_interrupts();
             let ps2 = crate::drivers::ps2::status();
             if input_ok && ps2.controller {
@@ -152,13 +170,28 @@ pub fn init_timer_interrupts() -> bool {
             } else {
                 crate::bootlog::warn("ps/2 IRQ routing skipped; controller unavailable");
             }
-            crate::bootlog::ok("APIC timer IRQ enabled; PIT IRQ0 masked");
+            crate::bootlog::ok_fmt(format_args!(
+                "NORX_X86_TIMER_APIC_HPET_OK v=1 timer_hz={} clock_hz={} scheduler_hz={} initial_count={}",
+                apic::timer_calibration()
+                    .map(|calibration| calibration.apic_timer_hz)
+                    .unwrap_or(0),
+                apic::clock_frequency_hz().unwrap_or(0),
+                crate::time::scheduler_hz(),
+                apic::timer_calibration()
+                    .map(|calibration| calibration.initial_count)
+                    .unwrap_or(0),
+            ));
             unsafe { asm!("sti", options(nomem, nostack, preserves_flags)) };
             return true;
         }
+        apic::disable_timer();
     }
     remap_pic();
     init_pit(crate::time::scheduler_hz() as u16);
+    if !tables::register_timer_handler(crate::drivers::framework::IrqKind::Legacy) {
+        crate::bootlog::fail("timer IRQ registration unavailable; using polling");
+        return false;
+    }
     crate::bootlog::ok("timer source=pit calibration=none");
     let input_ok = crate::drivers::ps2::enable_interrupts();
     let ps2 = crate::drivers::ps2::status();
@@ -347,6 +380,14 @@ pub fn user_space_unmap(
     paging::user_space_unmap(root, virtual_address, tables)
 }
 
+pub fn user_space_protect(
+    root: crate::address::PhysAddr,
+    virtual_address: usize,
+    flags: crate::address_space::PageFlags,
+) -> bool {
+    paging::user_space_protect(root, virtual_address, flags)
+}
+
 pub fn user_space_reset(root: crate::address::PhysAddr) {
     paging::user_space_reset(root)
 }
@@ -389,4 +430,24 @@ pub fn request_user_switch(from: u32, to: u32) {
 
 pub fn has_user_context(thread: u32) -> bool {
     syscall::has_user_context(thread)
+}
+
+pub fn revoke_user_context(thread: u32) {
+    syscall::revoke_user_context(thread)
+}
+
+pub fn context_contract_self_check() {
+    syscall::context_contract_self_check()
+}
+
+/// Request a chipset reset; fail stopped if firmware/hardware does not reset.
+pub fn reboot() -> ! {
+    unsafe {
+        core::arch::asm!("cli", "out dx, al", in("dx") 0xcf9u16, in("al") 6u8, options(nostack));
+    }
+    loop {
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack));
+        }
+    }
 }

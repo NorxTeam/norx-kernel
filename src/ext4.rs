@@ -4,6 +4,7 @@ const SECTOR_SIZE: usize = 512;
 const MAX_BLOCK_SIZE: usize = 4096;
 const MAX_COMPONENTS: usize = 16;
 const MAX_DIRECTORY_BLOCKS: u64 = 64;
+const MAX_PATH_BYTES: usize = 256;
 pub const MAX_NAME_LENGTH: usize = 255;
 const EXT4_MAGIC: u16 = 0xef53;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
@@ -62,6 +63,8 @@ pub struct FileInfo {
     pub mode: u16,
     pub size: u64,
     pub directory: bool,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +93,7 @@ pub struct Mount {
     reader: ReadSector,
     writer: Option<WriteSector>,
     base_lba: u64,
+    available_sectors: u64,
     block_size: u32,
     blocks: u64,
     inodes_per_group: u32,
@@ -127,6 +131,8 @@ impl TransactionBlock {
 #[derive(Clone, Copy)]
 struct Inode {
     mode: u16,
+    uid: u32,
+    gid: u32,
     flags: u32,
     size: u64,
     extents: [u8; 60],
@@ -164,6 +170,9 @@ impl Mount {
         base_lba: u64,
         available_sectors: u64,
     ) -> Result<Self, Error> {
+        if available_sectors < 4 || base_lba.checked_add(available_sectors).is_none() {
+            return Err(Error::InvalidSuperblock);
+        }
         let mut superblock = [0u8; 1024];
         let mut sector = [0u8; SECTOR_SIZE];
         let sector_lba = |relative: u64| base_lba.checked_add(relative);
@@ -250,6 +259,7 @@ impl Mount {
             reader,
             writer,
             base_lba,
+            available_sectors,
             block_size,
             blocks,
             inodes_per_group,
@@ -283,6 +293,8 @@ impl Mount {
             mode: inode.mode,
             size: inode.size,
             directory: is_directory(inode.mode),
+            uid: inode.uid,
+            gid: inode.gid,
         })
     }
 
@@ -483,6 +495,9 @@ impl Mount {
                 }
                 if child != 0 {
                     let name = &block[offset + 8..offset + 8 + name_length];
+                    if name.iter().any(|byte| *byte == 0 || *byte == b'/') {
+                        return Err(Error::BadDirectory);
+                    }
                     if visitor(child, name)? {
                         return Ok(());
                     }
@@ -502,6 +517,8 @@ impl Mount {
         extents.copy_from_slice(&bytes[40..100]);
         Ok(Inode {
             mode: le_u16(bytes, 0),
+            uid: u32::from(le_u16(bytes, 2)) | (u32::from(le_u16(bytes, 120)) << 16),
+            gid: u32::from(le_u16(bytes, 24)) | (u32::from(le_u16(bytes, 122)) << 16),
             flags: le_u32(bytes, 32),
             size: le_u32(bytes, 4) as u64 | (le_u32(bytes, 108) as u64) << 32,
             extents,
@@ -793,7 +810,7 @@ impl Mount {
             let start = index * SECTOR_SIZE;
             sector.copy_from_slice(&input[start..start + SECTOR_SIZE]);
             let lba = offset / SECTOR_SIZE as u64 + index as u64;
-            let absolute = self.base_lba.checked_add(lba).ok_or(Error::Io)?;
+            let absolute = self.absolute_sector(lba).ok_or(Error::Io)?;
             if !writer(absolute, &sector) {
                 return Err(Error::Io);
             }
@@ -823,19 +840,24 @@ impl Mount {
     }
 
     fn read_sector(self, lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
-        self.base_lba
-            .checked_add(lba)
+        self.absolute_sector(lba)
             .is_some_and(|absolute| (self.reader)(absolute, output))
+    }
+
+    fn absolute_sector(self, lba: u64) -> Option<u64> {
+        (lba < self.available_sectors)
+            .then_some(())
+            .and_then(|_| self.base_lba.checked_add(lba))
     }
 }
 
 pub fn probe_block() -> Result<Mount, Error> {
-    let partition = block::partition(0).ok_or(Error::InvalidSuperblock)?;
+    let partition = block::active_partition().ok_or(Error::InvalidSuperblock)?;
     Mount::open_at(ramdisk_read_sector, partition.start_lba, partition.sectors)
 }
 
 pub fn probe_block_rw() -> Result<Mount, Error> {
-    let partition = block::partition(0).ok_or(Error::InvalidSuperblock)?;
+    let partition = block::active_partition().ok_or(Error::InvalidSuperblock)?;
     Mount::open_at_rw(
         ramdisk_read_sector,
         ramdisk_write_sector,
@@ -938,6 +960,13 @@ fn fixture_check() -> bool {
     if partitioned
         .read_file("/hello.txt", &mut partitioned_output)
         .is_err()
+    {
+        return false;
+    }
+    if !Mount::open_at(fixture_partition_read_sector, 100, 3)
+        .is_err_and(|error| error == Error::InvalidSuperblock)
+        || !Mount::open_at(fixture_partition_read_sector, u64::MAX, 4)
+            .is_err_and(|error| error == Error::InvalidSuperblock)
     {
         return false;
     }
@@ -1196,7 +1225,7 @@ fn write_directory_entry(
 
 fn components(path: &str) -> Result<([&str; MAX_COMPONENTS], usize), Error> {
     let bytes = path.as_bytes();
-    if !bytes.starts_with(b"/") {
+    if !bytes.starts_with(b"/") || bytes.len() > MAX_PATH_BYTES || bytes.contains(&0) {
         return Err(Error::InvalidPath);
     }
     let mut result = [""; MAX_COMPONENTS];
@@ -1207,7 +1236,10 @@ fn components(path: &str) -> Result<([&str; MAX_COMPONENTS], usize), Error> {
             continue;
         }
         if index > start {
-            if count == MAX_COMPONENTS || &path[start..index] == "." || &path[start..index] == ".."
+            if count == MAX_COMPONENTS
+                || index - start > MAX_NAME_LENGTH
+                || &path[start..index] == "."
+                || &path[start..index] == ".."
             {
                 return Err(Error::InvalidPath);
             }
@@ -1217,7 +1249,11 @@ fn components(path: &str) -> Result<([&str; MAX_COMPONENTS], usize), Error> {
         start = index + 1;
     }
     if start < bytes.len() {
-        if count == MAX_COMPONENTS || &path[start..] == "." || &path[start..] == ".." {
+        if count == MAX_COMPONENTS
+            || bytes.len() - start > MAX_NAME_LENGTH
+            || &path[start..] == "."
+            || &path[start..] == ".."
+        {
             return Err(Error::InvalidPath);
         }
         result[count] = &path[start..];

@@ -2,12 +2,11 @@
 
 [![CI](../../actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
 
-Norx is an experimental Rust kernel and OS bring-up project. The current
-boot path is GRUB-based:
-
-- `x86_64-unknown-none` is loaded through GRUB Multiboot2;
-- `aarch64-unknown-uefi` is loaded by GRUB's EFI chainloader and receives its
-  DTB through the UEFI configuration table or `boot/norx.dtb`.
+Norx is an experimental Rust kernel and OS bring-up project. Native development
+and CI target ARM64 only: `aarch64-unknown-uefi`. Direct UEFI boot receives the
+DTB through firmware or `boot/norx.dtb`; the optional GRUB launcher remains an
+ARM64 convenience. Retained x86 source is historical implementation material,
+not a native support or CI claim. Foreign x86 applications belong to `WLI`.
 
 ## What exists now
 
@@ -31,17 +30,21 @@ boot path is GRUB-based:
 
 The current VFS is a bounded mount-tree smoke layer backed by an in-kernel RAM
 filesystem and contains `/hello.txt`. Norx is not production-ready. See the
-[shared roadmap](../ROADMAP.md) for the current implementation status and
+[shared roadmap](ROADMAP.md) for the current implementation status and
 future system work. The current ownership, failure, ABI, hardware, and
 unsupported-case release gates are indexed in
 [`docs/stability-contracts.md`](docs/stability-contracts.md).
+The per-ABI and per-driver target/console/evidence ledger is in
+[`docs/platform-matrix.md`](docs/platform-matrix.md).
+The roadmap repository/source-of-truth inventory is in
+[`docs/repository-manifest.md`](docs/repository-manifest.md).
 
 ## Requirements
 
-- Rustup. The repository pins nightly Rust and both kernel targets in
+- Rustup. The repository pins nightly Rust and the ARM64 kernel target in
   `rust-toolchain.toml`.
-- A POSIX shell (`sh`), Cargo, and the GRUB tools `grub-mkstandalone` and
-  `grub-file`.
+- A POSIX shell (`sh`), Cargo, and Python 3 for the direct EFI smoke.
+  `grub-mkstandalone` is required only for the optional GRUB launcher.
 - QEMU with the matching EDK2 firmware files in its share directory.
 
 On Windows, run the shell script from WSL or another POSIX-compatible shell.
@@ -51,16 +54,22 @@ The script can also use a custom firmware directory through `QEMU_SHARE`.
 
 ```sh
 cargo fmt --check
-cargo build --target x86_64-unknown-none
 cargo build --target aarch64-unknown-uefi
-cargo clippy --target x86_64-unknown-none -- -D warnings
 cargo clippy --target aarch64-unknown-uefi -- -D warnings
 ```
 
 ## Build and run in QEMU
 
+The bounded serial check boots the native EFI image directly without GRUB:
+
 ```sh
-./scripts/run.sh x86_64
+python3 scripts/arm-efi-smoke.py --log build/arm-efi.serial.log --timeout 45
+```
+
+Set `QEMU_SHARE` when the ARM EDK2 firmware lives outside QEMU's share directory.
+The following interactive launcher uses GRUB and defaults to ARM64:
+
+```sh
 ./scripts/run.sh aarch64
 ```
 
@@ -70,7 +79,6 @@ starts QEMU with serial output attached to the terminal. Set
 without starting QEMU:
 
 ```sh
-PROFILE=release ./scripts/run.sh x86_64
 MODE=build ./scripts/run.sh aarch64
 ```
 
@@ -83,9 +91,7 @@ On Windows, use the compact PowerShell wrapper when an ESP and UEFI vars file
 already exist:
 
 ```powershell
-.\scripts\qemu-boot.ps1 x86_64 -TimeoutSeconds 60 -SerialLog build\qemu-x86.log
 .\scripts\qemu-boot.ps1 aarch64 -TimeoutSeconds 60 -SerialLog build\qemu-arm.log
-.\scripts\qemu-boot.ps1 x86_64 -Interactive
 ```
 
 Pass `-Esp`, `-Vars`, or `-Marker 'kernel initialization complete'` when using
@@ -94,14 +100,12 @@ another fixture. A timeout returns code `124` and preserves the serial log.
 ### `nsh` interactive smoke
 
 After building the pinned Rust userspace fixtures, build the kernel with
-`RUN_NSH_SMOKE=1 REQUIRE_USERSPACE_FIXTURE=1`, refresh both ESP kernel images,
+`RUN_NSH_SMOKE=1 REQUIRE_USERSPACE_FIXTURE=1`, refresh the ARM64 ESP kernel image,
 and run the prompt-driven shell harness:
 
 ```sh
 python3 ../toolchain/scripts/build-rust-userspace.py
-RUN_NSH_SMOKE=1 REQUIRE_USERSPACE_FIXTURE=1 PROFILE=release MODE=build ./scripts/run.sh x86_64
 RUN_NSH_SMOKE=1 REQUIRE_USERSPACE_FIXTURE=1 PROFILE=release MODE=build ./scripts/run.sh aarch64
-./scripts/nsh-smoke.sh x86_64
 ./scripts/nsh-smoke.sh aarch64
 ```
 

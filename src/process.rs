@@ -1,7 +1,17 @@
+#![allow(
+    dead_code,
+    reason = "Staged ABI and hardware hooks are not all enabled in the bootstrap profile"
+)]
+
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::address::PhysAddr;
+use crate::signal::{
+    self, DefaultAction, MaskHow, SignalAction, SignalDelivery, SignalError, SignalReturn,
+    SignalState, ThreadSignalState, UserSignalContext, SA_NOCLDSTOP, SA_RESETHAND, SIGCHLD,
+    SIGCONT, SIGKILL, SIGSTOP,
+};
 
 const MAX_PROCESSES: usize = 32;
 const MAX_THREADS: usize = 64;
@@ -80,6 +90,7 @@ impl FileDescriptor {
 pub enum ProcessState {
     Creating,
     Running,
+    Stopped,
     Exiting,
     Zombie,
     Reaped,
@@ -92,6 +103,7 @@ pub enum ThreadState {
     Running,
     Blocked,
     Sleeping,
+    Stopped,
     Exited,
 }
 
@@ -99,6 +111,16 @@ pub enum ThreadState {
 pub enum ThreadKind {
     Kernel,
     User,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserContext {
+    pub registers: [u64; 35],
+}
+
+impl UserContext {
+    pub const EMPTY: Self = Self { registers: [0; 35] };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +131,15 @@ pub struct ContextSwitch {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockCurrentResult {
+    TimedOut,
+    Blocked {
+        token: crate::wait::WaitToken,
+        switch: ContextSwitch,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct SpawnTransaction {
     pub parent: ProcessId,
     pub child: ProcessId,
@@ -124,6 +155,33 @@ pub struct Credentials {
     pub effective_gid: u32,
     pub saved_gid: u32,
     pub capabilities: u64,
+}
+
+const NO_TARGET_UID: u32 = u32::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionCapability {
+    process: ProcessId,
+    generation: u32,
+}
+
+impl SessionCapability {
+    pub fn from_raw(raw: u64) -> Option<Self> {
+        let process = ProcessId::from_raw(raw as u32);
+        let generation = (raw >> 32) as u32;
+        if generation == 0 || process.slot().is_none() {
+            None
+        } else {
+            Some(Self {
+                process,
+                generation,
+            })
+        }
+    }
+
+    pub const fn raw(self) -> u64 {
+        ((self.generation as u64) << 32) | self.process.get() as u64
+    }
 }
 
 pub const MAX_SESSION_CWD: usize = 256;
@@ -251,11 +309,13 @@ struct ProcessRecord {
     id: ProcessId,
     parent: Option<ProcessId>,
     pgid: ProcessId,
+    sid: ProcessId,
     state: ProcessState,
     credentials: Credentials,
     session: SessionState,
+    session_generation: u32,
     exit_status: Option<i32>,
-    pending_signals: u64,
+    signals: SignalState,
     pending_events: u64,
     address_space_root: Option<PhysAddr>,
     threads: [Option<ThreadId>; MAX_PROCESS_THREADS],
@@ -273,11 +333,13 @@ impl ProcessRecord {
             id,
             parent,
             pgid,
+            sid: id,
             state: ProcessState::Creating,
             credentials,
             session: SessionState::DEFAULT,
+            session_generation: 1,
             exit_status: None,
-            pending_signals: 0,
+            signals: SignalState::new(),
             pending_events: 0,
             address_space_root: None,
             threads: [None; MAX_PROCESS_THREADS],
@@ -296,6 +358,9 @@ struct ThreadRecord {
     runtime_ticks: u64,
     preemptions: u64,
     context_switches: u64,
+    user_context: UserContext,
+    user_context_valid: bool,
+    signals: ThreadSignalState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,6 +375,8 @@ pub enum Error {
     GenerationExhausted,
     PermissionDenied,
     InvalidSession,
+    SignalFrameCapacity,
+    InvalidSignalFrame,
 }
 
 pub struct ProcessTable {
@@ -378,11 +445,18 @@ impl ProcessTable {
             return Err(Error::InvalidState);
         }
         let parent_group = self.process(parent)?.pgid;
+        let parent_session_id = self.process(parent)?.sid;
         let parent_session = self.process(parent)?.session;
+        let parent_signal_state = self.process(parent)?.signals.inherit();
+        let parent_thread = self.process_thread(parent)?;
+        let parent_signal_mask = self.thread(parent_thread)?.signals.inherit();
         let slot = self
             .processes
             .iter()
-            .position(Option::is_none)
+            .enumerate()
+            .find_map(|(slot, process)| {
+                (process.is_none() && self.process_generations[slot] != u16::MAX).then_some(slot)
+            })
             .ok_or(Error::ProcessCapacity)?;
         let process = ProcessId::new(slot, self.process_generations[slot]);
         self.processes[slot] = Some(ProcessRecord::new(
@@ -391,7 +465,9 @@ impl ProcessTable {
             parent_group,
             credentials,
         ));
+        self.process_mut(process)?.sid = parent_session_id;
         self.process_mut(process)?.session = parent_session;
+        self.process_mut(process)?.signals = parent_signal_state;
         let thread = match self.allocate_thread(Some(process), ThreadKind::User) {
             Ok(thread) => thread,
             Err(error) => {
@@ -399,6 +475,7 @@ impl ProcessTable {
                 return Err(error);
             }
         };
+        self.thread_mut(thread)?.signals = parent_signal_mask;
         if publish {
             self.publish_child(process, thread)?;
         }
@@ -414,6 +491,37 @@ impl ProcessTable {
         }
         self.process_mut(process)?.state = ProcessState::Running;
         self.thread_mut(thread)?.state = ThreadState::Ready;
+        Ok(())
+    }
+
+    pub fn finalize_spawn(
+        &mut self,
+        transaction: SpawnTransaction,
+        source_fds: [FileDescriptor; 3],
+        inherit_open_fds: bool,
+        process_group: Option<ProcessId>,
+    ) -> Result<(), Error> {
+        let SpawnTransaction {
+            parent,
+            child,
+            thread,
+        } = transaction;
+        let result = if inherit_open_fds {
+            self.inherit_open_fds(parent, child, source_fds)
+        } else {
+            self.inherit_standard_fds(parent, child, source_fds)
+        }
+        .and_then(|()| match process_group {
+            Some(process_group) => self.set_process_group_for_child(parent, child, process_group),
+            None => Ok(()),
+        })
+        .and_then(|()| self.publish_child(child, thread));
+        if let Err(error) = result {
+            return match self.abort_child(parent, child) {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(rollback_error),
+            };
+        }
         Ok(())
     }
 
@@ -437,12 +545,13 @@ impl ProcessTable {
             {
                 return Err(Error::InvalidState);
             }
-            thread_slots[index] = Some(slot);
+            thread_slots[index] = Some(thread);
         }
         for entry in record.fds.into_iter().flatten() {
             release_open_file(entry.open_file);
         }
-        for slot in thread_slots.into_iter().flatten() {
+        for thread in thread_slots.into_iter().flatten() {
+            let slot = thread.slot().ok_or(Error::InvalidId)?;
             self.threads[slot] = None;
             self.thread_generations[slot] += 1;
         }
@@ -458,37 +567,15 @@ impl ProcessTable {
     }
 
     pub fn exit(&mut self, process: ProcessId, status: i32) -> Result<(), Error> {
-        if process == ProcessId::INIT || self.process(process)?.state != ProcessState::Running {
+        if process == ProcessId::INIT
+            || !matches!(
+                self.process(process)?.state,
+                ProcessState::Running | ProcessState::Stopped
+            )
+        {
             return Err(Error::InvalidState);
         }
-        {
-            let record = self.process_mut(process)?;
-            record.state = ProcessState::Exiting;
-            record.exit_status = Some(status);
-            let fds = record.fds;
-            record.fds = [None; MAX_FDS];
-            for entry in fds.into_iter().flatten() {
-                release_open_file(entry.open_file);
-            }
-        }
-        for thread in &mut self.threads {
-            let Some(thread) = thread.as_mut() else {
-                continue;
-            };
-            if thread.process == Some(process) {
-                thread.state = ThreadState::Exited;
-            }
-        }
-        for record in &mut self.processes {
-            let Some(record) = record.as_mut() else {
-                continue;
-            };
-            if record.parent == Some(process) {
-                record.parent = Some(ProcessId::INIT);
-            }
-        }
-        self.process_mut(process)?.state = ProcessState::Zombie;
-        Ok(())
+        self.finish_exit(process, status, None)
     }
 
     fn wait_candidate(
@@ -660,17 +747,18 @@ impl ProcessTable {
         for (index, source) in sources.into_iter().enumerate() {
             target[index] = source;
         }
+        let max_fds = usize::try_from(child_record.session.max_fds)
+            .ok()
+            .filter(|max_fds| (3..=MAX_FDS).contains(max_fds))
+            .ok_or(Error::InvalidSession)?;
+        if target.iter().flatten().count() > max_fds {
+            return Err(Error::FdCapacity);
+        }
         let mut duplicated = [None; MAX_FDS];
         for (index, source) in target.into_iter().enumerate() {
             let Some(source) = source else {
                 continue;
             };
-            if index >= child_record.session.max_fds as usize {
-                for open_file in duplicated.into_iter().flatten() {
-                    release_open_file(open_file);
-                }
-                return Err(Error::FdCapacity);
-            }
             if let Err(error) = duplicate_open_file(source.open_file) {
                 for open_file in duplicated.into_iter().flatten() {
                     release_open_file(open_file);
@@ -741,29 +829,297 @@ impl ProcessTable {
         Ok((entry.nonblocking, entry.readable, entry.writable))
     }
 
-    pub fn raise_signal(&mut self, process: ProcessId, signal: u8) -> Result<(), Error> {
-        if signal >= 64 {
+    fn signal_error(error: SignalError) -> Error {
+        match error {
+            SignalError::FrameCapacity => Error::SignalFrameCapacity,
+            SignalError::StaleFrame => Error::InvalidSignalFrame,
+            SignalError::FrameUnavailable
+            | SignalError::TokenExhausted
+            | SignalError::InvalidSignal
+            | SignalError::InvalidMask
+            | SignalError::InvalidHandler
+            | SignalError::Uncatchable
+            | SignalError::UnsupportedFlags => Error::InvalidState,
+        }
+    }
+
+    fn validate_signal(signal: u8) -> Result<(), Error> {
+        if signal as usize >= signal::MAX_SIGNALS {
             return Err(Error::InvalidState);
         }
-        self.process_mut(process)?.pending_signals |= 1u64 << signal;
+        Ok(())
+    }
+
+    fn live_process(&self, process: ProcessId) -> Result<(), Error> {
+        if !matches!(
+            self.process(process)?.state,
+            ProcessState::Running | ProcessState::Stopped
+        ) {
+            return Err(Error::InvalidState);
+        }
+        Ok(())
+    }
+
+    pub fn signal_action(&self, process: ProcessId, signal: u8) -> Result<SignalAction, Error> {
+        Self::validate_signal(signal)?;
+        self.process(process)?
+            .signals
+            .action(signal)
+            .map_err(Self::signal_error)
+    }
+
+    pub fn set_signal_action(
+        &mut self,
+        process: ProcessId,
+        signal: u8,
+        action: SignalAction,
+    ) -> Result<SignalAction, Error> {
+        Self::validate_signal(signal)?;
+        self.live_process(process)?;
+        let old = self
+            .process_mut(process)?
+            .signals
+            .install(signal, action)
+            .map_err(Self::signal_error)?;
+        if action.is_ignored() {
+            let bit = signal::signal_bit(signal);
+            for thread in self.threads.iter_mut().flatten() {
+                if thread.process == Some(process) {
+                    thread.signals.clear_pending_mask(bit);
+                }
+            }
+        }
+        Ok(old)
+    }
+
+    pub fn signal_mask(&self, thread: ThreadId) -> Result<u64, Error> {
+        Ok(self.thread(thread)?.signals.mask())
+    }
+
+    pub fn set_signal_mask(&mut self, thread: ThreadId, mask: u64) -> Result<u64, Error> {
+        self.thread_mut(thread)?
+            .signals
+            .set_mask(mask)
+            .map_err(Self::signal_error)
+    }
+
+    pub fn change_signal_mask(
+        &mut self,
+        thread: ThreadId,
+        how: MaskHow,
+        mask: u64,
+    ) -> Result<u64, Error> {
+        self.thread_mut(thread)?
+            .signals
+            .change_mask(how, mask)
+            .map_err(Self::signal_error)
+    }
+
+    pub fn set_signal_restart(
+        &mut self,
+        thread: ThreadId,
+        restart: Option<crate::signal::RestartState>,
+    ) -> Result<(), Error> {
+        self.thread_mut(thread)?.signals.set_restart(restart);
+        Ok(())
+    }
+
+    pub fn signal_restart(
+        &self,
+        thread: ThreadId,
+    ) -> Result<Option<crate::signal::RestartState>, Error> {
+        Ok(self.thread(thread)?.signals.restart())
+    }
+
+    pub fn raise_signal(&mut self, process: ProcessId, signal: u8) -> Result<(), Error> {
+        Self::validate_signal(signal)?;
+        self.live_process(process)?;
+        self.process_mut(process)?
+            .signals
+            .set_pending(signal)
+            .map_err(Self::signal_error)?;
+        self.wake_signal_waiter(process, signal);
+        Ok(())
+    }
+
+    pub fn raise_signal_to_thread(&mut self, thread: ThreadId, signal: u8) -> Result<(), Error> {
+        Self::validate_signal(signal)?;
+        let process = self.thread(thread)?.process.ok_or(Error::InvalidState)?;
+        self.live_process(process)?;
+        self.thread_mut(thread)?
+            .signals
+            .set_pending(signal)
+            .map_err(Self::signal_error)?;
+        self.wake_signal_waiter(process, signal);
         Ok(())
     }
 
     pub fn signal_pending(&self, process: ProcessId, signal: u8) -> Result<bool, Error> {
-        if signal >= 64 {
-            return Err(Error::InvalidState);
+        Self::validate_signal(signal)?;
+        self.process(process)?
+            .signals
+            .pending(signal)
+            .map_err(Self::signal_error)
+    }
+
+    pub fn thread_signal_pending(&self, thread: ThreadId, signal: u8) -> Result<bool, Error> {
+        Self::validate_signal(signal)?;
+        self.thread(thread)?
+            .signals
+            .pending(signal)
+            .map_err(Self::signal_error)
+    }
+
+    fn wake_signal_waiter(&mut self, process: ProcessId, signal: u8) {
+        let bit = signal::signal_bit(signal);
+        for thread in self.threads.iter_mut().flatten() {
+            if thread.process == Some(process)
+                && matches!(thread.state, ThreadState::Blocked | ThreadState::Sleeping)
+                && (thread.signals.mask() & bit == 0 || signal == SIGKILL || signal == SIGSTOP)
+            {
+                thread.state = ThreadState::Ready;
+                thread.wake_at = 0;
+            }
         }
-        Ok(self.process(process)?.pending_signals & (1u64 << signal) != 0)
+    }
+
+    fn pending_for_thread(
+        &self,
+        process: ProcessId,
+        thread: ThreadId,
+    ) -> Result<Option<(u8, bool)>, Error> {
+        let process_record = self.process(process)?;
+        let thread_record = self.thread(thread)?;
+        let unmaskable = signal::signal_bit(SIGKILL) | signal::signal_bit(SIGSTOP);
+        let pending = (process_record.signals.pending_mask()
+            | thread_record.signals.pending_mask())
+            & (!thread_record.signals.mask() | unmaskable)
+            & signal::SIGNAL_MASK;
+        if pending == 0 {
+            return Ok(None);
+        }
+        let signal = pending.trailing_zeros() as u8;
+        let from_thread = thread_record.signals.pending_mask() & signal::signal_bit(signal) != 0;
+        Ok(Some((signal, from_thread)))
+    }
+
+    pub fn deliver_pending_signal(
+        &mut self,
+        thread: ThreadId,
+        context: UserSignalContext,
+    ) -> Result<SignalDelivery, Error> {
+        let process = self.thread(thread)?.process.ok_or(Error::InvalidState)?;
+        self.live_process(process)?;
+        let state = self.thread(thread)?.state;
+        let Some((signal, from_thread)) = self.pending_for_thread(process, thread)? else {
+            return Ok(SignalDelivery::NoPending);
+        };
+        if state == ThreadState::Stopped && signal != SIGCONT && signal != SIGKILL {
+            return Ok(SignalDelivery::NoPending);
+        }
+        let action = self.signal_action(process, signal)?;
+        if action.is_default() {
+            let default = signal::default_action(signal);
+            if signal == SIGKILL && process == ProcessId::INIT {
+                return Err(Error::PermissionDenied);
+            }
+            self.clear_pending_source(thread, process, signal, from_thread);
+            match default {
+                DefaultAction::Ignore => {}
+                DefaultAction::Terminate => self.terminate(process, signal)?,
+                DefaultAction::Stop => self.stop_process(process, signal)?,
+                DefaultAction::Continue => self.continue_process(process, signal)?,
+            }
+            return Ok(SignalDelivery::Default {
+                signal,
+                action: default,
+            });
+        }
+        if action.is_ignored() {
+            self.clear_pending_source(thread, process, signal, from_thread);
+            if signal == SIGCONT {
+                self.continue_process(process, signal)?;
+            }
+            return Ok(SignalDelivery::Ignored { signal });
+        }
+
+        let delivery = self
+            .thread_mut(thread)?
+            .signals
+            .begin_handler(signal, action, context)
+            .map_err(Self::signal_error)?;
+        self.clear_pending_source(thread, process, signal, from_thread);
+        if action.flags & SA_RESETHAND != 0 {
+            self.process_mut(process)?
+                .signals
+                .install(signal, SignalAction::DEFAULT)
+                .map_err(Self::signal_error)?;
+        }
+        if signal == SIGCONT {
+            self.continue_process(process, signal)?;
+        }
+        Ok(delivery)
+    }
+
+    fn clear_pending_source(
+        &mut self,
+        thread: ThreadId,
+        process: ProcessId,
+        signal: u8,
+        from_thread: bool,
+    ) {
+        if from_thread {
+            if let Ok(thread) = self.thread_mut(thread) {
+                thread.signals.clear_pending(signal);
+            }
+        } else {
+            if let Ok(process) = self.process_mut(process) {
+                process.signals.clear_pending(signal);
+            }
+        }
+    }
+
+    pub fn finish_signal(&mut self, thread: ThreadId, token: u32) -> Result<SignalReturn, Error> {
+        self.thread_mut(thread)?
+            .signals
+            .finish_handler(token)
+            .map_err(Self::signal_error)
+    }
+
+    pub fn signal_frame_count(&self, thread: ThreadId) -> Result<usize, Error> {
+        Ok(self.thread(thread)?.signals.frame_count())
     }
 
     pub fn get_process_group(&self, process: ProcessId) -> Result<ProcessId, Error> {
         Ok(self.process(process)?.pgid)
     }
 
+    pub fn get_session_id(&self, process: ProcessId) -> Result<ProcessId, Error> {
+        Ok(self.process(process)?.sid)
+    }
+
     pub fn process_group_has_live_member(&self, group: ProcessId) -> bool {
         self.processes.iter().flatten().any(|record| {
             record.pgid == group
-                && matches!(record.state, ProcessState::Creating | ProcessState::Running)
+                && matches!(
+                    record.state,
+                    ProcessState::Creating | ProcessState::Running | ProcessState::Stopped
+                )
+        })
+    }
+
+    pub fn process_group_has_live_member_in_session(
+        &self,
+        group: ProcessId,
+        session: ProcessId,
+    ) -> bool {
+        self.processes.iter().flatten().any(|record| {
+            record.sid == session
+                && record.pgid == group
+                && matches!(
+                    record.state,
+                    ProcessState::Creating | ProcessState::Running | ProcessState::Stopped
+                )
         })
     }
 
@@ -775,13 +1131,7 @@ impl ProcessTable {
         if record.state != ProcessState::Running {
             return Err(Error::InvalidState);
         }
-        if pgid != process
-            && !self
-                .processes
-                .iter()
-                .flatten()
-                .any(|member| member.pgid == pgid)
-        {
+        if pgid != process && !self.process_group_has_live_member_in_session(pgid, record.sid) {
             return Err(Error::InvalidId);
         }
         self.process_mut(process)?.pgid = pgid;
@@ -799,6 +1149,7 @@ impl ProcessTable {
         if parent_record.state != ProcessState::Running
             || child_record.parent != Some(parent)
             || child_record.state != ProcessState::Creating
+            || child_record.sid != parent_record.sid
         {
             return Err(Error::InvalidState);
         }
@@ -819,6 +1170,7 @@ impl ProcessTable {
         let target_record = self.process(process)?;
         if caller_record.state != ProcessState::Running
             || target_record.state != ProcessState::Running
+            || caller_record.sid != target_record.sid
         {
             return Err(Error::InvalidState);
         }
@@ -839,6 +1191,9 @@ impl ProcessTable {
         let caller_record = self.process(caller)?;
         if caller_record.state != ProcessState::Running || pgid.get() == 0 {
             return Err(Error::InvalidState);
+        }
+        if !self.process_group_has_live_member_in_session(pgid, caller_record.sid) {
+            return Err(Error::PermissionDenied);
         }
         if caller_record.pgid == pgid {
             return Ok(());
@@ -864,14 +1219,16 @@ impl ProcessTable {
         if pgid.get() == 0 {
             return Err(Error::InvalidId);
         }
-        if signal >= 64 {
-            return Err(Error::InvalidState);
-        }
-        let bit = 1u64 << signal;
+        Self::validate_signal(signal)?;
         let mut members = 0;
         for record in self.processes.iter_mut().flatten() {
-            if record.pgid == pgid && record.state == ProcessState::Running {
-                record.pending_signals |= bit;
+            if record.pgid == pgid
+                && matches!(record.state, ProcessState::Running | ProcessState::Stopped)
+            {
+                record
+                    .signals
+                    .set_pending(signal)
+                    .map_err(Self::signal_error)?;
                 members += 1;
             }
         }
@@ -881,43 +1238,101 @@ impl ProcessTable {
         Ok(())
     }
 
-    pub fn terminate_signal_to_group(&mut self, pgid: ProcessId, signal: u8) -> Result<(), Error> {
-        if pgid.get() == 0 || signal >= 64 {
-            return Err(Error::InvalidState);
+    pub fn send_signal(
+        &mut self,
+        caller: ProcessId,
+        target: ProcessId,
+        signal: u8,
+    ) -> Result<(), Error> {
+        Self::validate_signal(signal)?;
+        self.live_process(caller)?;
+        self.live_process(target)?;
+        if !self.can_signal(caller, target) {
+            return Err(Error::PermissionDenied);
         }
-        let members: [Option<ProcessId>; MAX_PROCESSES] = {
-            let mut members = [None; MAX_PROCESSES];
-            let mut count = 0;
-            for record in self.processes.iter().flatten() {
-                if record.pgid == pgid && record.state == ProcessState::Running {
-                    if count == MAX_PROCESSES {
-                        return Err(Error::ProcessCapacity);
-                    }
-                    members[count] = Some(record.id);
-                    count += 1;
-                }
-            }
-            members
-        };
-        let mut terminated = 0;
-        for process in members.into_iter().flatten() {
-            self.terminate(process, signal)?;
-            terminated += 1;
-        }
-        if terminated == 0 {
+        self.raise_signal(target, signal)
+    }
+
+    pub fn send_signal_to_group(
+        &mut self,
+        caller: ProcessId,
+        pgid: ProcessId,
+        signal: u8,
+    ) -> Result<usize, Error> {
+        Self::validate_signal(signal)?;
+        self.live_process(caller)?;
+        if pgid.get() == 0 {
             return Err(Error::InvalidId);
         }
-        Ok(())
+        let mut targets = [None; MAX_PROCESSES];
+        let mut target_count = 0;
+        for record in self.processes.iter().flatten() {
+            if record.pgid == pgid
+                && matches!(record.state, ProcessState::Running | ProcessState::Stopped)
+            {
+                targets[target_count] = Some(record.id);
+                target_count += 1;
+            }
+        }
+        if target_count == 0 {
+            return Err(Error::InvalidId);
+        }
+        let mut sent = 0;
+        for target in targets.into_iter().flatten() {
+            if self.can_signal(caller, target) {
+                self.raise_signal(target, signal)?;
+                sent += 1;
+            }
+        }
+        if sent == 0 {
+            return Err(Error::PermissionDenied);
+        }
+        Ok(sent)
+    }
+
+    fn can_signal(&self, caller: ProcessId, target: ProcessId) -> bool {
+        let Ok(caller) = self.process(caller) else {
+            return false;
+        };
+        let Ok(target) = self.process(target) else {
+            return false;
+        };
+        caller
+            .credentials
+            .has_capability(Capability::SessionAdmin as u8)
+            || caller.credentials.effective_uid == target.credentials.real_uid
+            || caller.credentials.effective_uid == target.credentials.effective_uid
+            || caller.credentials.real_uid == target.credentials.real_uid
+            || caller.credentials.real_uid == target.credentials.effective_uid
+    }
+
+    /// Kept as an internal compatibility name for callers that used the old
+    /// immediate-termination probe.  POSIX `killpg` only queues a signal;
+    /// default actions run when the target reaches a safe delivery boundary.
+    pub fn terminate_signal_to_group(&mut self, pgid: ProcessId, signal: u8) -> Result<(), Error> {
+        self.raise_signal_to_group(pgid, signal)
     }
 
     fn terminate(&mut self, process: ProcessId, signal: u8) -> Result<(), Error> {
         if process == ProcessId::INIT || self.process(process)?.state != ProcessState::Running {
             return Err(Error::InvalidState);
         }
+        self.finish_exit(process, -(signal as i32), Some(signal))
+    }
+
+    fn finish_exit(
+        &mut self,
+        process: ProcessId,
+        status: i32,
+        _signal: Option<u8>,
+    ) -> Result<(), Error> {
+        let parent = self.process(process)?.parent;
         {
             let record = self.process_mut(process)?;
             record.state = ProcessState::Exiting;
-            record.exit_status = Some(-(signal as i32));
+            record.session_generation = 0;
+            record.exit_status = Some(status);
+            record.signals.clear_all();
             let fds = record.fds;
             record.fds = [None; MAX_FDS];
             for entry in fds.into_iter().flatten() {
@@ -928,6 +1343,7 @@ impl ProcessTable {
             if let Some(thread) = thread.as_mut() {
                 if thread.process == Some(process) {
                     thread.state = ThreadState::Exited;
+                    thread.signals.clear_for_teardown();
                 }
             }
         }
@@ -939,6 +1355,73 @@ impl ProcessTable {
             }
         }
         self.process_mut(process)?.state = ProcessState::Zombie;
+        if let Some(parent) = parent {
+            self.notify_parent(parent, false);
+        }
+        Ok(())
+    }
+
+    fn notify_parent(&mut self, parent: ProcessId, stop_or_continue: bool) {
+        let Ok(parent_record) = self.process(parent) else {
+            return;
+        };
+        if !matches!(
+            parent_record.state,
+            ProcessState::Running | ProcessState::Stopped
+        ) {
+            return;
+        }
+        let action = parent_record
+            .signals
+            .action(SIGCHLD)
+            .unwrap_or(SignalAction::DEFAULT);
+        if stop_or_continue && action.flags & SA_NOCLDSTOP != 0 {
+            return;
+        }
+        let _ = self.process_mut(parent).and_then(|record| {
+            record
+                .signals
+                .set_pending(SIGCHLD)
+                .map_err(Self::signal_error)
+        });
+        self.wake_signal_waiter(parent, SIGCHLD);
+    }
+
+    fn stop_process(&mut self, process: ProcessId, _signal: u8) -> Result<(), Error> {
+        if process == ProcessId::INIT {
+            return Err(Error::PermissionDenied);
+        }
+        if !matches!(
+            self.process(process)?.state,
+            ProcessState::Running | ProcessState::Stopped
+        ) {
+            return Err(Error::InvalidState);
+        }
+        self.process_mut(process)?.state = ProcessState::Stopped;
+        for thread in self.threads.iter_mut().flatten() {
+            if thread.process == Some(process) {
+                thread.state = ThreadState::Stopped;
+            }
+        }
+        if let Some(parent) = self.process(process)?.parent {
+            self.notify_parent(parent, true);
+        }
+        Ok(())
+    }
+
+    fn continue_process(&mut self, process: ProcessId, _signal: u8) -> Result<(), Error> {
+        if self.process(process)?.state != ProcessState::Stopped {
+            return Ok(());
+        }
+        self.process_mut(process)?.state = ProcessState::Running;
+        for thread in self.threads.iter_mut().flatten() {
+            if thread.process == Some(process) && thread.state == ThreadState::Stopped {
+                thread.state = ThreadState::Ready;
+            }
+        }
+        if let Some(parent) = self.process(process)?.parent {
+            self.notify_parent(parent, true);
+        }
         Ok(())
     }
 
@@ -959,6 +1442,7 @@ impl ProcessTable {
         process: ProcessId,
         credentials: Credentials,
     ) -> Result<(), Error> {
+        self.rotate_session(process)?;
         self.process_mut(process)?.credentials = credentials;
         Ok(())
     }
@@ -969,8 +1453,75 @@ impl ProcessTable {
 
     pub fn set_session(&mut self, process: ProcessId, session: SessionState) -> Result<(), Error> {
         session.validate()?;
+        self.rotate_session(process)?;
         self.process_mut(process)?.session = session;
         Ok(())
+    }
+
+    pub fn set_credentials_and_session(
+        &mut self,
+        process: ProcessId,
+        credentials: Credentials,
+        session: SessionState,
+    ) -> Result<(), Error> {
+        session.validate()?;
+        self.rotate_session(process)?;
+        let record = self.process_mut(process)?;
+        record.credentials = credentials;
+        record.session = session;
+        Ok(())
+    }
+
+    pub fn session_capability(&self, process: ProcessId) -> Result<SessionCapability, Error> {
+        let record = self.process(process)?;
+        if record.session_generation == 0 {
+            return Err(Error::InvalidState);
+        }
+        Ok(SessionCapability {
+            process,
+            generation: record.session_generation,
+        })
+    }
+
+    pub fn validate_session_capability(
+        &self,
+        capability: SessionCapability,
+        required_capabilities: u64,
+        target_uid: u32,
+    ) -> Result<(), Error> {
+        let record = self.process(capability.process)?;
+        if record.session_generation == 0 || record.session_generation != capability.generation {
+            return Err(Error::PermissionDenied);
+        }
+        if required_capabilities == 0 {
+            if target_uid == NO_TARGET_UID || record.credentials.effective_uid != target_uid {
+                return Err(Error::PermissionDenied);
+            }
+        } else if record.credentials.capabilities & required_capabilities != required_capabilities {
+            return Err(Error::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    fn rotate_session(&mut self, process: ProcessId) -> Result<(), Error> {
+        let record = self.process_mut(process)?;
+        record.session_generation = record
+            .session_generation
+            .checked_add(1)
+            .ok_or(Error::GenerationExhausted)?;
+        Ok(())
+    }
+
+    pub fn create_session(&mut self, process: ProcessId) -> Result<ProcessId, Error> {
+        let record = *self.process(process)?;
+        if record.state != ProcessState::Running || record.pgid == process {
+            return Err(Error::PermissionDenied);
+        }
+        let old_session = record.sid;
+        let record = self.process_mut(process)?;
+        record.sid = process;
+        record.pgid = process;
+        Ok(old_session)
     }
 
     pub fn process_state(&self, process: ProcessId) -> Result<ProcessState, Error> {
@@ -1058,6 +1609,20 @@ impl ProcessTable {
             ThreadState::Blocked
         };
         record.wake_at = 0;
+        Ok(())
+    }
+
+    pub fn block_thread_until(
+        &mut self,
+        thread: ThreadId,
+        deadline: Option<u64>,
+    ) -> Result<(), Error> {
+        let record = self.thread_mut(thread)?;
+        if !matches!(record.state, ThreadState::Ready | ThreadState::Running) {
+            return Err(Error::InvalidState);
+        }
+        record.state = ThreadState::Blocked;
+        record.wake_at = deadline.unwrap_or(0);
         Ok(())
     }
 
@@ -1165,7 +1730,10 @@ impl ProcessTable {
         let slot = self
             .threads
             .iter()
-            .position(Option::is_none)
+            .enumerate()
+            .find_map(|(slot, thread)| {
+                (thread.is_none() && self.thread_generations[slot] != u16::MAX).then_some(slot)
+            })
             .ok_or(Error::ThreadCapacity)?;
         let thread_index = if let Some(process) = process {
             let process_slot = self.process(process)?.threads;
@@ -1188,6 +1756,9 @@ impl ProcessTable {
             runtime_ticks: 0,
             preemptions: 0,
             context_switches: 0,
+            user_context: UserContext::EMPTY,
+            user_context_valid: false,
+            signals: ThreadSignalState::new(),
         });
         if let (Some(process), Some(thread_index)) = (process, thread_index) {
             self.process_mut(process)?.threads[thread_index] = Some(id);
@@ -1253,6 +1824,44 @@ impl ProcessTable {
         let record = self.threads[slot].as_mut().ok_or(Error::InvalidId)?;
         (record.id == id).then_some(record).ok_or(Error::InvalidId)
     }
+
+    fn set_user_context(&mut self, id: ThreadId, context: UserContext) -> Result<(), Error> {
+        let record = self.thread_mut(id)?;
+        if record.kind != ThreadKind::User {
+            return Err(Error::InvalidState);
+        }
+        record.user_context = context;
+        record.user_context_valid = true;
+        Ok(())
+    }
+
+    fn save_user_context(&mut self, id: ThreadId, context: UserContext) -> Result<(), Error> {
+        let record = self.thread_mut(id)?;
+        if record.kind != ThreadKind::User || !record.user_context_valid {
+            return Err(Error::InvalidState);
+        }
+        record.user_context = context;
+        Ok(())
+    }
+
+    fn has_user_context(&self, id: ThreadId) -> Result<bool, Error> {
+        Ok(self.thread(id)?.user_context_valid)
+    }
+
+    fn revoke_user_context(&mut self, id: ThreadId) -> Result<(), Error> {
+        let record = self.thread_mut(id)?;
+        record.user_context = UserContext::EMPTY;
+        record.user_context_valid = false;
+        Ok(())
+    }
+
+    fn user_context_pointer(&self, id: ThreadId) -> Result<*const UserContext, Error> {
+        let record = self.thread(id)?;
+        if record.kind != ThreadKind::User || !record.user_context_valid {
+            return Err(Error::InvalidState);
+        }
+        Ok(core::ptr::addr_of!(record.user_context))
+    }
 }
 
 struct Runtime {
@@ -1284,13 +1893,21 @@ impl Runtime {
         current_process != Some(ProcessId::INIT)
             && !self
                 .init_thread
-                .is_some_and(|thread| crate::arch::has_user_context(thread.get()))
+                .is_some_and(|thread| self.table.has_user_context(thread).unwrap_or(false))
     }
 }
 
 struct RuntimeLock {
     owner: AtomicUsize,
     depth: AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeLockError {
+    Contended,
+    InvalidToken,
+    InvalidState,
+    DepthExhausted,
 }
 
 impl RuntimeLock {
@@ -1302,9 +1919,26 @@ impl RuntimeLock {
     }
 
     fn try_lock_for(&self, token: usize) -> Option<RuntimeLockGuard<'_>> {
+        if token == 0 {
+            return None;
+        }
         if self.owner.load(Ordering::Acquire) == token {
-            self.depth.fetch_add(1, Ordering::Relaxed);
-            return Some(RuntimeLockGuard { lock: self, token });
+            let mut depth = self.depth.load(Ordering::Relaxed);
+            if depth == 0 {
+                return None;
+            }
+            loop {
+                let next = depth.checked_add(1)?;
+                match self.depth.compare_exchange_weak(
+                    depth,
+                    next,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return Some(RuntimeLockGuard { lock: self, token }),
+                    Err(observed) => depth = observed,
+                }
+            }
         }
         if self
             .owner
@@ -1317,21 +1951,38 @@ impl RuntimeLock {
         None
     }
 
-    fn lock(&self) -> RuntimeLockGuard<'_> {
-        let token = crate::arch::cpu_id().saturating_add(1);
+    fn lock_for(
+        &self,
+        token: usize,
+        spin_limit: usize,
+    ) -> Result<RuntimeLockGuard<'_>, RuntimeLockError> {
+        if token == 0 {
+            return Err(RuntimeLockError::InvalidToken);
+        }
         let mut spins = 0;
         loop {
             if let Some(guard) = self.try_lock_for(token) {
-                return guard;
+                return Ok(guard);
             }
-            if spins == RUNTIME_LOCK_SPIN_LIMIT {
-                // Deliberate fail-stop: a waiter cannot sleep or spin forever
-                // with local IRQs masked, including an interrupt-context bug.
-                panic!("process runtime lock contention");
+            if self.owner.load(Ordering::Acquire) == token {
+                return Err(match self.depth.load(Ordering::Relaxed) {
+                    0 => RuntimeLockError::InvalidState,
+                    usize::MAX => RuntimeLockError::DepthExhausted,
+                    _ => RuntimeLockError::Contended,
+                });
+            }
+            if spins >= spin_limit {
+                return Err(RuntimeLockError::Contended);
             }
             spins += 1;
             core::hint::spin_loop();
         }
+    }
+
+    fn lock(&self) -> RuntimeLockGuard<'_> {
+        let token = crate::arch::cpu_id().saturating_add(1).max(1);
+        self.lock_for(token, RUNTIME_LOCK_SPIN_LIMIT)
+            .unwrap_or_else(|error| panic!("process runtime lock failure: {error:?}"))
     }
 }
 
@@ -1342,7 +1993,13 @@ struct RuntimeLockGuard<'a> {
 
 impl Drop for RuntimeLockGuard<'_> {
     fn drop(&mut self) {
-        debug_assert_eq!(self.lock.owner.load(Ordering::Relaxed), self.token);
+        assert_eq!(
+            self.lock.owner.load(Ordering::Acquire),
+            self.token,
+            "process runtime lock released by a non-owner"
+        );
+        let depth = self.lock.depth.load(Ordering::Relaxed);
+        assert!(depth != 0, "process runtime lock depth underflow");
         if self.lock.depth.fetch_sub(1, Ordering::Relaxed) == 1 {
             self.lock.owner.store(0, Ordering::Release);
         }
@@ -1427,6 +2084,25 @@ pub fn current_credentials() -> Result<Credentials, Error> {
     })
 }
 
+pub fn current_session_capability() -> Result<SessionCapability, Error> {
+    with_runtime(|runtime| {
+        let process = runtime.current_process.ok_or(Error::InvalidState)?;
+        runtime.table.session_capability(process)
+    })
+}
+
+pub fn validate_session_capability(
+    capability: SessionCapability,
+    required_capabilities: u64,
+    target_uid: u32,
+) -> Result<(), Error> {
+    with_runtime(|runtime| {
+        runtime
+            .table
+            .validate_session_capability(capability, required_capabilities, target_uid)
+    })
+}
+
 pub fn set_current_credentials(credentials: Credentials) -> Result<(), Error> {
     with_runtime(|runtime| {
         let process = runtime.current_process.ok_or(Error::InvalidState)?;
@@ -1475,8 +2151,9 @@ pub fn set_current_session(credentials: Credentials, session: SessionState) -> R
         {
             return Err(Error::PermissionDenied);
         }
-        runtime.table.set_credentials(process, credentials)?;
-        runtime.table.set_session(process, session)
+        runtime
+            .table
+            .set_credentials_and_session(process, credentials, session)
     })
 }
 
@@ -1492,6 +2169,26 @@ pub fn current_process_group_id() -> Option<ProcessId> {
             .current_process
             .and_then(|process| runtime.table.get_process_group(process).ok())
     })
+}
+
+pub fn current_session_id() -> Option<ProcessId> {
+    with_runtime(|runtime| {
+        runtime
+            .current_process
+            .and_then(|process| runtime.table.get_session_id(process).ok())
+    })
+}
+
+pub fn process_group_in_session(group: ProcessId, session: ProcessId) -> bool {
+    with_runtime(|runtime| {
+        runtime
+            .table
+            .process_group_has_live_member_in_session(group, session)
+    })
+}
+
+pub fn raise_signal_to_group(group: ProcessId, signal: u8) -> Result<(), Error> {
+    with_runtime(|runtime| runtime.table.raise_signal_to_group(group, signal))
 }
 
 #[allow(dead_code)]
@@ -1523,7 +2220,7 @@ pub fn handle_user_fault(fault: crate::vm::FaultInfo) -> crate::vm::FaultResult 
     let Some(process) = current_process_id() else {
         return crate::vm::FaultResult::KernelFatal;
     };
-    crate::user_runtime::handle_fault(process, fault).unwrap_or_else(|| {
+    crate::user_runtime::handle_fault(process, fault).unwrap_or({
         if fault.user {
             crate::vm::FaultResult::UserFault(crate::vm::FaultReason::InvalidAddress)
         } else {
@@ -1559,6 +2256,11 @@ pub fn discard_child(parent: ProcessId, child: ProcessId) -> Result<(), Error> {
         }
         Ok(())
     })
+}
+
+pub fn rollback_spawn(transaction: SpawnTransaction) -> Result<(), Error> {
+    let SpawnTransaction { parent, child, .. } = transaction;
+    with_runtime(|runtime| runtime.table.abort_child(parent, child))
 }
 
 #[allow(dead_code)]
@@ -1626,7 +2328,7 @@ pub fn exit_current(status: i32) -> Result<Option<ContextSwitch>, Error> {
                 }
             }
         }
-        if !crate::arch::has_user_context(thread.get()) {
+        if !runtime.table.has_user_context(thread)? {
             runtime.current_process = None;
             runtime.current_thread = None;
             return Ok(None);
@@ -1725,9 +2427,15 @@ fn duplicate_open_file(open_file: u32) -> Result<(), Error> {
         return Ok(());
     }
     if crate::vfs::FileHandle::from_raw(open_file).is_some() {
-        crate::vfs::duplicate_raw(open_file).map_err(|_| Error::InvalidFd)?;
+        crate::vfs::duplicate_raw(open_file).map_err(|error| match error {
+            crate::vfs::Error::NoSpace => Error::FdCapacity,
+            _ => Error::InvalidFd,
+        })?;
     } else if crate::pipe::is_pipe_raw(open_file) {
-        crate::pipe::duplicate_raw(open_file).map_err(|_| Error::InvalidFd)?;
+        crate::pipe::duplicate_raw(open_file).map_err(|error| match error {
+            crate::pipe::Error::NoSpace => Error::FdCapacity,
+            _ => Error::InvalidFd,
+        })?;
     } else {
         return Err(Error::InvalidFd);
     }
@@ -1771,7 +2479,7 @@ pub fn current_fd_access(fd: u32) -> Result<(bool, bool, bool), Error> {
 pub fn yield_current() -> Result<Option<ContextSwitch>, Error> {
     with_runtime(|runtime| {
         let current = runtime.current_thread.ok_or(Error::InvalidState)?;
-        if !crate::arch::has_user_context(current.get()) {
+        if !runtime.table.has_user_context(current)? {
             return Ok(None);
         }
         runtime.table.wake_sleepers(crate::time::ticks());
@@ -1787,6 +2495,68 @@ pub fn yield_current() -> Result<Option<ContextSwitch>, Error> {
     })
 }
 
+pub fn block_current_on(
+    queue: &mut crate::wait::WaitQueue,
+    owner: u64,
+    deadline: Option<u64>,
+) -> Result<BlockCurrentResult, crate::wait::Error> {
+    with_runtime(|runtime| {
+        let current = runtime
+            .current_thread
+            .ok_or(crate::wait::Error::ThreadState)?;
+        if !runtime.table.has_user_context(current).unwrap_or(false) {
+            return Err(crate::wait::Error::ThreadState);
+        }
+        let action = queue.park(
+            &mut runtime.table,
+            current,
+            owner,
+            deadline,
+            crate::time::ticks(),
+        )?;
+        let crate::wait::WaitAction::Blocked(token) = action else {
+            return Ok(BlockCurrentResult::TimedOut);
+        };
+        let Some(next) = runtime.table.pick_ready_user_with_init_policy(
+            runtime.current_process,
+            runtime.exclude_init_from_user_schedule(runtime.current_process),
+        ) else {
+            queue
+                .cancel_with_table(&mut runtime.table, token, current)
+                .map_err(|_| crate::wait::Error::ThreadState)?;
+            return Err(crate::wait::Error::ThreadState);
+        };
+        let switch = runtime
+            .table
+            .switch_to(None, next)
+            .map_err(|_| crate::wait::Error::ThreadState)?;
+        crate::arch::request_user_switch(current.get(), next.get());
+        Ok(BlockCurrentResult::Blocked { token, switch })
+    })
+}
+
+pub fn wake_waiter_one(
+    queue: &mut crate::wait::WaitQueue,
+    owner: u64,
+) -> Result<Option<crate::wait::Wake>, crate::wait::Error> {
+    with_runtime(|runtime| queue.wake_one_with_table(&mut runtime.table, owner))
+}
+
+pub fn wake_waiters_all(
+    queue: &mut crate::wait::WaitQueue,
+    owner: u64,
+) -> Result<crate::wait::WakeBatch, crate::wait::Error> {
+    with_runtime(|runtime| queue.wake_all_with_table(&mut runtime.table, owner))
+}
+
+pub fn expire_waiters(
+    queue: &mut crate::wait::WaitQueue,
+    owner: u64,
+    now: u64,
+) -> Result<crate::wait::WakeBatch, crate::wait::Error> {
+    with_runtime(|runtime| queue.expire_with_table(&mut runtime.table, owner, now))
+}
+
 pub fn commit_user_switch(from: u32, to: u32) -> Result<PhysAddr, Error> {
     with_runtime(|runtime| {
         let from = ThreadId::from_raw(from);
@@ -1798,6 +2568,9 @@ pub fn commit_user_switch(from: u32, to: u32) -> Result<PhysAddr, Error> {
             .table
             .thread_process(to)?
             .ok_or(Error::InvalidState)?;
+        if !runtime.table.has_user_context(to)? {
+            return Err(Error::InvalidState);
+        }
         let root = runtime
             .table
             .address_space_root(process)?
@@ -1833,6 +2606,47 @@ pub fn install_user_context(
     }
 }
 
+pub fn set_user_context(thread: u32, context: UserContext) -> Result<(), Error> {
+    with_runtime(|runtime| {
+        runtime
+            .table
+            .set_user_context(ThreadId::from_raw(thread), context)
+    })
+}
+
+pub fn save_user_context(thread: u32, context: UserContext) -> Result<(), Error> {
+    with_runtime(|runtime| {
+        runtime
+            .table
+            .save_user_context(ThreadId::from_raw(thread), context)
+    })
+}
+
+pub fn user_context_pointer(thread: u32) -> Result<*const UserContext, Error> {
+    with_runtime(|runtime| {
+        runtime
+            .table
+            .user_context_pointer(ThreadId::from_raw(thread))
+    })
+}
+
+pub fn has_user_context(thread: u32) -> bool {
+    with_runtime(|runtime| {
+        runtime
+            .table
+            .has_user_context(ThreadId::from_raw(thread))
+            .unwrap_or(false)
+    })
+}
+
+pub fn revoke_user_context(thread: u32) {
+    with_runtime(|runtime| {
+        let _ = runtime
+            .table
+            .revoke_user_context(ThreadId::from_raw(thread));
+    });
+}
+
 pub fn inherit_spawn_standard_fds(
     transaction: SpawnTransaction,
     source_fds: [u32; 3],
@@ -1860,6 +2674,23 @@ pub fn inherit_spawn_fds(
     })
 }
 
+pub fn finalize_spawn(
+    transaction: SpawnTransaction,
+    source_fds: [u32; 3],
+    inherit_open_fds: bool,
+    process_group: Option<ProcessId>,
+) -> Result<(), Error> {
+    with_runtime(|runtime| {
+        ProcessTable::finalize_spawn(
+            &mut runtime.table,
+            transaction,
+            source_fds.map(FileDescriptor::from_raw),
+            inherit_open_fds,
+            process_group,
+        )
+    })
+}
+
 pub fn publish_spawn(transaction: SpawnTransaction) -> Result<(), Error> {
     with_runtime(|runtime| {
         runtime
@@ -1880,13 +2711,27 @@ pub fn set_process_group_for_spawn(
 }
 
 pub fn sleep_current(duration: u64) -> Result<Option<ContextSwitch>, Error> {
+    sleep_current_ticks(
+        crate::time::scheduler_ticks().saturating_mul(duration),
+        true,
+    )
+}
+
+pub fn sleep_current_ticks(
+    duration: u64,
+    saturating_deadline: bool,
+) -> Result<Option<ContextSwitch>, Error> {
     with_runtime(|runtime| {
         let current = runtime.current_thread.ok_or(Error::InvalidState)?;
-        if duration == 0 || !crate::arch::has_user_context(current.get()) {
+        if duration == 0 || !runtime.table.has_user_context(current)? {
             return Ok(None);
         }
-        let wake_at = crate::time::ticks()
-            .saturating_add(crate::time::scheduler_ticks().saturating_mul(duration));
+        let now = crate::time::ticks();
+        let wake_at = if saturating_deadline {
+            now.saturating_add(duration)
+        } else {
+            now.checked_add(duration).ok_or(Error::InvalidState)?
+        };
         runtime.table.sleep_thread_until(current, wake_at)?;
         let Some(next) = runtime.table.pick_ready_user_with_init_policy(
             runtime.current_process,
@@ -1909,7 +2754,71 @@ pub fn wake_sleepers(now: u64) {
 }
 
 pub fn contract_self_check() {
+    let mut context_table = ProcessTable::new();
+    let (context_init, _) = context_table.create_init().unwrap();
+    let (context_child, context_thread) = context_table
+        .spawn_child(context_init, Credentials::BOOTSTRAP)
+        .unwrap();
+    let context_registers = crate::elf::InitialRegisters {
+        instruction_pointer: 1,
+        stack_pointer: 2,
+        flags: 0x202,
+        arg0: 0,
+        arg1: 0,
+        arg2: 0,
+    };
+    let mut context = UserContext::EMPTY;
+    context.registers[0] = context_registers.instruction_pointer as u64;
+    context.registers[1] = context_registers.stack_pointer as u64;
+    context.registers[2] = context_registers.flags;
+    context_table
+        .set_user_context(context_thread, context)
+        .unwrap();
+    assert!(context_table.has_user_context(context_thread).unwrap());
+    context_table.exit(context_child, 0).unwrap();
+    assert_eq!(
+        context_table.wait(context_init, Some(context_child)),
+        Ok((context_child, 0))
+    );
+    assert!(!context_table
+        .has_user_context(context_thread)
+        .unwrap_or(false));
+    let (_recycled_child, recycled_thread) = context_table
+        .spawn_child(context_init, Credentials::BOOTSTRAP)
+        .unwrap();
+    assert_ne!(recycled_thread.get(), context_thread.get());
+    assert!(!context_table.has_user_context(recycled_thread).unwrap());
+    context_table
+        .set_user_context(recycled_thread, context)
+        .unwrap();
+    assert!(context_table.has_user_context(recycled_thread).unwrap());
+    assert!(!context_table
+        .has_user_context(ThreadId::from_raw(context_thread.get()))
+        .unwrap_or(false));
+    context_table
+        .thread_mut(recycled_thread)
+        .unwrap()
+        .user_context_valid = false;
+    assert!(!context_table.has_user_context(recycled_thread).unwrap());
+    let (staged_child, staged_thread) = context_table
+        .spawn_child_staged(context_init, Credentials::BOOTSTRAP)
+        .unwrap();
+    context_table
+        .set_user_context(staged_thread, context)
+        .unwrap();
+    context_table
+        .abort_child(context_init, staged_child)
+        .unwrap();
+    assert!(!context_table
+        .has_user_context(staged_thread)
+        .unwrap_or(false));
+
     let lock = RuntimeLock::new();
+    assert!(lock.try_lock_for(0).is_none());
+    assert!(matches!(
+        lock.lock_for(0, 0),
+        Err(RuntimeLockError::InvalidToken)
+    ));
     let first = lock
         .try_lock_for(1)
         .unwrap_or_else(|| panic!("runtime lock acquire"));
@@ -1923,8 +2832,27 @@ pub fn contract_self_check() {
     drop(nested);
     assert_eq!(lock.depth.load(Ordering::Relaxed), 1);
     assert!(lock.try_lock_for(2).is_none());
+    assert!(matches!(
+        lock.lock_for(2, 0),
+        Err(RuntimeLockError::Contended)
+    ));
+    assert_eq!(lock.owner.load(Ordering::Relaxed), 1);
+    assert_eq!(lock.depth.load(Ordering::Relaxed), 1);
+    lock.depth.store(0, Ordering::Relaxed);
+    assert!(matches!(
+        lock.lock_for(1, 0),
+        Err(RuntimeLockError::InvalidState)
+    ));
+    lock.depth.store(1, Ordering::Relaxed);
+    lock.depth.store(usize::MAX, Ordering::Relaxed);
+    assert!(matches!(
+        lock.lock_for(1, 0),
+        Err(RuntimeLockError::DepthExhausted)
+    ));
+    lock.depth.store(1, Ordering::Relaxed);
     drop(first);
     assert_eq!(lock.owner.load(Ordering::Relaxed), 0);
+    assert_eq!(lock.depth.load(Ordering::Relaxed), 0);
     let foreign = lock
         .try_lock_for(2)
         .unwrap_or_else(|| panic!("runtime lock release"));
@@ -2136,49 +3064,43 @@ pub fn contract_self_check() {
     let (inherited_child, inherited_thread) = table
         .spawn_child_staged(child, Credentials::BOOTSTRAP)
         .unwrap();
-    table
-        .inherit_standard_fds(child, inherited_child, [fd, fd, duplicate])
-        .unwrap();
-    assert_eq!(
-        table
-            .fd_info(inherited_child, FileDescriptor::from_raw(0))
-            .unwrap()
-            .0,
-        1
-    );
-    assert_eq!(
-        table
-            .fd_info(inherited_child, FileDescriptor::from_raw(1))
-            .unwrap()
-            .0,
-        1
-    );
-    assert_eq!(
-        table
-            .fd_info(inherited_child, FileDescriptor::from_raw(2))
-            .unwrap()
-            .0,
-        1
-    );
-    assert_eq!(
-        table.fd_info(inherited_child, FileDescriptor::from_raw(3)),
-        Err(Error::InvalidFd)
-    );
     let transaction = SpawnTransaction {
         parent: child,
         child: inherited_child,
         thread: inherited_thread,
     };
     assert_eq!(
+        table
+            .fd_info(inherited_child, FileDescriptor::from_raw(3))
+            .unwrap_err(),
+        Error::InvalidFd
+    );
+    assert_eq!(table.get_process_group(inherited_child), Ok(child));
+    assert_eq!(
         table.set_process_group_for_child(init, transaction.child, transaction.child),
         Err(Error::InvalidState)
     );
     table
-        .set_process_group_for_child(transaction.parent, transaction.child, transaction.child)
+        .finalize_spawn(
+            transaction,
+            [fd, fd, duplicate],
+            false,
+            Some(inherited_child),
+        )
         .unwrap();
-    table
-        .publish_child(transaction.child, transaction.thread)
-        .unwrap();
+    for target in 0..=2 {
+        assert_eq!(
+            table
+                .fd_info(inherited_child, FileDescriptor::from_raw(target))
+                .unwrap()
+                .0,
+            1
+        );
+    }
+    assert_eq!(
+        table.get_process_group(inherited_child),
+        Ok(inherited_child)
+    );
     table.exit(inherited_child, 0).unwrap();
     assert_eq!(
         table.wait(child, Some(inherited_child)).unwrap(),
@@ -2413,30 +3335,36 @@ pub fn contract_self_check() {
         );
     }
 
-    let (invalid_concurrent_child, _invalid_concurrent_thread) = concurrent_table
+    let (invalid_concurrent_child, invalid_concurrent_thread) = concurrent_table
         .spawn_child_staged(concurrent_parent, Credentials::BOOTSTRAP)
         .unwrap();
     assert_eq!(
-        concurrent_table.inherit_open_fds(
-            concurrent_parent,
-            invalid_concurrent_child,
+        concurrent_table.finalize_spawn(
+            SpawnTransaction {
+                parent: concurrent_parent,
+                child: invalid_concurrent_child,
+                thread: invalid_concurrent_thread,
+            },
             [
                 FileDescriptor::from_raw(0),
                 FileDescriptor::from_raw(1),
                 FileDescriptor::from_raw(31),
             ],
+            true,
+            None,
         ),
         Err(Error::InvalidFd)
     );
     assert_eq!(
         concurrent_table.fd_info(invalid_concurrent_child, FileDescriptor::from_raw(3)),
-        Err(Error::InvalidFd)
+        Err(Error::InvalidId)
     );
-    concurrent_table
-        .abort_child(concurrent_parent, invalid_concurrent_child)
-        .unwrap();
+    assert_eq!(
+        concurrent_table.thread_state(invalid_concurrent_thread),
+        Err(Error::InvalidId)
+    );
 
-    let (capacity_concurrent_child, _capacity_concurrent_thread) = concurrent_table
+    let (capacity_concurrent_child, capacity_concurrent_thread) = concurrent_table
         .spawn_child_staged(concurrent_parent, Credentials::BOOTSTRAP)
         .unwrap();
     concurrent_table
@@ -2445,20 +3373,26 @@ pub fn contract_self_check() {
         .session
         .max_fds = 5;
     assert_eq!(
-        concurrent_table.inherit_open_fds(
-            concurrent_parent,
-            capacity_concurrent_child,
+        concurrent_table.finalize_spawn(
+            SpawnTransaction {
+                parent: concurrent_parent,
+                child: capacity_concurrent_child,
+                thread: capacity_concurrent_thread,
+            },
             concurrent_sources,
+            true,
+            None,
         ),
         Err(Error::FdCapacity)
     );
     assert_eq!(
         concurrent_table.fd_info(capacity_concurrent_child, FileDescriptor::from_raw(3)),
-        Err(Error::InvalidFd)
+        Err(Error::InvalidId)
     );
-    concurrent_table
-        .abort_child(concurrent_parent, capacity_concurrent_child)
-        .unwrap();
+    assert_eq!(
+        concurrent_table.thread_state(capacity_concurrent_thread),
+        Err(Error::InvalidId)
+    );
 
     concurrent_table
         .close_fd(concurrent_parent, concurrent_file_fd)

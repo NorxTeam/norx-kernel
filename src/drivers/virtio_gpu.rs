@@ -1,5 +1,5 @@
-use crate::boot::{PixelFormat, RawFramebuffer};
-use crate::drivers::framework::{DmaBuffer, DmaDirection};
+use crate::boot::RawFramebuffer;
+use crate::drivers::framework::{BusKind, DmaBuffer, DmaDirection};
 use crate::drivers::pci;
 use crate::io::{MmioRegion, PioRegion};
 
@@ -9,6 +9,7 @@ const PAGE_SIZE: usize = 4096;
 const MAX_QUEUE_SIZE: u16 = 256;
 const CONTROL_QUEUE: u16 = 0;
 const QUEUE_PAGES: usize = 2;
+const DMA_DEVICE_ID: crate::drivers::framework::DeviceId = 10;
 const REQUEST_SIZE: usize = 64;
 const RESPONSE_SIZE: usize = 512;
 const DESC_NEXT: u16 = 1;
@@ -100,8 +101,8 @@ pub enum InitResult {
     Failed(Error),
 }
 
-#[derive(Clone, Copy)]
 struct DmaPage {
+    dma: Option<DmaBuffer>,
     physical: u64,
     virtual_address: usize,
 }
@@ -109,64 +110,67 @@ struct DmaPage {
 impl DmaPage {
     const fn empty() -> Self {
         Self {
+            dma: None,
             physical: 0,
             virtual_address: 0,
         }
     }
 
     fn new() -> Result<Self, Error> {
-        let physical = crate::memory::alloc_frame().ok_or(Error::DmaUnavailable)?;
-        let virtual_address =
-            crate::arch::physical_to_virtual(crate::address::PhysAddr::new(physical))
-                .ok_or(Error::DmaUnavailable)?
-                .value();
+        let dma = DmaBuffer::allocate(
+            DMA_DEVICE_ID,
+            BusKind::Pci,
+            PAGE_SIZE,
+            PAGE_SIZE,
+            DmaDirection::Bidirectional,
+        )
+        .map_err(|_| Error::DmaUnavailable)?;
+        let physical = dma.physical().value();
+        let virtual_address = dma.virtual_address().value();
         let page = Self {
+            dma: Some(dma),
             physical,
             virtual_address,
         };
         page.clear();
-        page.sync_for_device()?;
         Ok(page)
     }
 
-    fn buffer(self) -> DmaBuffer {
-        DmaBuffer {
-            physical: crate::address::PhysAddr::new(self.physical),
-            virtual_address: crate::address::VirtAddr::new(self.virtual_address),
-            length: PAGE_SIZE,
-            alignment: PAGE_SIZE,
-            direction: DmaDirection::Bidirectional,
-            owner: 10,
-        }
+    fn sync_for_device(&self) -> Result<(), Error> {
+        self.dma
+            .as_ref()
+            .ok_or(Error::DmaUnavailable)?
+            .sync_for_device()
+            .map_err(|_| Error::DmaUnavailable)
     }
 
-    fn sync_for_device(self) -> Result<(), Error> {
-        unsafe { self.buffer().sync_for_device() }.map_err(|_| Error::DmaUnavailable)
+    fn sync_for_cpu(&self) -> Result<(), Error> {
+        self.dma
+            .as_ref()
+            .ok_or(Error::DmaUnavailable)?
+            .sync_for_cpu()
+            .map_err(|_| Error::DmaUnavailable)
     }
 
-    fn sync_for_cpu(self) -> Result<(), Error> {
-        unsafe { self.buffer().sync_for_cpu() }.map_err(|_| Error::DmaUnavailable)
-    }
-
-    fn clear(self) {
+    fn clear(&self) {
         unsafe { core::ptr::write_bytes(self.virtual_address as *mut u8, 0, PAGE_SIZE) };
     }
 
-    fn write_u32(self, offset: usize, value: u32) {
+    fn write_u32(&self, offset: usize, value: u32) {
         assert!(offset + 4 <= PAGE_SIZE && offset.is_multiple_of(4));
         unsafe {
             ((self.virtual_address + offset) as *mut u32).write_volatile(value.to_le());
         }
     }
 
-    fn write_u64(self, offset: usize, value: u64) {
+    fn write_u64(&self, offset: usize, value: u64) {
         assert!(offset + 8 <= PAGE_SIZE && offset.is_multiple_of(8));
         unsafe {
             ((self.virtual_address + offset) as *mut u64).write_volatile(value.to_le());
         }
     }
 
-    fn read_u32(self, offset: usize) -> u32 {
+    fn read_u32(&self, offset: usize) -> u32 {
         assert!(offset + 4 <= PAGE_SIZE && offset.is_multiple_of(4));
         let value = unsafe { ((self.virtual_address + offset) as *const u32).read_volatile() };
         u32::from_le(value)
@@ -188,7 +192,7 @@ impl QueueMemory {
         if total > QUEUE_PAGES * PAGE_SIZE {
             return Err(Error::InvalidQueue);
         }
-        let mut pages = [DmaPage::empty(); QUEUE_PAGES];
+        let mut pages = core::array::from_fn(|_| DmaPage::empty());
         for page in &mut pages {
             *page = DmaPage::new()?;
         }
@@ -223,14 +227,14 @@ impl QueueMemory {
     }
 
     fn sync_for_device(&self) -> Result<(), Error> {
-        for page in self.pages {
+        for page in &self.pages {
             page.sync_for_device()?;
         }
         Ok(())
     }
 
     fn sync_for_cpu(&self) -> Result<(), Error> {
-        for page in self.pages {
+        for page in &self.pages {
             page.sync_for_cpu()?;
         }
         Ok(())
@@ -312,7 +316,12 @@ impl Queue {
         self.memory.write_u16(offset + 14, next);
     }
 
-    fn submit(&mut self, io: PioRegion, request: DmaPage, response: DmaPage) -> Result<(), Error> {
+    fn submit(
+        &mut self,
+        io: PioRegion,
+        request: &DmaPage,
+        response: &DmaPage,
+    ) -> Result<(), Error> {
         self.set_descriptor(0, request.physical, REQUEST_SIZE as u32, DESC_NEXT, 1);
         self.set_descriptor(1, response.physical, RESPONSE_SIZE as u32, DESC_WRITE, 0);
         let ring = self.available_offset() + 4 + (self.available % self.memory.size) as usize * 2;
@@ -329,7 +338,7 @@ impl Queue {
         Ok(())
     }
 
-    fn wait(&mut self, response: DmaPage) -> Result<(), Error> {
+    fn wait(&mut self, response: &DmaPage) -> Result<(), Error> {
         for _ in 0..100_000 {
             self.memory.sync_for_cpu()?;
             let device_used = self.memory.read_u16(self.memory.used_offset + 2);
@@ -410,7 +419,7 @@ impl ModernQueue {
         self.memory.write_u16(offset + 14, next);
     }
 
-    fn submit(&mut self, request: DmaPage, response: DmaPage) -> Result<(), Error> {
+    fn submit(&mut self, request: &DmaPage, response: &DmaPage) -> Result<(), Error> {
         self.set_descriptor(0, request.physical, REQUEST_SIZE as u32, DESC_NEXT, 1);
         self.set_descriptor(1, response.physical, RESPONSE_SIZE as u32, DESC_WRITE, 0);
         let ring =
@@ -435,7 +444,7 @@ impl ModernQueue {
         Ok(())
     }
 
-    fn wait(&mut self, response: DmaPage) -> Result<(), Error> {
+    fn wait(&mut self, response: &DmaPage) -> Result<(), Error> {
         for _ in 0..100_000 {
             self.memory.sync_for_cpu()?;
             let device_used = self.memory.read_u16(self.memory.used_offset + 2);
@@ -463,6 +472,32 @@ struct ModernRuntime {
     status: Status,
 }
 
+struct ModernResetGuard {
+    common: MmioRegion,
+    armed: bool,
+}
+
+impl ModernResetGuard {
+    fn new(common: MmioRegion) -> Self {
+        Self {
+            common,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ModernResetGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.common.write_u8(COMMON_DEVICE_STATUS, 0);
+        }
+    }
+}
+
 impl ModernRuntime {
     fn new(
         device: pci::Device,
@@ -471,6 +506,7 @@ impl ModernRuntime {
         notify_multiplier: u32,
         framebuffer: Option<RawFramebuffer>,
     ) -> Result<Self, Error> {
+        let mut reset = ModernResetGuard::new(common);
         if !common.write_u8(COMMON_DEVICE_STATUS, 0)
             || !common.write_u8(COMMON_DEVICE_STATUS, STATUS_ACKNOWLEDGE)
             || !common.write_u8(COMMON_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER)
@@ -546,6 +582,7 @@ impl ModernRuntime {
         if let Some(framebuffer) = framebuffer {
             runtime.configure_framebuffer(framebuffer)?;
         }
+        reset.disarm();
         Ok(runtime)
     }
 
@@ -553,8 +590,8 @@ impl ModernRuntime {
         self.request.clear();
         self.response.clear();
         self.request.write_u32(0, CMD_GET_DISPLAY_INFO);
-        self.control.submit(self.request, self.response)?;
-        self.control.wait(self.response)?;
+        self.control.submit(&self.request, &self.response)?;
+        self.control.wait(&self.response)?;
         let response_type = self.response.read_u32(0);
         if response_type != RESP_OK_DISPLAY_INFO {
             return Err(Error::InvalidDisplayResponse(response_type));
@@ -565,78 +602,10 @@ impl ModernRuntime {
         Ok(())
     }
 
-    fn configure_framebuffer(&mut self, framebuffer: RawFramebuffer) -> Result<(), Error> {
-        if framebuffer.bytes_per_pixel != 4
-            || framebuffer.width == 0
-            || framebuffer.height == 0
-            || framebuffer.stride < framebuffer.width as usize * 4
-            || framebuffer
-                .stride
-                .checked_mul(framebuffer.height as usize)
-                .is_none_or(|size| size > framebuffer.size)
-        {
-            return Err(Error::UnsupportedFeatures);
-        }
-        let Some(framebuffer_size) = u32::try_from(framebuffer.size).ok() else {
-            return Err(Error::AddressTooWide);
-        };
-        let (display_width, display_height) = crate::drivers::display::validate_scanout(
-            framebuffer.width,
-            framebuffer.height,
-            self.status.scanout_width,
-            self.status.scanout_height,
-        )
-        .ok_or(Error::ModeMismatch)?;
-        let framebuffer_dma = DmaBuffer {
-            physical: crate::address::PhysAddr::new(framebuffer.base as u64),
-            virtual_address: crate::address::VirtAddr::new(framebuffer.base as usize),
-            length: framebuffer.size,
-            alignment: 1,
-            direction: DmaDirection::ToDevice,
-            owner: 10,
-        };
-        unsafe { framebuffer_dma.sync_for_device() }.map_err(|_| Error::DmaUnavailable)?;
-        let format = match framebuffer.format {
-            PixelFormat::Bgr => FORMAT_B8G8R8A8_UNORM,
-            PixelFormat::Rgb => FORMAT_R8G8B8A8_UNORM,
-        };
-        self.command(CMD_RESOURCE_CREATE_2D);
-        self.request.write_u32(24, RESOURCE_ID);
-        self.request.write_u32(28, format);
-        self.request.write_u32(32, framebuffer.width);
-        self.request.write_u32(36, framebuffer.height);
-        self.expect_ok_nodata()?;
-
-        self.command(CMD_RESOURCE_ATTACH_BACKING);
-        self.request.write_u32(24, RESOURCE_ID);
-        self.request.write_u32(28, 1);
-        self.request.write_u64(32, framebuffer.base as u64);
-        self.request.write_u32(40, framebuffer_size);
-        self.request.write_u32(44, 0);
-        self.expect_ok_nodata()?;
-
-        self.command(CMD_SET_SCANOUT);
-        self.write_rect(24, display_width, display_height);
-        self.request.write_u32(40, 0);
-        self.request.write_u32(44, RESOURCE_ID);
-        self.expect_ok_nodata()?;
-
-        self.command(CMD_TRANSFER_TO_HOST_2D);
-        self.write_rect(24, display_width, display_height);
-        self.request.write_u64(40, 0);
-        self.request.write_u32(48, RESOURCE_ID);
-        self.request.write_u32(52, 0);
-        self.expect_ok_nodata()?;
-
-        self.command(CMD_RESOURCE_FLUSH);
-        self.write_rect(24, display_width, display_height);
-        self.request.write_u32(40, RESOURCE_ID);
-        self.expect_ok_nodata()?;
-        self.status.two_d = true;
-        self.status.scanout_enabled = true;
-        self.status.guest_mode_width = framebuffer.width;
-        self.status.guest_mode_height = framebuffer.height;
-        Ok(())
+    fn configure_framebuffer(&mut self, _framebuffer: RawFramebuffer) -> Result<(), Error> {
+        // Firmware framebuffer memory is not allocator-issued DMA. An owned
+        // scanout buffer with a device-bound lifetime is required before attach.
+        Err(Error::DmaUnavailable)
     }
 
     fn command(&mut self, command: u32) {
@@ -653,8 +622,8 @@ impl ModernRuntime {
     }
 
     fn expect_ok_nodata(&mut self) -> Result<(), Error> {
-        self.control.submit(self.request, self.response)?;
-        self.control.wait(self.response)?;
+        self.control.submit(&self.request, &self.response)?;
+        self.control.wait(&self.response)?;
         let response_type = self.response.read_u32(0);
         if response_type != RESP_OK_NODATA {
             return Err(Error::InvalidDisplayResponse(response_type));
@@ -874,8 +843,9 @@ impl Runtime {
         self.request.clear();
         self.response.clear();
         self.request.write_u32(0, CMD_GET_DISPLAY_INFO);
-        self.control.submit(self.io, self.request, self.response)?;
-        self.control.wait(self.response)?;
+        self.control
+            .submit(self.io, &self.request, &self.response)?;
+        self.control.wait(&self.response)?;
         let response_type = self.response.read_u32(0);
         if response_type != RESP_OK_DISPLAY_INFO {
             return Err(Error::InvalidDisplayResponse(response_type));

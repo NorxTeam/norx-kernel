@@ -1,10 +1,10 @@
 use crate::process::ProcessId;
+pub use crate::wait::WaitQueue;
 
 const CHANNEL_CAPACITY: usize = 4;
 const EVENT_CAPACITY: usize = 8;
 const MAX_MESSAGE: usize = 64;
 const RING_CAPACITY: usize = 4;
-const WAITERS: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -26,6 +26,15 @@ pub enum WaitResult {
     Blocked,
 }
 
+fn map_wait_error(error: crate::wait::Error) -> Error {
+    match error {
+        crate::wait::Error::QueueFull => Error::WaitQueueFull,
+        crate::wait::Error::AlreadyWaiting => Error::AlreadyWaiting,
+        crate::wait::Error::InvalidWaiter => Error::InvalidWaiter,
+        _ => Error::InvalidWaiter,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Event {
     pub kind: u16,
@@ -43,47 +52,6 @@ impl Message {
         length: 0,
         bytes: [0; MAX_MESSAGE],
     };
-}
-
-pub struct WaitQueue {
-    waiters: [Option<u32>; WAITERS],
-}
-
-impl WaitQueue {
-    pub const fn new() -> Self {
-        Self {
-            waiters: [None; WAITERS],
-        }
-    }
-
-    pub fn enqueue(&mut self, waiter: u32) -> Result<(), Error> {
-        if waiter == 0 {
-            return Err(Error::InvalidWaiter);
-        }
-        if self.waiters.contains(&Some(waiter)) {
-            return Err(Error::AlreadyWaiting);
-        }
-        let slot = self
-            .waiters
-            .iter_mut()
-            .find(|entry| entry.is_none())
-            .ok_or(Error::WaitQueueFull)?;
-        *slot = Some(waiter);
-        Ok(())
-    }
-
-    pub fn wake_one(&mut self) -> Option<u32> {
-        let slot = self.waiters.iter_mut().find(|entry| entry.is_some())?;
-        slot.take()
-    }
-
-    pub fn contains(&self, waiter: u32) -> bool {
-        self.waiters.contains(&Some(waiter))
-    }
-
-    pub fn len(&self) -> usize {
-        self.waiters.iter().filter(|entry| entry.is_some()).count()
-    }
 }
 
 pub struct Channel {
@@ -155,7 +123,7 @@ impl Channel {
         match self.send(bytes) {
             Ok(()) => Ok(WaitResult::Completed),
             Err(Error::Full) => {
-                self.send_waiters.enqueue(waiter)?;
+                self.send_waiters.enqueue(waiter).map_err(map_wait_error)?;
                 Ok(WaitResult::Blocked)
             }
             Err(error) => Err(error),
@@ -170,7 +138,9 @@ impl Channel {
         match self.receive(output) {
             Ok(length) => Ok(Some(length)),
             Err(Error::Empty) => {
-                self.receive_waiters.enqueue(waiter)?;
+                self.receive_waiters
+                    .enqueue(waiter)
+                    .map_err(map_wait_error)?;
                 Ok(None)
             }
             Err(error) => Err(error),
@@ -179,12 +149,31 @@ impl Channel {
 
     pub fn close_sender(&mut self) {
         self.senders = 0;
-        let _ = self.receive_waiters.wake_one();
+        self.receive_waiters.wake_all();
     }
 
     pub fn close_receiver(&mut self) {
         self.receivers = 0;
-        let _ = self.send_waiters.wake_one();
+        self.send_waiters.wake_all();
+    }
+
+    pub fn revoke(&mut self) {
+        self.senders = 0;
+        self.receivers = 0;
+        self.queue = [None; CHANNEL_CAPACITY];
+        self.head = 0;
+        self.tail = 0;
+        self.length = 0;
+        self.send_waiters.wake_all();
+        self.receive_waiters.wake_all();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.senders == 0 || self.receivers == 0
+    }
+
+    pub fn next_length(&self) -> Option<usize> {
+        self.queue[self.head].map(|message| message.length)
     }
 
     pub fn pending(&self) -> usize {
@@ -269,7 +258,9 @@ impl SharedRing {
         match self.publish(caller, bytes) {
             Ok(()) => Ok(WaitResult::Completed),
             Err(Error::Full) => {
-                self.producer_waiters.enqueue(waiter)?;
+                self.producer_waiters
+                    .enqueue(waiter)
+                    .map_err(map_wait_error)?;
                 Ok(WaitResult::Blocked)
             }
             Err(error) => Err(error),
@@ -285,7 +276,9 @@ impl SharedRing {
         match self.consume(caller, output) {
             Ok(length) => Ok(Some(length)),
             Err(Error::Empty) => {
-                self.consumer_waiters.enqueue(waiter)?;
+                self.consumer_waiters
+                    .enqueue(waiter)
+                    .map_err(map_wait_error)?;
                 Ok(None)
             }
             Err(error) => Err(error),
@@ -298,6 +291,8 @@ impl SharedRing {
             return Err(Error::PermissionDenied);
         }
         self.active = false;
+        self.producer_waiters.wake_all();
+        self.consumer_waiters.wake_all();
         Ok(())
     }
 
@@ -364,7 +359,7 @@ impl EventQueue {
         match self.pop() {
             Ok(event) => Ok(Some(event)),
             Err(Error::Empty) => {
-                self.waiters.enqueue(waiter)?;
+                self.waiters.enqueue(waiter).map_err(map_wait_error)?;
                 Ok(None)
             }
             Err(error) => Err(error),
@@ -373,7 +368,7 @@ impl EventQueue {
 
     pub fn close(&mut self) {
         self.closed = true;
-        let _ = self.waiters.wake_one();
+        self.waiters.wake_all();
     }
 }
 
@@ -439,10 +434,10 @@ pub fn contract_self_check() {
     assert_eq!(events.pop(), Err(Error::Closed));
 
     let mut waiters = WaitQueue::new();
-    assert_eq!(waiters.enqueue(0), Err(Error::InvalidWaiter));
+    assert_eq!(waiters.enqueue(0), Err(crate::wait::Error::InvalidWaiter));
     waiters.enqueue(11).unwrap();
     assert!(waiters.contains(11));
-    assert_eq!(waiters.enqueue(11), Err(Error::AlreadyWaiting));
+    assert_eq!(waiters.enqueue(11), Err(crate::wait::Error::AlreadyWaiting));
     assert_eq!(waiters.wake_one(), Some(11));
     assert_eq!(waiters.len(), 0);
 }

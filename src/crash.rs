@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "Staged ABI and hardware hooks are not all enabled in the bootstrap profile"
+)]
+
 use crate::error::KernelError;
 
 const MAGIC: u32 = 0x4e52_5843;
@@ -24,6 +29,10 @@ static mut EFI_DATA: [u8; crate::drivers::block::SECTOR_SIZE] =
     [0; crate::drivers::block::SECTOR_SIZE];
 static mut EFI_ATTRIBUTES: u32 = 0;
 static mut EFI_SIZE: usize = 0;
+
+pub(crate) const fn record_capacity() -> usize {
+    crate::drivers::block::SECTOR_SIZE
+}
 
 pub fn contract_self_check() {
     let record = Record {
@@ -282,6 +291,7 @@ type EfiGetVariable =
     unsafe extern "efiapi" fn(*const u16, *const u8, *mut u32, *mut usize, *mut u8) -> usize;
 type EfiSetVariable =
     unsafe extern "efiapi" fn(*const u16, *const u8, u32, usize, *const u8) -> usize;
+type EfiResetSystem = unsafe extern "efiapi" fn(u32, usize, usize, *const u16);
 
 const EFI_VARIABLE_NON_VOLATILE: u32 = 0x0000_0001;
 const EFI_VARIABLE_BOOTSERVICE_ACCESS: u32 = 0x0000_0002;
@@ -341,14 +351,56 @@ const EFI_WARM_LOG_NAMES: [[u16; 10]; RECORDS] = [
 ];
 
 fn efi_read(output: &mut [u8; crate::drivers::block::SECTOR_SIZE]) -> bool {
+    output.fill(0);
+    for (slot, name) in EFI_WARM_LOG_NAMES.iter().enumerate() {
+        let mut record = [0u8; RECORD_SIZE];
+        if efi_read_variable(name, &EFI_WARM_LOG_GUID, &mut record) {
+            let offset = slot * RECORD_SIZE;
+            output[offset..offset + RECORD_SIZE].copy_from_slice(&record);
+        }
+    }
+    efi_runtime_available()
+}
+
+fn efi_write(input: &[u8; crate::drivers::block::SECTOR_SIZE]) -> bool {
+    for (slot, name) in EFI_WARM_LOG_NAMES.iter().enumerate() {
+        let offset = slot * RECORD_SIZE;
+        if !efi_write_variable(
+            name,
+            &EFI_WARM_LOG_GUID,
+            &input[offset..offset + RECORD_SIZE],
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn efi_runtime_available() -> bool {
+    let system_table = crate::boot::efi_system_table();
+    if system_table == 0 {
+        return false;
+    }
+    let Some(runtime) = (unsafe { read_u64(system_table as usize + 88) }) else {
+        return false;
+    };
+    runtime != 0
+        && unsafe { read_u64(runtime as usize + 72).is_some_and(|address| address != 0) }
+        && unsafe { read_u64(runtime as usize + 88).is_some_and(|address| address != 0) }
+}
+
+pub(crate) fn efi_read_variable(name: &[u16], guid: &[u8; 16], output: &mut [u8]) -> bool {
+    if name.is_empty() || output.is_empty() || output.len() > crate::drivers::block::SECTOR_SIZE {
+        return false;
+    }
     let system_table = crate::boot::efi_system_table();
     if system_table == 0 {
         return false;
     }
     crate::arch::without_interrupts(|| unsafe {
         let runtime = match read_u64(system_table as usize + 88) {
-            Some(runtime) => runtime,
-            None => return false,
+            Some(runtime) if runtime != 0 => runtime,
+            _ => return false,
         };
         let function = match read_u64(runtime as usize + 72) {
             Some(function) if function != 0 => function,
@@ -361,36 +413,30 @@ fn efi_read(output: &mut [u8; crate::drivers::block::SECTOR_SIZE]) -> bool {
         if !crate::arch::prepare_firmware_runtime() {
             return false;
         }
-        output.fill(0);
-        for (slot, name) in EFI_WARM_LOG_NAMES.iter().enumerate() {
-            (*attributes) = 0;
-            (*size) = RECORD_SIZE;
-            let status = get_variable(
-                name.as_ptr(),
-                EFI_WARM_LOG_GUID.as_ptr(),
-                attributes,
-                size,
-                data,
-            );
-            if status == 0 && (*size) == RECORD_SIZE {
-                let offset = slot * RECORD_SIZE;
-                core::ptr::copy_nonoverlapping(data, output.as_mut_ptr().add(offset), RECORD_SIZE);
-            }
+        (*attributes) = 0;
+        (*size) = output.len();
+        let status = get_variable(name.as_ptr(), guid.as_ptr(), attributes, size, data);
+        let success = status == 0 && (*size) == output.len();
+        if success {
+            core::ptr::copy_nonoverlapping(data, output.as_mut_ptr(), output.len());
         }
         crate::arch::finish_firmware_runtime();
-        true
+        success
     })
 }
 
-fn efi_write(input: &[u8; crate::drivers::block::SECTOR_SIZE]) -> bool {
+pub(crate) fn efi_write_variable(name: &[u16], guid: &[u8; 16], input: &[u8]) -> bool {
+    if name.is_empty() || input.is_empty() || input.len() > crate::drivers::block::SECTOR_SIZE {
+        return false;
+    }
     let system_table = crate::boot::efi_system_table();
     if system_table == 0 {
         return false;
     }
     crate::arch::without_interrupts(|| unsafe {
         let runtime = match read_u64(system_table as usize + 88) {
-            Some(runtime) => runtime,
-            None => return false,
+            Some(runtime) if runtime != 0 => runtime,
+            _ => return false,
         };
         let function = match read_u64(runtime as usize + 88) {
             Some(function) if function != 0 => function,
@@ -401,26 +447,42 @@ fn efi_write(input: &[u8; crate::drivers::block::SECTOR_SIZE]) -> bool {
         if !crate::arch::prepare_firmware_runtime() {
             return false;
         }
-        let mut success = true;
-        for (slot, name) in EFI_WARM_LOG_NAMES.iter().enumerate() {
-            let offset = slot * RECORD_SIZE;
-            core::ptr::copy_nonoverlapping(input.as_ptr().add(offset), data, RECORD_SIZE);
-            let status = set_variable(
-                name.as_ptr(),
-                EFI_WARM_LOG_GUID.as_ptr(),
-                EFI_VARIABLE_NON_VOLATILE
-                    | EFI_VARIABLE_BOOTSERVICE_ACCESS
-                    | EFI_VARIABLE_RUNTIME_ACCESS,
-                RECORD_SIZE,
-                data,
-            );
-            if status != 0 {
-                success = false;
-                break;
-            }
-        }
+        core::ptr::copy_nonoverlapping(input.as_ptr(), data, input.len());
+        let status = set_variable(
+            name.as_ptr(),
+            guid.as_ptr(),
+            EFI_VARIABLE_NON_VOLATILE
+                | EFI_VARIABLE_BOOTSERVICE_ACCESS
+                | EFI_VARIABLE_RUNTIME_ACCESS,
+            input.len(),
+            data,
+        );
         crate::arch::finish_firmware_runtime();
-        success
+        status == 0
+    })
+}
+
+pub(crate) fn efi_reset_system() -> bool {
+    let system_table = crate::boot::efi_system_table();
+    if system_table == 0 {
+        return false;
+    }
+    crate::arch::without_interrupts(|| unsafe {
+        let runtime = match read_u64(system_table as usize + 88) {
+            Some(runtime) if runtime != 0 => runtime,
+            _ => return false,
+        };
+        let function = match read_u64(runtime as usize + 104) {
+            Some(function) if function != 0 => function,
+            _ => return false,
+        };
+        let reset_system: EfiResetSystem = core::mem::transmute(function);
+        if !crate::arch::prepare_firmware_runtime() {
+            return false;
+        }
+        reset_system(1, 0, 0, core::ptr::null());
+        crate::arch::finish_firmware_runtime();
+        false
     })
 }
 

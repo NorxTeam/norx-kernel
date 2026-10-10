@@ -1,4 +1,4 @@
-use crate::drivers::framework::{DmaBuffer, DmaDirection};
+use crate::drivers::framework::{BusKind, DmaBuffer, DmaDirection};
 use crate::drivers::pci;
 use crate::io::MmioRegion;
 
@@ -9,6 +9,7 @@ const SECTOR_SIZE: usize = 512;
 const QUEUE_PAGES: usize = 3;
 const MAX_QUEUE_SIZE: u16 = 8;
 const POLL_LIMIT: usize = 100_000;
+const DMA_DEVICE_ID: crate::drivers::framework::DeviceId = 3;
 
 const DESC_NEXT: u16 = 1;
 const DESC_WRITE: u16 = 2;
@@ -97,8 +98,8 @@ pub enum InitResult {
     Failed(Error),
 }
 
-#[derive(Clone, Copy)]
 struct DmaPage {
+    dma: Option<DmaBuffer>,
     physical: u64,
     virtual_address: usize,
 }
@@ -106,74 +107,77 @@ struct DmaPage {
 impl DmaPage {
     const fn empty() -> Self {
         Self {
+            dma: None,
             physical: 0,
             virtual_address: 0,
         }
     }
 
     fn new() -> Result<Self, Error> {
-        let physical = crate::memory::alloc_frame().ok_or(Error::DmaUnavailable)?;
-        let virtual_address =
-            crate::arch::physical_to_virtual(crate::address::PhysAddr::new(physical))
-                .ok_or(Error::DmaUnavailable)?
-                .value();
+        let dma = DmaBuffer::allocate(
+            DMA_DEVICE_ID,
+            BusKind::Pci,
+            PAGE_SIZE,
+            PAGE_SIZE,
+            DmaDirection::Bidirectional,
+        )
+        .map_err(|_| Error::DmaUnavailable)?;
+        let physical = dma.physical().value();
+        let virtual_address = dma.virtual_address().value();
         let page = Self {
+            dma: Some(dma),
             physical,
             virtual_address,
         };
         page.clear();
-        page.sync_for_device()?;
         Ok(page)
     }
 
-    fn buffer(self) -> DmaBuffer {
-        DmaBuffer {
-            physical: crate::address::PhysAddr::new(self.physical),
-            virtual_address: crate::address::VirtAddr::new(self.virtual_address),
-            length: PAGE_SIZE,
-            alignment: PAGE_SIZE,
-            direction: DmaDirection::Bidirectional,
-            owner: 11,
-        }
+    fn sync_for_device(&self) -> Result<(), Error> {
+        self.dma
+            .as_ref()
+            .ok_or(Error::DmaUnavailable)?
+            .sync_for_device()
+            .map_err(|_| Error::DmaUnavailable)
     }
 
-    fn sync_for_device(self) -> Result<(), Error> {
-        unsafe { self.buffer().sync_for_device() }.map_err(|_| Error::DmaUnavailable)
+    fn sync_for_cpu(&self) -> Result<(), Error> {
+        self.dma
+            .as_ref()
+            .ok_or(Error::DmaUnavailable)?
+            .sync_for_cpu()
+            .map_err(|_| Error::DmaUnavailable)
     }
 
-    fn sync_for_cpu(self) -> Result<(), Error> {
-        unsafe { self.buffer().sync_for_cpu() }.map_err(|_| Error::DmaUnavailable)
-    }
-
-    fn clear(self) {
+    fn clear(&self) {
         unsafe { core::ptr::write_bytes(self.virtual_address as *mut u8, 0, PAGE_SIZE) };
     }
 
-    fn write_u8(self, offset: usize, value: u8) {
+    fn write_u8(&self, offset: usize, value: u8) {
         assert!(offset < PAGE_SIZE);
         unsafe { ((self.virtual_address + offset) as *mut u8).write_volatile(value) };
     }
 
-    fn read_u8(self, offset: usize) -> u8 {
+    fn read_u8(&self, offset: usize) -> u8 {
         assert!(offset < PAGE_SIZE);
         unsafe { ((self.virtual_address + offset) as *const u8).read_volatile() }
     }
 
-    fn write_u32(self, offset: usize, value: u32) {
+    fn write_u32(&self, offset: usize, value: u32) {
         assert!(offset + 4 <= PAGE_SIZE && offset.is_multiple_of(4));
         unsafe {
             ((self.virtual_address + offset) as *mut u32).write_volatile(value.to_le());
         }
     }
 
-    fn write_u64(self, offset: usize, value: u64) {
+    fn write_u64(&self, offset: usize, value: u64) {
         assert!(offset + 8 <= PAGE_SIZE && offset.is_multiple_of(8));
         unsafe {
             ((self.virtual_address + offset) as *mut u64).write_volatile(value.to_le());
         }
     }
 
-    fn copy_from(self, input: &[u8; SECTOR_SIZE]) {
+    fn copy_from(&self, input: &[u8; SECTOR_SIZE]) {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 input.as_ptr(),
@@ -183,7 +187,7 @@ impl DmaPage {
         }
     }
 
-    fn copy_to(self, output: &mut [u8; SECTOR_SIZE]) {
+    fn copy_to(&self, output: &mut [u8; SECTOR_SIZE]) {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 self.virtual_address as *const u8,
@@ -207,7 +211,7 @@ impl QueueMemory {
         if total > QUEUE_PAGES * PAGE_SIZE {
             return Err(Error::InvalidQueue);
         }
-        let mut pages = [DmaPage::empty(); QUEUE_PAGES];
+        let mut pages = core::array::from_fn(|_| DmaPage::empty());
         for page in &mut pages {
             *page = DmaPage::new()?;
         }
@@ -238,20 +242,20 @@ impl QueueMemory {
     }
 
     fn clear(&self) {
-        for page in self.pages {
+        for page in &self.pages {
             page.clear();
         }
     }
 
     fn sync_for_device(&self) -> Result<(), Error> {
-        for page in self.pages {
+        for page in &self.pages {
             page.sync_for_device()?;
         }
         Ok(())
     }
 
     fn sync_for_cpu(&self) -> Result<(), Error> {
-        for page in self.pages {
+        for page in &self.pages {
             page.sync_for_cpu()?;
         }
         Ok(())
@@ -394,9 +398,9 @@ impl Queue {
     fn submit(
         &mut self,
         operation: Operation,
-        request: DmaPage,
-        data: Option<DmaPage>,
-        status: DmaPage,
+        request: &DmaPage,
+        data: Option<&DmaPage>,
+        status: &DmaPage,
     ) -> Result<u32, Error> {
         if self.available != self.used {
             return Err(Error::Busy);
@@ -455,8 +459,8 @@ impl Queue {
     fn wait(
         &mut self,
         operation: Operation,
-        data: Option<DmaPage>,
-        status: DmaPage,
+        data: Option<&DmaPage>,
+        status: &DmaPage,
     ) -> Result<(), Error> {
         let expected_length = operation.expected_used_length();
         for _ in 0..POLL_LIMIT {
@@ -566,8 +570,8 @@ impl Runtime {
         self.status_page.clear();
         self.status_page.write_u8(0, 0xff);
         self.queue
-            .submit(Operation::Flush, self.request, None, self.status_page)?;
-        self.queue.wait(Operation::Flush, None, self.status_page)
+            .submit(Operation::Flush, &self.request, None, &self.status_page)?;
+        self.queue.wait(Operation::Flush, None, &self.status_page)
     }
 
     fn request(
@@ -591,10 +595,14 @@ impl Runtime {
         }
         self.status_page.clear();
         self.status_page.write_u8(0, 0xff);
+        self.queue.submit(
+            operation,
+            &self.request,
+            Some(&self.data),
+            &self.status_page,
+        )?;
         self.queue
-            .submit(operation, self.request, Some(self.data), self.status_page)?;
-        self.queue
-            .wait(operation, Some(self.data), self.status_page)?;
+            .wait(operation, Some(&self.data), &self.status_page)?;
         if let Some(output) = output {
             self.data.copy_to(output);
         }
@@ -910,6 +918,9 @@ fn cap_region(device: pci::Device, requested_type: u8) -> Result<Option<(MmioReg
                     return Err(Error::InvalidCapability);
                 }
                 let region_base = usize::try_from(region_base).map_err(|_| Error::InvalidPciBar)?;
+                let region_base =
+                    crate::arch::paging::map_device(region_base as u64, region_length)
+                        .ok_or(Error::InvalidPciBar)?;
                 let region = unsafe { MmioRegion::new(region_base, region_length) }
                     .ok_or(Error::InvalidPciBar)?;
                 let multiplier = if requested_type == PCI_CAP_NOTIFY_CFG {

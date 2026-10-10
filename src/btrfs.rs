@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "Staged ABI and hardware hooks are not all enabled in the bootstrap profile"
+)]
+
 use crate::drivers::block;
 
 const SECTOR_SIZE: usize = 512;
@@ -14,6 +19,7 @@ const MAX_PENDING_NODES: usize = 512;
 const MAX_TREE_VISITS: usize = 4096;
 const MAX_COMPONENTS: usize = 16;
 const MAX_TRANSACTION_SECTORS: usize = 32;
+const MAX_PATH_BYTES: usize = 256;
 pub const MAX_NAME_LENGTH: usize = 255;
 
 const MAGIC: &[u8; 8] = b"_BHRfS_M";
@@ -52,6 +58,7 @@ pub enum Error {
     BufferTooSmall,
     PermissionDenied,
     ReadOnly,
+    RollbackFailed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +86,8 @@ pub struct FileInfo {
     pub mode: u32,
     pub size: u64,
     pub directory: bool,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +136,8 @@ struct Key {
 #[derive(Clone, Copy)]
 struct Inode {
     mode: u32,
+    uid: u32,
+    gid: u32,
     size: u64,
 }
 
@@ -145,6 +156,7 @@ pub struct Mount {
     writer: Option<WriteSector>,
     flush: Option<FlushCache>,
     base_lba: u64,
+    available_sectors: u64,
     fsid: [u8; 16],
     sectorsize: u32,
     nodesize: u32,
@@ -201,8 +213,20 @@ impl Mount {
         base_lba: u64,
         available_sectors: u64,
     ) -> Result<Self, Error> {
+        if available_sectors
+            < (SUPERBLOCK_OFFSET + SUPERBLOCK_SIZE as u64).div_ceil(SECTOR_SIZE as u64)
+            || base_lba.checked_add(available_sectors).is_none()
+        {
+            return Err(Error::InvalidSuperblock);
+        }
         let mut superblock = [0u8; SUPERBLOCK_SIZE];
-        read_sectors(reader, base_lba, SUPERBLOCK_OFFSET, &mut superblock)?;
+        read_sectors(
+            reader,
+            base_lba,
+            available_sectors,
+            SUPERBLOCK_OFFSET,
+            &mut superblock,
+        )?;
         if &superblock[0x40..0x48] != MAGIC {
             return Err(Error::InvalidSuperblock);
         }
@@ -248,6 +272,7 @@ impl Mount {
             writer,
             flush,
             base_lba,
+            available_sectors,
             fsid: copy_array(&superblock[0x20..0x30]),
             sectorsize,
             nodesize,
@@ -290,6 +315,7 @@ impl Mount {
             writer,
             flush,
             base_lba: self.base_lba,
+            available_sectors: self.available_sectors,
             total_bytes: self.total_bytes,
             fsid: self.fsid,
             nodesize: self.nodesize,
@@ -331,6 +357,8 @@ impl Mount {
             mode: info.mode,
             size: info.size,
             directory: info.mode & 0xf000 == INODE_DIRECTORY,
+            uid: info.uid,
+            gid: info.gid,
         })
     }
 
@@ -419,13 +447,16 @@ impl Mount {
     }
 
     fn validate_inline_rewrite(self, path: &str, input: &[u8]) -> Result<(), Error> {
+        if input.len() > MAX_NODE_SIZE {
+            return Err(Error::UnsupportedFeature);
+        }
         let (root, inode_number) = self.resolve(path)?;
         let inode = self.find_inode(root, inode_number)?;
         if inode.mode & 0xf000 != INODE_REGULAR || input.is_empty() {
             return Err(Error::UnsupportedFeature);
         }
         let size = usize::try_from(inode.size).map_err(|_| Error::BufferTooSmall)?;
-        if size != input.len() {
+        if size > MAX_NODE_SIZE || size != input.len() {
             return Err(Error::UnsupportedFeature);
         }
         let mut current = [0u8; MAX_NODE_SIZE];
@@ -468,6 +499,8 @@ impl Mount {
                     }
                     result = Some(Inode {
                         mode: le_u32(data, 52),
+                        uid: le_u32(data, 44),
+                        gid: le_u32(data, 48),
                         size: le_u64(data, 16),
                     });
                     Ok(true)
@@ -511,28 +544,36 @@ impl Mount {
                     }
                     let data_length = le_u16(data, offset + 25) as usize;
                     let name_length = le_u16(data, offset + 27) as usize;
-                    let record_length = 30usize
-                        .checked_add(data_length)
-                        .and_then(|length| length.checked_add(name_length))
-                        .ok_or(Error::TreeCorrupt)?;
-                    let name_end = offset
+                    let name_start = offset
                         .checked_add(30)
-                        .and_then(|start| start.checked_add(name_length))
+                        .and_then(|start| start.checked_add(data_length))
+                        .ok_or(Error::TreeCorrupt)?;
+                    let name_end = name_start
+                        .checked_add(name_length)
+                        .ok_or(Error::TreeCorrupt)?;
+                    let record_length = name_end.checked_sub(offset).ok_or(Error::TreeCorrupt)?;
+                    let record_end = offset
+                        .checked_add(record_length)
                         .ok_or(Error::TreeCorrupt)?;
                     if record_length <= 30
+                        || name_length == 0
                         || name_length > MAX_NAME_LENGTH
                         || name_end > data.len()
-                        || offset + record_length > data.len()
+                        || record_end > data.len()
                         || le_u64(data, offset) == 0
                         || data[offset + 8] != INODE_ITEM_KEY
                         || data[offset + 29] > 7
                     {
                         return Err(Error::TreeCorrupt);
                     }
-                    if visitor(le_u64(data, offset), &data[offset + 30..name_end])? {
+                    let name = &data[name_start..name_end];
+                    if name.iter().any(|byte| *byte == 0 || *byte == b'/') {
+                        return Err(Error::TreeCorrupt);
+                    }
+                    if visitor(le_u64(data, offset), name)? {
                         return Ok(true);
                     }
-                    offset += record_length;
+                    offset = record_end;
                 }
                 Ok(false)
             })
@@ -604,7 +645,11 @@ impl Mount {
     {
         let nritems = le_u32(leaf, 0x60) as usize;
         let item_end = TREE_HEADER_SIZE
-            .checked_add(nritems * LEAF_ITEM_SIZE)
+            .checked_add(
+                nritems
+                    .checked_mul(LEAF_ITEM_SIZE)
+                    .ok_or(Error::TreeCorrupt)?,
+            )
             .ok_or(Error::TreeCorrupt)?;
         for index in 0..nritems {
             let offset = TREE_HEADER_SIZE + index * LEAF_ITEM_SIZE;
@@ -633,7 +678,10 @@ impl Mount {
         let end = logical
             .checked_add(self.nodesize as u64)
             .ok_or(Error::TreeCorrupt)?;
-        if self.map_logical(end - 1)? != physical + self.nodesize as u64 - 1 {
+        let physical_end = physical
+            .checked_add(self.nodesize as u64 - 1)
+            .ok_or(Error::UnmappedLogical)?;
+        if self.map_logical(end - 1)? != physical_end {
             return Err(Error::UnsupportedFeature);
         }
         self.read_physical(physical, &mut output[..self.nodesize as usize])?;
@@ -672,7 +720,11 @@ impl Mount {
         }
         for index in 0..output.len() / SECTOR_SIZE {
             let mut sector = [0u8; SECTOR_SIZE];
-            if !self.read_sector(offset / SECTOR_SIZE as u64 + index as u64, &mut sector) {
+            let lba = offset
+                .checked_div(SECTOR_SIZE as u64)
+                .and_then(|lba| lba.checked_add(index as u64))
+                .ok_or(Error::Io)?;
+            if !self.read_sector(lba, &mut sector) {
                 return Err(Error::Io);
             }
             let start = index * SECTOR_SIZE;
@@ -682,9 +734,14 @@ impl Mount {
     }
 
     fn read_sector(self, lba: u64, output: &mut [u8; SECTOR_SIZE]) -> bool {
-        self.base_lba
-            .checked_add(lba)
+        self.absolute_sector(lba)
             .is_some_and(|absolute| (self.reader)(absolute, output))
+    }
+
+    fn absolute_sector(self, lba: u64) -> Option<u64> {
+        (lba < self.available_sectors)
+            .then_some(())
+            .and_then(|_| self.base_lba.checked_add(lba))
     }
 }
 
@@ -716,6 +773,7 @@ pub struct Transaction {
     writer: WriteSector,
     flush: FlushCache,
     base_lba: u64,
+    available_sectors: u64,
     total_bytes: u64,
     fsid: [u8; 16],
     nodesize: u32,
@@ -739,8 +797,8 @@ impl Transaction {
         mut block: [u8; MAX_NODE_SIZE],
     ) -> Result<(), Error> {
         if phase > TRANSACTION_POINTER_PHASE
-            || physical_offset % self.nodesize as u64 != 0
-            || logical % self.nodesize as u64 != 0
+            || !physical_offset.is_multiple_of(self.nodesize as u64)
+            || !logical.is_multiple_of(self.nodesize as u64)
             || block[0x20..0x30] != self.fsid
             || le_u64(&block, 0x30) != logical
             || block[0x64] > 8
@@ -786,10 +844,11 @@ impl Transaction {
             return Err(Error::Io);
         }
         for index in 0..bytes.len() / SECTOR_SIZE {
-            let lba = self
-                .base_lba
-                .checked_add(physical_offset / SECTOR_SIZE as u64 + index as u64)
-                .ok_or(Error::Io)?;
+            let relative = physical_offset / SECTOR_SIZE as u64 + index as u64;
+            if relative >= self.available_sectors {
+                return Err(Error::Io);
+            }
+            let lba = self.base_lba.checked_add(relative).ok_or(Error::Io)?;
             if self.pending[..self.pending_count]
                 .iter()
                 .any(|pending| pending.lba == lba)
@@ -853,12 +912,12 @@ impl Transaction {
 }
 
 pub fn probe_block() -> Result<Mount, Error> {
-    let partition = block::partition(0).ok_or(Error::InvalidSuperblock)?;
+    let partition = block::active_partition().ok_or(Error::InvalidSuperblock)?;
     Mount::open_at(ramdisk_read_sector, partition.start_lba, partition.sectors)
 }
 
 pub fn probe_block_rw() -> Result<Mount, Error> {
-    let partition = block::partition(0).ok_or(Error::InvalidSuperblock)?;
+    let partition = block::active_partition().ok_or(Error::InvalidSuperblock)?;
     Mount::open_at_with_writer(
         ramdisk_read_sector,
         ramdisk_write_sector,
@@ -868,6 +927,10 @@ pub fn probe_block_rw() -> Result<Mount, Error> {
     )
 }
 
+#[allow(
+    clippy::nonminimal_bool,
+    reason = "Each short-circuited check performs a distinct fixture read"
+)]
 pub fn contract_self_check() {
     assert!(fixture_check());
 }
@@ -974,6 +1037,13 @@ fn fixture_check() -> bool {
     if partitioned
         .read_file("/hello.txt", &mut partitioned_output)
         .is_err()
+    {
+        return false;
+    }
+    if !Mount::open_at(fixture_partition_read_sector, 100, 135)
+        .is_err_and(|error| error == Error::InvalidSuperblock)
+        || !Mount::open_at(fixture_partition_read_sector, u64::MAX, 136)
+            .is_err_and(|error| error == Error::InvalidSuperblock)
     {
         return false;
     }
@@ -1246,7 +1316,10 @@ fn fixture_transaction_check() -> bool {
     let mut restored = [0u8; MAX_NODE_SIZE];
     if !fixture_transaction_block(0x5000 / SECTOR_SIZE as u64, &mut restored)
         || restored != [0; MAX_NODE_SIZE]
-        || !fixture_transaction_block(0x6000 / SECTOR_SIZE as u64, &mut restored)
+    {
+        return false;
+    }
+    if !fixture_transaction_block(0x6000 / SECTOR_SIZE as u64, &mut restored)
         || restored != [0; MAX_NODE_SIZE]
     {
         return false;
@@ -1635,16 +1708,23 @@ fn components(path: &str) -> Result<([&str; MAX_COMPONENTS], usize), Error> {
 fn read_sectors(
     reader: ReadSector,
     base_lba: u64,
+    available_sectors: u64,
     offset: u64,
     output: &mut [u8],
 ) -> Result<(), Error> {
     if !offset.is_multiple_of(SECTOR_SIZE as u64) || !output.len().is_multiple_of(SECTOR_SIZE) {
         return Err(Error::Io);
     }
+    let first = offset / SECTOR_SIZE as u64;
+    let count = (output.len() / SECTOR_SIZE) as u64;
+    let end = first.checked_add(count).ok_or(Error::Io)?;
+    if end > available_sectors || base_lba.checked_add(available_sectors).is_none() {
+        return Err(Error::Io);
+    }
     for index in 0..output.len() / SECTOR_SIZE {
         let mut sector = [0u8; SECTOR_SIZE];
         let lba = base_lba
-            .checked_add(offset / SECTOR_SIZE as u64 + index as u64)
+            .checked_add(first + index as u64)
             .ok_or(Error::Io)?;
         if !reader(lba, &mut sector) {
             return Err(Error::Io);

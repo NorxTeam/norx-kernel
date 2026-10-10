@@ -176,7 +176,7 @@ fn init_v2(info: Aarch64InterruptInfo) -> bool {
     if !distributor.write_u32_le(GICD_CTLR, 0) {
         return false;
     }
-    for index in 0..((count as usize + 31) / 32) {
+    for index in 0..(count as usize).div_ceil(32) {
         if !distributor.write_u32_le(GICD_ICENABLER + index * 4, u32::MAX) {
             return false;
         }

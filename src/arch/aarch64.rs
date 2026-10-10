@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "Staged ABI and hardware hooks are not all enabled in the bootstrap profile"
+)]
+
 use core::arch::asm;
 
 pub const NAME: &str = "aarch64";
@@ -399,6 +404,14 @@ pub fn user_space_unmap(
     paging::user_space_unmap(root, virtual_address, tables)
 }
 
+pub fn user_space_protect(
+    root: crate::address::PhysAddr,
+    virtual_address: usize,
+    flags: crate::address_space::PageFlags,
+) -> bool {
+    paging::user_space_protect(root, virtual_address, flags)
+}
+
 pub fn user_space_reset(root: crate::address::PhysAddr) {
     paging::user_space_reset(root);
 }
@@ -441,4 +454,24 @@ pub fn request_user_switch(from: u32, to: u32) {
 
 pub fn has_user_context(thread: u32) -> bool {
     syscall::has_user_context(thread)
+}
+
+pub fn revoke_user_context(thread: u32) {
+    syscall::revoke_user_context(thread)
+}
+
+pub fn context_contract_self_check() {
+    syscall::context_contract_self_check()
+}
+
+/// PSCI SYSTEM_RESET through the QEMU virt HVC conduit.
+pub fn reboot() -> ! {
+    unsafe {
+        core::arch::asm!("hvc #0", inout("x0") 0x84000009u64 => _, clobber_abi("C"));
+    }
+    loop {
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack));
+        }
+    }
 }

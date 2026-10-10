@@ -45,6 +45,7 @@ static mut DIRECT_MAP_READY: bool = false;
 static mut DIRECT_MAP_BYTES: usize = 0;
 static mut NORX_CR3_READY: bool = false;
 static mut NORX_CR3: u64 = 0;
+static mut DEVICE_MAP_NEXT: usize = DEVICE_MAP_BASE;
 
 pub fn init_direct_map() -> bool {
     unsafe {
@@ -129,18 +130,17 @@ pub fn map_device(physical: u64, size: usize) -> Option<usize> {
     let physical_start = usize::try_from(physical).ok()? & !0xfff;
     let physical_end = physical.checked_add(size as u64)?.checked_add(0xfff)? & !0xfff;
     let bytes = usize::try_from(physical_end.checked_sub(physical_start as u64)?).ok()?;
-    let virtual_end = DEVICE_MAP_BASE.checked_add(bytes)?;
-    if virtual_end > DEVICE_MAP_LIMIT {
-        return None;
-    }
     crate::arch::without_interrupts(|| unsafe {
+        let virtual_start = DEVICE_MAP_NEXT;
+        let virtual_end = virtual_start.checked_add(bytes)?;
+        if virtual_end > DEVICE_MAP_LIMIT {
+            return None;
+        }
         let mut offset = 0usize;
         while offset < bytes {
-            let Some(frame) = physical_start.checked_add(offset) else {
-                return None;
-            };
+            let frame = physical_start.checked_add(offset)?;
             if !map_to_flags(
-                DEVICE_MAP_BASE + offset,
+                virtual_start + offset,
                 frame as u64,
                 PTE_PRESENT | PTE_WRITABLE | PTE_NX,
             ) {
@@ -148,7 +148,8 @@ pub fn map_device(physical: u64, size: usize) -> Option<usize> {
             }
             offset += 4096;
         }
-        Some(DEVICE_MAP_BASE + (physical as usize - physical_start))
+        DEVICE_MAP_NEXT = virtual_end;
+        Some(virtual_start + (physical as usize - physical_start))
     })
 }
 
@@ -223,32 +224,48 @@ pub fn user_space_map(
             (mapping.virtual_address >> 21) & 0x1ff,
             (mapping.virtual_address >> 12) & 0x1ff,
         ];
-        for index in indices[..3].iter().copied() {
+        let mut created = [None; 3];
+        let mut parents = [core::ptr::null_mut(); 3];
+        for (depth, index) in indices[..3].iter().copied().enumerate() {
             let entry = table.add(index);
+            parents[depth] = entry;
             let value = entry.read_volatile();
             if value & PTE_PRESENT == 0 {
                 let Some(frame) = allocate_user_table(tables) else {
+                    rollback_user_tables(&created, &parents, tables);
                     return false;
                 };
                 entry.write_volatile(frame.value() | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+                created[depth] = Some(frame);
                 table = match direct_map_ptr(frame.value()).map(|ptr| ptr.cast::<u64>()) {
                     Some(table) => table,
-                    None => return false,
+                    None => {
+                        rollback_user_tables(&created, &parents, tables);
+                        return false;
+                    }
                 };
             } else {
-                if value & PTE_USER == 0 || value & (1 << 7) != 0 {
+                if value & PTE_USER == 0
+                    || value & (1 << 7) != 0
+                    || !owned_user_table(tables, value & ADDRESS_MASK)
+                {
+                    rollback_user_tables(&created, &parents, tables);
                     return false;
                 }
                 table = match direct_map_ptr((value & ADDRESS_MASK) as usize as u64)
                     .map(|ptr| ptr.cast::<u64>())
                 {
                     Some(table) => table,
-                    None => return false,
+                    None => {
+                        rollback_user_tables(&created, &parents, tables);
+                        return false;
+                    }
                 };
             }
         }
         let leaf = table.add(indices[3]);
         if leaf.read_volatile() & PTE_PRESENT != 0 {
+            rollback_user_tables(&created, &parents, tables);
             return false;
         }
         let mut flags = PTE_PRESENT | PTE_USER;
@@ -267,7 +284,7 @@ pub fn user_space_map(
 pub fn user_space_unmap(
     root: crate::address::PhysAddr,
     virtual_address: usize,
-    owned_tables: &mut [Option<crate::address::PhysAddr>],
+    _owned_tables: &mut [Option<crate::address::PhysAddr>],
 ) -> bool {
     unsafe {
         let Some(mut table) = direct_map_ptr(root.value()).map(|ptr| ptr.cast::<u64>()) else {
@@ -279,12 +296,12 @@ pub fn user_space_unmap(
             (virtual_address >> 21) & 0x1ff,
             (virtual_address >> 12) & 0x1ff,
         ];
-        let mut child_tables = [core::ptr::null_mut(); 3];
-        let mut parent_entries = [core::ptr::null_mut(); 3];
-        for (depth, index) in indices[..3].iter().copied().enumerate() {
-            parent_entries[depth] = table.add(index);
+        for index in indices[..3].iter().copied() {
             let value = table.add(index).read_volatile();
             if value & PTE_PRESENT == 0 || value & (1 << 7) != 0 {
+                return false;
+            }
+            if !owned_user_table(_owned_tables, value & ADDRESS_MASK) {
                 return false;
             }
             table = match direct_map_ptr((value & ADDRESS_MASK) as usize as u64)
@@ -293,7 +310,6 @@ pub fn user_space_unmap(
                 Some(table) => table,
                 None => return false,
             };
-            child_tables[depth] = table;
         }
         let leaf = table.add(indices[3]);
         if leaf.read_volatile() & PTE_PRESENT == 0 {
@@ -301,26 +317,58 @@ pub fn user_space_unmap(
         }
         leaf.write_volatile(0);
         asm!("invlpg [{}]", in(reg) virtual_address, options(nostack, preserves_flags));
-        for depth in (0..3).rev() {
-            let child = child_tables[depth];
-            let parent_entry = parent_entries[depth];
-            let empty = (0..512).all(|index| child.add(index).read_volatile() & PTE_PRESENT == 0);
-            if !empty {
-                break;
-            }
-            let child_frame = parent_entry.read_volatile() & ADDRESS_MASK;
-            let Some(slot_index) = owned_tables.iter().position(|slot| {
-                slot.as_ref()
-                    .is_some_and(|frame| frame.value() == child_frame)
-            }) else {
+    }
+    true
+}
+
+pub fn user_space_protect(
+    root: crate::address::PhysAddr,
+    virtual_address: usize,
+    flags: crate::address_space::PageFlags,
+) -> bool {
+    if !flags.is_valid()
+        || !virtual_address.is_multiple_of(4096)
+        || !(crate::address_space::PAGE_SIZE..crate::address_space::USER_LIMIT)
+            .contains(&virtual_address)
+    {
+        return false;
+    }
+    unsafe {
+        let Some(mut table) = direct_map_ptr(root.value()).map(|ptr| ptr.cast::<u64>()) else {
+            return false;
+        };
+        let indices = [
+            (virtual_address >> 39) & 0x1ff,
+            (virtual_address >> 30) & 0x1ff,
+            (virtual_address >> 21) & 0x1ff,
+            (virtual_address >> 12) & 0x1ff,
+        ];
+        for index in indices[..3].iter().copied() {
+            let value = table.add(index).read_volatile();
+            if value & (PTE_PRESENT | PTE_USER) != (PTE_PRESENT | PTE_USER) || value & PTE_HUGE != 0
+            {
                 return false;
+            }
+            table = match direct_map_ptr(value & ADDRESS_MASK).map(|ptr| ptr.cast()) {
+                Some(table) => table,
+                None => return false,
             };
-            let frame = owned_tables[slot_index].expect("owned page table");
-            if !crate::memory::free_frame(frame.value()) {
-                return false;
-            }
-            parent_entry.write_volatile(0);
-            owned_tables[slot_index] = None;
+        }
+        let leaf = table.add(indices[3]);
+        let value = leaf.read_volatile();
+        if value & (PTE_PRESENT | PTE_USER) != (PTE_PRESENT | PTE_USER) {
+            return false;
+        }
+        let mut updated = value & !(PTE_WRITABLE | PTE_NX);
+        if flags.writable {
+            updated |= PTE_WRITABLE;
+        }
+        if !flags.executable {
+            updated |= PTE_NX;
+        }
+        leaf.write_volatile(updated);
+        if user_space_is_current(root) {
+            asm!("invlpg [{}]", in(reg) virtual_address, options(nostack, preserves_flags));
         }
     }
     true
@@ -385,14 +433,39 @@ pub fn zero_physical_page(physical: crate::address::PhysAddr) -> bool {
 unsafe fn allocate_user_table(
     tables: &mut [Option<crate::address::PhysAddr>],
 ) -> Option<crate::address::PhysAddr> {
+    let slot = tables.iter().position(Option::is_none)?;
     let frame = crate::memory::alloc_frame().map(crate::address::PhysAddr::new)?;
     if !zero_physical_page(frame) {
         let _ = crate::memory::free_frame(frame.value());
         return None;
     }
-    let slot = tables.iter().position(Option::is_none)?;
     tables[slot] = Some(frame);
     Some(frame)
+}
+
+unsafe fn owned_user_table(tables: &[Option<crate::address::PhysAddr>], frame: u64) -> bool {
+    tables.iter().flatten().any(|entry| entry.value() == frame)
+}
+
+unsafe fn rollback_user_tables(
+    created: &[Option<crate::address::PhysAddr>; 3],
+    parents: &[*mut u64; 3],
+    tables: &mut [Option<crate::address::PhysAddr>],
+) {
+    for depth in (0..3).rev() {
+        let Some(frame) = created[depth] else {
+            continue;
+        };
+        parents[depth].write_volatile(0);
+        if crate::memory::free_frame(frame.value()) {
+            if let Some(slot) = tables
+                .iter()
+                .position(|entry| entry.is_some_and(|entry| entry == frame))
+            {
+                tables[slot] = None;
+            }
+        }
+    }
 }
 
 pub fn init_norx_cr3() -> bool {
@@ -409,7 +482,8 @@ pub fn init_norx_cr3() -> bool {
         let Some(old) = direct_map_ptr(old_cr3 & ADDRESS_MASK).map(|ptr| ptr.cast::<u64>()) else {
             crate::bootlog::fail_fmt(format_args!(
                 "firmware CR3 outside direct map cr3=0x{:x} bytes=0x{:x}",
-                old_cr3, DIRECT_MAP_BYTES
+                old_cr3,
+                { DIRECT_MAP_BYTES }
             ));
             let _ = crate::memory::free_frame(new_p4);
             return false;
@@ -417,7 +491,8 @@ pub fn init_norx_cr3() -> bool {
         let Some(new) = direct_map_ptr(new_p4).map(|ptr| ptr.cast::<u64>()) else {
             crate::bootlog::fail_fmt(format_args!(
                 "new CR3 outside direct map frame=0x{:x} bytes=0x{:x}",
-                new_p4, DIRECT_MAP_BYTES
+                new_p4,
+                { DIRECT_MAP_BYTES }
             ));
             let _ = crate::memory::free_frame(new_p4);
             return false;

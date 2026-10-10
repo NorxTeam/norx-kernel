@@ -36,5 +36,7 @@ serial backend has failed.
 Getty must validate `AVAILABLE`, the controlling process, and the foreground
 group before prompting. A group mismatch is a recoverable terminal-busy
 condition. Signal forwarding and shutdown remain supervisor actions; getty's
-versioned `LoginHandoff` carries the target group and window metadata without
-including credentials.
+version-2 `LoginHandoff` carries the target group, window metadata, and
+non-zero terminal/session generation values without including credentials.
+Events with stale generations are ignored, and restart must revoke the
+previous session identity before a new prompt is accepted.
